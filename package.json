@@ -1,0 +1,32 @@
+{
+  "name": "dynamicchat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "api": "node server/dynamicchat-server.mjs",
+    "dev": "node server/dev-runner.mjs",
+    "dev:web": "vite --host 127.0.0.1",
+    "eval:simulation": "node server/simulation-quality-eval.mjs",
+    "eval:image-prompts": "node server/image-prompt-quality-eval.mjs",
+    "eval:simulation-runs": "node server/simulation-run-quality-eval.mjs",
+    "eval:quality": "pnpm eval:simulation && pnpm eval:image-prompts && pnpm eval:simulation-runs",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "fflate": "^0.8.2",
+    "lucide-react": "^0.561.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3"
+  }
+}

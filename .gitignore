@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.dynamicchat-data/
+.external/
+.env
+.env.*

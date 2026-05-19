@@ -78,6 +78,7 @@ function matchRoute(method, pathname) {
     ["POST", /^\/simulations\/([^/]+)\/chat\/turns$/u, createChatTurn],
     ["POST", /^\/simulations\/([^/]+)\/sessions\/reset$/u, resetSession],
     ["POST", /^\/simulations\/([^/]+)\/image-jobs$/u, createImageJob],
+    ["POST", /^\/simulations\/([^/]+)\/assets$/u, persistImageAssets],
     ["GET", /^\/simulations\/([^/]+)\/assets$/u, listAssets],
     ["GET", /^\/simulations\/([^/]+)\/audit$/u, listAudit],
     ["POST", /^\/simulations\/([^/]+)\/backup$/u, createBackup],
@@ -388,6 +389,20 @@ async function listAssets(request, response, [simulationId]) {
   appendAuditEvent(state, request, "asset_accessed", "simulation", simulationId, { assetCount: assets.length });
   void writeStateStore(store).catch(() => undefined);
   sendJson(response, 200, assets);
+}
+
+async function persistImageAssets(request, response, [simulationId]) {
+  const body = await readJsonBody(request);
+  const assets = Array.isArray(body?.assets) ? body.assets : [];
+  const store = await readStateStore();
+  const state = store.simulations[simulationId];
+  if (state && !assertRequestOwnerScope(response, request, state)) {
+    return;
+  }
+
+  const objectRoot = await getRequestObjectRoot(request);
+  const persistedAssets = await persistAssetObjects(simulationId, assets, objectRoot);
+  sendJson(response, 200, persistedAssets.map(stripAssetDataUrl));
 }
 
 function readRequestedAssetIds(request) {

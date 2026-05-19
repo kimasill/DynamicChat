@@ -10,6 +10,11 @@ The implementation keeps provider-facing payloads behind the NovelAI adapter and
 stores DynamicChat-specific metadata separately in `providerPayload` and asset
 metadata.
 
+Before a job is queued, the runtime uses the main simulation LLM sidecar as the
+source of `image_cues`. The main LLM must produce final usable NovelAI tags while
+it writes the turn response; DynamicChat does not run a later tag planner to
+repair missing tags.
+
 ## Provider Settings Checked
 
 Official NovelAI image docs describe the core UI/runtime settings DynamicChat

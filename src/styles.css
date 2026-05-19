@@ -3766,7 +3766,7 @@ textarea:focus-visible {
 
 .crack-inline-image-job {
   display: grid;
-  grid-template-columns: 28px 1fr auto auto;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
   padding: 12px;
@@ -3786,7 +3786,16 @@ textarea:focus-visible {
   line-height: 1.45;
 }
 
+.crack-inline-image-job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .crack-inline-image-job button {
+  display: inline-grid;
+  place-items: center;
   min-height: 32px;
   padding: 0 10px;
   border: 1px solid #deddd7;
@@ -8049,6 +8058,154 @@ body.resizing-ops-rail {
 
 .image-prompt-authoring-panel .prompt-long-field textarea {
   min-height: 174px;
+}
+
+.scene-tag-preset-panel {
+  gap: 14px;
+}
+
+.scene-tag-preset-list {
+  display: grid;
+  gap: 12px;
+}
+
+.scene-tag-preset-toolbar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.scene-tag-preset-node {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  margin-left: min(56px, calc(var(--scene-preset-depth, 0) * 18px));
+}
+
+.scene-tag-preset-node.dragging > .scene-tag-preset-row {
+  opacity: 0.5;
+  transform: scale(0.995);
+}
+
+.scene-tag-preset-node.drop-before::before,
+.scene-tag-preset-node.drop-after::after {
+  position: absolute;
+  right: 6px;
+  left: 6px;
+  z-index: 4;
+  height: 3px;
+  border-radius: 999px;
+  background: #2f6f68;
+  box-shadow: 0 0 0 3px rgb(47 111 104 / 14%);
+  content: "";
+}
+
+.scene-tag-preset-node.drop-before::before {
+  top: -6px;
+}
+
+.scene-tag-preset-node.drop-after::after {
+  bottom: -6px;
+}
+
+.scene-tag-preset-node.drop-inside > .scene-tag-preset-row {
+  border-color: #2f6f68;
+  box-shadow: 0 0 0 2px rgb(47 111 104 / 16%) inset;
+}
+
+.scene-tag-preset-children {
+  display: grid;
+  gap: 10px;
+  padding-left: 12px;
+  border-left: 2px solid color-mix(in srgb, var(--tone-a) 26%, transparent);
+}
+
+.scene-tag-preset-row {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 72%);
+}
+
+.scene-tag-preset-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.scene-tag-preset-toggle {
+  flex: 0 0 auto;
+}
+
+.scene-tag-preset-drag-handle {
+  flex: 0 0 auto;
+  cursor: grab;
+}
+
+.scene-tag-preset-drag-handle:active {
+  cursor: grabbing;
+}
+
+.scene-tag-preset-node:hover > .scene-tag-preset-row .scene-tag-preset-drag-handle,
+.scene-tag-preset-node.dragging > .scene-tag-preset-row .scene-tag-preset-drag-handle {
+  color: var(--ink);
+}
+
+.scene-tag-preset-level {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scene-tag-preset-title {
+  margin-left: 8px;
+  color: var(--ink);
+  font-size: 0.86rem;
+  font-weight: 900;
+}
+
+.scene-tag-preset-child-count {
+  margin-left: 8px;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.scene-tag-preset-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scene-tag-preset-actions .icon-text-button {
+  min-height: 34px;
+  padding: 0 10px;
+}
+
+.scene-tag-preset-row textarea {
+  min-height: 82px;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+.scene-tag-preset-row label:last-child textarea {
+  min-height: 64px;
+}
+
+.scene-tag-preset-collapsed-summary {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.5;
 }
 
 .prompt-textarea-grid {

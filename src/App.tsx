@@ -51,7 +51,7 @@ import type {
   SetStateAction,
   WheelEvent as ReactWheelEvent
 } from "react";
-import { Component, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { builtInSimulationStates, createStateFromDraft, hydrateState, seedState, type SimulationDraft } from "./data/seed";
 import { createId } from "./lib/id";
@@ -62,13 +62,21 @@ import { NeuralMapClient, type NeuralMapLiveGraph, type NeuralMapLiveNode } from
 import { toShareableLlmSettings, toShareableNovelAiSettings } from "./services/runtimeApiSettings";
 import { relaxImageUserRulesForAdultMode } from "./services/contentRating";
 import {
+  readStateMemoryKind,
+  readStateMemoryOwnerId,
+  readStateMemoryStateType,
+  readStateMemoryTargetId,
+  readStateMemoryValue
+} from "./services/stateMemory";
+import {
   clearState,
   configureDynamicChatApiBaseUrl,
   createDynamicChatApiClient,
   getConfiguredDynamicChatApiBaseUrl,
   getNovelAiGenerateProxyUrl,
   loadState,
-  saveState
+  saveState,
+  type SaveStateOptions
 } from "./services/dynamicChatApi";
 import { createAuditEvent, createRedactionRequest } from "./services/security";
 import { createResetSessionState, planImageJobForCompletedTurn, runSimulationTurn } from "./services/simulationEngine";
@@ -85,6 +93,8 @@ import type {
   ImageGenerationCadence,
   ImageGenerationJob,
   ImageGenerationProfile,
+  ImageSceneTagPreset,
+  ImageSceneTagPresetNode,
   ImageSafetyLevel,
   ImageTriggerMode,
   LlmApiSettings,
@@ -157,7 +167,8 @@ const imageGenerationCadenceOptions: Array<{
   { value: "sparse", label: "적게", detail: "큰 전환 중심" },
   { value: "balanced", label: "균형", detail: "중요 장면마다" },
   { value: "rich", label: "많게", detail: "행동/감정 변화" },
-  { value: "paragraph", label: "문단마다", detail: "문단 단위 cue" }
+  { value: "paragraph", label: "문단마다", detail: "문단 단위 cue" },
+  { value: "image_progression", label: "이미지 진행", detail: "10컷 태그" }
 ];
 const imageSafetyLevels: ImageSafetyLevel[] = ["safe", "sensitive", "suggestive", "explicit"];
 const contentRatingOptions: Array<{ value: ContentRating; label: string; detail: string }> = [
@@ -254,6 +265,7 @@ const llmProviderOptions: Array<{
 type BuilderTab = "overview" | "prompts" | "characters" | "status" | "api" | "review";
 type RightPanel = "image" | "relationship" | "neuralmap" | "memory" | "ops" | "persona" | "settings";
 type ModuleDropPosition = "before" | "after";
+type ImageScenePresetDropPosition = "before" | "after" | "inside";
 type DynamicTextBlockKind = "scene" | "impact" | "whisper" | "sfx" | "status" | "choice" | "memory" | "letter";
 type DynamicTextSegment =
   | {
@@ -315,8 +327,11 @@ const AUTO_RESET_MIN_ACTIVE_USER_TURNS = 3;
 const AUTO_RESET_DEGRADED_TRACE_MIN_TURNS = 5;
 const AUTO_RESET_DEGRADED_TRACE_LIMIT = 2;
 const AUTO_RESET_PRESSURE_NOTICE_THRESHOLD = 0.72;
+const AUTO_CONTINUE_TURN_TEXT = "이어서 진행";
 const PRODUCT_TAGLINE = "기억, 장면, 이미지를 한 흐름으로 잇는 시뮬레이션 작업대.";
 const PRODUCT_HOME_DESCRIPTION = "Prompt Tree와 Context Pack으로 세계를 정리하고, Image Cue까지 한 턴의 흐름 안에서 붙잡습니다.";
+const EMPTY_IMAGE_ASSETS: ImageAsset[] = [];
+const EMPTY_IMAGE_JOBS: ImageGenerationJob[] = [];
 
 type PresetPromptMode = Exclude<SimulationPromptMode, "custom">;
 
@@ -559,6 +574,124 @@ const dynamicMarkdownComponents: Components = {
   pre: ({ node: _node, ...props }) => <pre className="rich-code-block" {...props} />,
   a: ({ node: _node, ...props }) => <a className="rich-link" rel="noreferrer" target="_blank" {...props} />
 };
+const markdownRemarkPlugins = [remarkGfm];
+const markdownTableDelimiterCellPattern = /^:?-{3,}:?$/u;
+
+function readMarkdownTableCells(line: string): string[] {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) {
+    return [];
+  }
+
+  const withoutLeadingPipe = trimmed.startsWith("|") ? trimmed.slice(1) : trimmed;
+  const withoutEdgePipes = withoutLeadingPipe.endsWith("|") ? withoutLeadingPipe.slice(0, -1) : withoutLeadingPipe;
+  return withoutEdgePipes.split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableRow(line: string): boolean {
+  return readMarkdownTableCells(line).some(Boolean);
+}
+
+function isMarkdownTableDelimiter(line: string): boolean {
+  const cells = readMarkdownTableCells(line);
+  return cells.length > 0 && cells.every((cell) => markdownTableDelimiterCellPattern.test(cell));
+}
+
+function readPreviousNonEmptyLine(lines: string[]): string | undefined {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index].trim()) {
+      return lines[index];
+    }
+  }
+  return undefined;
+}
+
+function readNextNonEmptyLine(lines: string[], startIndex: number): string | undefined {
+  for (let index = startIndex; index < lines.length; index += 1) {
+    if (lines[index].trim()) {
+      return lines[index];
+    }
+  }
+  return undefined;
+}
+
+function removeLooseMarkdownTableHeaderGaps(lines: string[]): string[] {
+  const normalizedLines: string[] = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\s*```/u.test(line)) {
+      inFence = !inFence;
+      normalizedLines.push(line);
+      continue;
+    }
+
+    if (!inFence && !line.trim()) {
+      const previousLine = readPreviousNonEmptyLine(normalizedLines);
+      const nextLine = readNextNonEmptyLine(lines, index + 1);
+      if (previousLine && nextLine && isMarkdownTableRow(previousLine) && isMarkdownTableDelimiter(nextLine)) {
+        continue;
+      }
+    }
+
+    normalizedLines.push(line);
+  }
+
+  return normalizedLines;
+}
+
+function separateAdjacentMarkdownTables(lines: string[]): string[] {
+  const normalizedLines: string[] = [];
+  let inFence = false;
+  let tableActive = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\s*```/u.test(line)) {
+      inFence = !inFence;
+      tableActive = false;
+      normalizedLines.push(line);
+      continue;
+    }
+
+    if (!inFence && !line.trim()) {
+      tableActive = false;
+      normalizedLines.push(line);
+      continue;
+    }
+
+    if (!inFence) {
+      const nextLine = readNextNonEmptyLine(lines, index + 1);
+      const startsTable = isMarkdownTableRow(line) && Boolean(nextLine && isMarkdownTableDelimiter(nextLine));
+      if (startsTable) {
+        const previousLine = readPreviousNonEmptyLine(normalizedLines);
+        if (previousLine && (tableActive || !isMarkdownTableRow(previousLine)) && normalizedLines.at(-1)?.trim()) {
+          normalizedLines.push("");
+        }
+        tableActive = false;
+      }
+    }
+
+    normalizedLines.push(line);
+
+    if (inFence) {
+      continue;
+    }
+    if (isMarkdownTableDelimiter(line)) {
+      tableActive = true;
+    } else if (!isMarkdownTableRow(line)) {
+      tableActive = false;
+    }
+  }
+
+  return normalizedLines;
+}
+
+function normalizeLooseMarkdownTables(content: string): string {
+  const lines = content.replace(/\r\n/gu, "\n").split("\n");
+  return separateAdjacentMarkdownTables(removeLooseMarkdownTableHeaderGaps(lines)).join("\n");
+}
 
 function formatActivationTags(tags: string[]): string {
   return tags.map((tag) => activationTagDisplayLabels[tag] ?? tag).join(", ");
@@ -570,6 +703,21 @@ function parseActivationTags(value: string): string[] {
     .map((tag) => tag.trim())
     .filter(Boolean)
     .map((tag) => activationTagStorageLabels[tag] ?? tag);
+}
+
+function parseScenePresetTags(value: string): string[] {
+  const seen = new Set<string>();
+  return value
+    .split(/[,;\n]+/u)
+    .map((tag) => tag.trim())
+    .filter((tag) => {
+      const key = tag.toLowerCase();
+      if (!tag || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
 }
 
 function inferCharacterNameFromModule(module: PromptModule, fallbackName: string): string {
@@ -602,6 +750,21 @@ function createDraftCharacterForModule(module: PromptModule, characterId: string
 
 function createCopiedTitle(title: string, existingTitles: string[]): string {
   const baseTitle = title.replace(/\s+복사본(?:\s+\d+)?$/u, "").trim() || "복사한 모듈";
+  const usedTitles = new Set(existingTitles);
+  const firstTitle = `${baseTitle} 복사본`;
+  if (!usedTitles.has(firstTitle)) {
+    return firstTitle;
+  }
+
+  let index = 2;
+  while (usedTitles.has(`${baseTitle} 복사본 ${index}`)) {
+    index += 1;
+  }
+  return `${baseTitle} 복사본 ${index}`;
+}
+
+function createCopiedSimulationTitle(title: string, existingTitles: string[]): string {
+  const baseTitle = title.replace(/\s+복사본(?:\s+\d+)?$/u, "").trim() || "새 시뮬레이션";
   const usedTitles = new Set(existingTitles);
   const firstTitle = `${baseTitle} 복사본`;
   if (!usedTitles.has(firstTitle)) {
@@ -935,25 +1098,19 @@ function loadSimulationLibrary(fallbackState: AppState): SimulationLibrary {
 function saveSimulationLibrary(library: SimulationLibrary): void {
   const previousRawLibrary = window.localStorage.getItem(SIMULATION_LIBRARY_STORAGE_KEY);
   const shareableLibrary = library.map(stripLibrarySecrets);
+  const cacheLibrary = shareableLibrary.map(stripCachedImagePayloadsFromState);
   try {
-    window.localStorage.setItem(SIMULATION_LIBRARY_STORAGE_KEY, JSON.stringify(shareableLibrary));
+    window.localStorage.setItem(SIMULATION_LIBRARY_STORAGE_KEY, JSON.stringify(cacheLibrary));
   } catch (error) {
-    console.warn("DynamicChat simulation library cache was too large; saving image metadata only.", error);
-    try {
-      window.localStorage.setItem(
-        SIMULATION_LIBRARY_STORAGE_KEY,
-        JSON.stringify(shareableLibrary.map(stripCachedImagePayloadsFromState))
-      );
-    } catch {
-      if (previousRawLibrary) {
-        return;
-      }
+    console.warn("DynamicChat simulation library cache was too large; saving a lightweight index.", error);
+    if (previousRawLibrary) {
+      return;
+    }
 
-      try {
-        window.localStorage.setItem(SIMULATION_LIBRARY_STORAGE_KEY, JSON.stringify(createLightweightSimulationLibraryIndex(shareableLibrary)));
-      } catch {
-        window.localStorage.removeItem(SIMULATION_LIBRARY_STORAGE_KEY);
-      }
+    try {
+      window.localStorage.setItem(SIMULATION_LIBRARY_STORAGE_KEY, JSON.stringify(createLightweightSimulationLibraryIndex(cacheLibrary)));
+    } catch {
+      window.localStorage.removeItem(SIMULATION_LIBRARY_STORAGE_KEY);
     }
   }
 }
@@ -1012,7 +1169,7 @@ function upsertSimulationInLibrary(library: SimulationLibrary, nextState: AppSta
 }
 
 function upsertSimulationInLibraryRaw(library: SimulationLibrary, nextState: AppState): SimulationLibrary {
-  const redactedState = stripLibrarySecrets(nextState);
+  const redactedState = stripCachedImagePayloadsFromState(stripLibrarySecrets(nextState));
   const exists = library.some((item) => item.simulation.id === nextState.simulation.id);
   const nextLibrary = exists
     ? library.map((item) => (item.simulation.id === nextState.simulation.id ? redactedState : item))
@@ -1238,7 +1395,88 @@ function stripCachedImagePayload(asset: ImageAsset): ImageAsset {
 }
 
 function hasMissingImagePayload(asset: ImageAsset): boolean {
-  return !asset.dataUrl;
+  return !asset.dataUrl && !asset.objectKey;
+}
+
+async function persistRuntimeImagePayloads(simulationId: string, assets: ImageAsset[]): Promise<ImageAsset[]> {
+  if (!assets.some((asset) => asset.dataUrl)) {
+    return assets;
+  }
+
+  try {
+    const persistedAssets = await createDynamicChatApiClient().persistImageAssets(
+      simulationId,
+      assets.filter((asset) => asset.dataUrl)
+    );
+    const persistedById = new Map(persistedAssets.map((asset) => [asset.id, stripCachedImagePayload(asset)]));
+    return assets.map((asset) => persistedById.get(asset.id) ?? asset);
+  } catch {
+    return assets;
+  }
+}
+
+function collectImageAssetsWithPayload(state: AppState): ImageAsset[] {
+  const assetsById = new Map<string, ImageAsset>();
+  for (const asset of collectStateImageAssets(state)) {
+    if (asset.dataUrl && !assetsById.has(asset.id)) {
+      assetsById.set(asset.id, asset);
+    }
+  }
+  return [...assetsById.values()];
+}
+
+function createImagePayloadCompactionSignature(state: AppState): string | undefined {
+  const payloadAssets = collectImageAssetsWithPayload(state);
+  if (payloadAssets.length === 0) {
+    return undefined;
+  }
+
+  return `${state.simulation.id}:${payloadAssets
+    .map((asset) => `${asset.id}:${asset.dataUrl?.length ?? 0}`)
+    .sort()
+    .join("|")}`;
+}
+
+function compactImagePayloadsInState(state: AppState, persistedAssets: ImageAsset[]): AppState {
+  const compactedById = new Map(
+    persistedAssets
+      .filter((asset) => asset.objectKey)
+      .map((asset) => [asset.id, stripCachedImagePayload(asset)])
+  );
+  if (compactedById.size === 0) {
+    return state;
+  }
+
+  let changed = false;
+  const compactAssets = (assets: ImageAsset[]): ImageAsset[] =>
+    assets.map((asset) => {
+      const compacted = compactedById.get(asset.id);
+      if (!compacted) {
+        return asset;
+      }
+
+      const { dataUrl: _dataUrl, ...assetWithoutPayload } = asset;
+      const nextAsset = {
+        ...assetWithoutPayload,
+        ...compacted
+      };
+      changed ||= asset.dataUrl !== undefined || nextAsset.objectKey !== asset.objectKey || nextAsset.mimeType !== asset.mimeType;
+      return nextAsset;
+    });
+
+  const imageAssets = compactAssets(state.imageAssets);
+  const progressRuns = state.progressRuns.map((run) => ({
+    ...run,
+    imageAssets: compactAssets(run.imageAssets)
+  }));
+
+  return changed
+    ? {
+        ...state,
+        imageAssets,
+        progressRuns
+      }
+    : state;
 }
 
 function collectDeletedImageAssetIds(state: AppState): Set<string> {
@@ -1301,7 +1539,7 @@ function mergeHydratedImagePayloads(currentAssets: ImageAsset[], hydratedAssets:
     return currentAssets;
   }
 
-  const hydratedById = new Map(hydratedAssets.map((asset) => [asset.id, asset]));
+  const hydratedById = new Map(hydratedAssets.map((asset) => [asset.id, asset.objectKey ? stripCachedImagePayload(asset) : asset]));
   let changed = false;
   const merged = currentAssets.map((asset) => {
     const hydrated = hydratedById.get(asset.id);
@@ -1309,10 +1547,11 @@ function mergeHydratedImagePayloads(currentAssets: ImageAsset[], hydratedAssets:
       return asset;
     }
 
+    const nextObjectKey = asset.objectKey ?? hydrated.objectKey;
     const nextAsset = {
       ...asset,
-      dataUrl: asset.dataUrl ?? hydrated.dataUrl,
-      objectKey: asset.objectKey ?? hydrated.objectKey,
+      dataUrl: asset.dataUrl ?? (nextObjectKey ? undefined : hydrated.dataUrl),
+      objectKey: nextObjectKey,
       mimeType: asset.mimeType ?? hydrated.mimeType
     };
     changed ||= nextAsset.dataUrl !== asset.dataUrl || nextAsset.objectKey !== asset.objectKey || nextAsset.mimeType !== asset.mimeType;
@@ -1321,7 +1560,9 @@ function mergeHydratedImagePayloads(currentAssets: ImageAsset[], hydratedAssets:
 
   const mergedIds = new Set(merged.map((asset) => asset.id));
   const missingAssets = appendMissing
-    ? hydratedAssets.filter((asset) => !mergedIds.has(asset.id) && (asset.dataUrl || asset.objectKey))
+    ? hydratedAssets
+        .filter((asset) => !mergedIds.has(asset.id) && (asset.dataUrl || asset.objectKey))
+        .map((asset) => (asset.objectKey ? stripCachedImagePayload(asset) : asset))
     : [];
 
   return changed || missingAssets.length > 0 ? [...merged, ...missingAssets] : currentAssets;
@@ -1354,8 +1595,18 @@ function mergeHydratedImagePayloadsIntoState(state: AppState, hydratedAssets: Im
       };
 }
 
-function persistStateSnapshotImmediately(state: AppState): void {
-  saveState(state);
+function saveStateSnapshot(state: AppState, options?: SaveStateOptions): void {
+  saveState(state, options);
+}
+
+function scheduleIdleTask(callback: () => void, timeout = 1400): () => void {
+  if ("requestIdleCallback" in window) {
+    const handle = window.requestIdleCallback(callback, { timeout });
+    return () => window.cancelIdleCallback(handle);
+  }
+
+  const handle = globalThis.setTimeout(callback, Math.min(timeout, 250));
+  return () => globalThis.clearTimeout(handle);
 }
 
 function getLlmProviderOption(provider: LlmApiSettings["provider"]) {
@@ -1417,6 +1668,16 @@ function runAfterNextPaint(callback: () => void): void {
 function readProviderCost(payload: Record<string, unknown>): number | undefined {
   const raw = payload.estimatedAnlas ?? payload.estimatedCost ?? payload.cost;
   return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+}
+
+function readImageCuePlannerSource(payload: Record<string, unknown>): string | undefined {
+  const planner = payload.imageCuePlanner;
+  if (!planner || typeof planner !== "object" || Array.isArray(planner)) {
+    return undefined;
+  }
+
+  const source = (planner as Record<string, unknown>).source;
+  return typeof source === "string" && source.trim() ? source : undefined;
 }
 
 function getImageJobStatusLabel(status: ImageGenerationJob["status"]): string {
@@ -1771,6 +2032,11 @@ function applyPromptModePresetToDraft(current: SimulationDraft, promptMode: Pres
       stylePrompt: preset.imageStylePrompt,
       userRules: preset.imageUserRules
     },
+    imageScenePresets: ensureDraftImageScenePresetIds(
+      (current.imageScenePresets?.length ?? 0) > 0
+        ? current.imageScenePresets
+        : createDefaultDraftImageScenePresets(now, promptMode)
+    ),
     relationshipMap: {
       ...current.relationshipMap,
       enabled: true,
@@ -1788,7 +2054,7 @@ function applyPromptModePresetToDraft(current: SimulationDraft, promptMode: Pres
 
 function createRelationshipMapPresetPrompt(promptMode: SimulationPromptMode): string {
   const shared =
-    "관계도/상태창은 오른쪽 관계도 탭에서 보여 줄 compact state source다. assistant_text에는 긴 상태창을 반복 출력하지 말고, 변화가 있을 때만 memory_events에 저장한다. 인물의 현재 위치, 감정, 체력/컨디션, 착용/소지품, 목표, 관계 변화는 memory_kind='state' 또는 'relationship'을 우선 사용한다. 의상 변화나 장면상 의상이 확정되면 state_type='Wearing'에 NovelAI-style English outfit tags를 저장하고, 표정/컨디션/자세/소지품처럼 이미지와 반응 일관성에 필요한 캐릭터별 상태 태그는 state_type='StatusTags'에 저장한다. 자세, 현재 행동, 상호작용, 전체 상황/단계, 소지품, 카메라/조명/장면 구도가 이미지 일관성에 중요하면 state_type='PoseTags', 'ActionTags', 'InteractionTags', 'InteractionPhaseTags', 'HeldItemTags', 'SceneTags', 'ScenePhaseTags', 'CompositionTags', 'CameraTags', 'LightingTags'에 comma-separated English NAI tags로 저장한다. 너무 세세한 부위별 태그를 매번 쌓기보다 현재 상황을 복원할 수 있는 3-8개의 compact phase/state tags를 우선한다. actor_id, actor_name, target_id, state_type, state_value를 알 수 있으면 반드시 채운다. 기존 상태와 같은 값은 반복하지 않는다.";
+    "관계도/상태창은 오른쪽 관계도 탭에서 보여 줄 compact state source다. assistant_text에는 긴 상태창을 반복 출력하지 말고, 변화가 있을 때만 memory_events에 저장한다. 인물의 현재 위치, 감정, 체력/컨디션, 착용/소지품, 목표, 관계 변화는 memory_kind='state' 또는 'relationship'을 우선 사용한다. 의상 변화나 장면상 의상이 확정되면 state_type='Wearing'에 NovelAI-style English outfit tags를 저장하고, 표정/컨디션/자세/소지품처럼 이미지와 반응 일관성에 필요한 캐릭터별 상태 태그는 state_type='StatusTags'에 저장한다. 기존 의상이 찢어짐/젖음/오염/헐거워짐처럼 변형될 때는 police uniform, navy short dress, mini skirt 같은 베이스 의상 태그를 유지하고 torn uniform 같은 상태 태그를 덧붙인다. 자세, 현재 행동, 상호작용, 전체 상황/단계, 소지품, 카메라/조명/장면 구도가 이미지 일관성에 중요하면 state_type='PoseTags', 'ActionTags', 'InteractionTags', 'InteractionPhaseTags', 'HeldItemTags', 'SceneTags', 'ScenePhaseTags', 'CompositionTags', 'CameraTags', 'LightingTags'에 comma-separated English NAI tags로 저장한다. 너무 세세한 부위별 태그를 매번 쌓기보다 현재 상황을 복원할 수 있는 3-8개의 compact phase/state tags를 우선한다. actor_id, actor_name, target_id, state_type, state_value를 알 수 있으면 반드시 채운다. 기존 상태와 같은 값은 반복하지 않는다.";
 
   if (promptMode === "one_on_one") {
     return `${shared}\n1:1 진행에서는 신뢰, 호감, 거리감, 약속, 상처, 선호처럼 관계 이해에 필요한 작은 변화도 relationship 또는 observation으로 남긴다.`;
@@ -1799,6 +2065,353 @@ function createRelationshipMapPresetPrompt(promptMode: SimulationPromptMode): st
   }
 
   return `${shared}\n기본 진행에서는 캐릭터가 다음 장면에서 일관되게 반응하는 데 필요한 상태와 관계 변화만 선별해 저장한다.`;
+}
+
+function createDefaultDraftImageScenePresets(now = new Date().toISOString(), promptMode: SimulationPromptMode = "basic"): ImageSceneTagPreset[] {
+  const common = [
+    {
+      keyword: "classroom",
+      tags: ["classroom", "indoors", "desk", "chair", "window", "daylight", "school interior"],
+      note: "교실 내부 기본 장면. 캐릭터 외형/복장 태그는 제외.",
+      children: [
+        {
+          id: "draft_scene_preset_classroom_window",
+          keyword: "window seat",
+          tags: ["window", "sunlight", "desk", "curtain", "classroom"],
+          note: "창가 자리/측면광 장면.",
+          enabled: true,
+          priority: 76,
+          updatedAt: now,
+          children: []
+        }
+      ]
+    },
+    {
+      keyword: "hallway",
+      tags: ["school hallway", "corridor", "indoors", "locker", "fluorescent light", "depth of field"],
+      note: "복도 이동/대기 장면. 인물 태그 없이 공간과 조명만 유지.",
+      children: []
+    },
+    {
+      keyword: "night street",
+      tags: ["night", "street", "city lights", "wet pavement", "street lamp", "reflection", "cinematic lighting"],
+      note: "야간 외부 장면. 날씨/조명/배경 중심.",
+      children: [
+        {
+          id: "draft_scene_preset_night_street_alley",
+          keyword: "alley",
+          tags: ["narrow alley", "neon sign", "wet pavement", "mist", "backlight"],
+          note: "골목/추적/대기 장면.",
+          enabled: true,
+          priority: 72,
+          updatedAt: now,
+          children: []
+        }
+      ]
+    }
+  ];
+  const simulationOnly =
+    promptMode === "simulation"
+      ? [
+          {
+            keyword: "operation room",
+            tags: ["control room", "monitor", "desk", "dim light", "blue lighting", "equipment", "tense atmosphere"],
+            note: "작전/상태 확인 장면. 캐릭터 태그는 후속 cue에서 따로 붙인다.",
+            children: []
+          }
+        ]
+      : [];
+
+  return ensureDraftImageScenePresetIds(
+    [...common, ...simulationOnly].map((preset, index) => ({
+      id: `draft_scene_preset_${index + 1}`,
+      simulationId: "draft_simulation",
+      keyword: preset.keyword,
+      tags: preset.tags,
+      note: preset.note,
+      enabled: true,
+      priority: 80 - index * 4,
+      updatedAt: now,
+      children: preset.children
+    }))
+  );
+}
+
+function cloneImageScenePresetNodes(nodes: ImageSceneTagPresetNode[] | undefined): ImageSceneTagPresetNode[] {
+  return (nodes ?? []).map((node) => ({
+    ...node,
+    tags: [...node.tags],
+    children: cloneImageScenePresetNodes(node.children)
+  }));
+}
+
+function ensureDraftImageScenePresetIds(presets: ImageSceneTagPreset[]): ImageSceneTagPreset[] {
+  const seen = new Set<string>();
+  return presets.map((preset, index) => ({
+    ...preset,
+    id: reserveImageScenePresetId(preset.id, `draft_scene_preset_${index + 1}`, seen),
+    simulationId: preset.simulationId || "draft_simulation",
+    children: ensureDraftImageScenePresetNodeIds(preset.children, seen, `${index + 1}`)
+  }));
+}
+
+function ensureDraftImageScenePresetNodeIds(
+  nodes: ImageSceneTagPresetNode[] | undefined,
+  seen: Set<string>,
+  path: string
+): ImageSceneTagPresetNode[] {
+  return (nodes ?? []).map((node, index) => {
+    const nodePath = `${path}_${index + 1}`;
+    return {
+      ...node,
+      id: reserveImageScenePresetId(node.id, `draft_scene_preset_child_${nodePath}`, seen),
+      children: ensureDraftImageScenePresetNodeIds(node.children, seen, nodePath)
+    };
+  });
+}
+
+function normalizeDraftImageScenePresetNodes(
+  nodes: ImageSceneTagPresetNode[] | undefined,
+  updatedAt: string,
+  seen = new Set<string>(),
+  path = "child"
+): ImageSceneTagPresetNode[] {
+  return (nodes ?? []).map((node, index) => ({
+    ...node,
+    id: reserveImageScenePresetId(
+      node.id && !node.id.startsWith("draft_") ? node.id : undefined,
+      `scene_preset_child_${path}_${index + 1}`,
+      seen
+    ),
+    keyword: node.keyword.trim() || `scene-${index + 1}`,
+    tags: node.tags.map((tag) => tag.trim()).filter(Boolean),
+    note: node.note.trim(),
+    enabled: node.enabled,
+    priority: Math.min(120, Math.max(0, Number(node.priority) || 70)),
+    updatedAt,
+    children: normalizeDraftImageScenePresetNodes(node.children, updatedAt, seen, `${path}_${index + 1}`)
+  }));
+}
+
+function reserveImageScenePresetId(candidateId: string | undefined, fallbackPrefix: string, seen: Set<string>): string {
+  let id = candidateId?.trim();
+  if (!id || seen.has(id)) {
+    do {
+      id = createId(fallbackPrefix);
+    } while (seen.has(id));
+  }
+  seen.add(id);
+  return id;
+}
+
+function createDraftImageScenePresetNode(now: string, index: number): ImageSceneTagPresetNode {
+  return {
+    id: createId("draft_scene_preset"),
+    keyword: `sub keyword ${index}`,
+    tags: ["close-up", "soft light"],
+    note: "",
+    enabled: true,
+    priority: 68,
+    updatedAt: now,
+    children: []
+  };
+}
+
+function updateImageScenePresetNodes<T extends ImageSceneTagPresetNode>(
+  nodes: T[],
+  presetId: string,
+  patch: Partial<ImageSceneTagPresetNode>,
+  updatedAt: string
+): T[] {
+  return nodes.map((node) => {
+    if (node.id === presetId) {
+      return {
+        ...node,
+        ...patch,
+        updatedAt,
+        children: patch.children ?? node.children ?? []
+      } as T;
+    }
+
+    return {
+      ...node,
+      children: updateImageScenePresetNodes(node.children ?? [], presetId, patch, updatedAt)
+    } as T;
+  });
+}
+
+function appendImageScenePresetChild<T extends ImageSceneTagPresetNode>(
+  nodes: T[],
+  parentId: string,
+  child: ImageSceneTagPresetNode,
+  updatedAt: string
+): T[] {
+  return nodes.map((node) => {
+    if (node.id === parentId) {
+      return {
+        ...node,
+        updatedAt,
+        children: [...(node.children ?? []), child]
+      } as T;
+    }
+
+    return {
+      ...node,
+      children: appendImageScenePresetChild(node.children ?? [], parentId, child, updatedAt)
+    } as T;
+  });
+}
+
+function moveImageScenePresetNodes(
+  presets: ImageSceneTagPreset[],
+  sourceId: string,
+  targetId: string,
+  position: ImageScenePresetDropPosition,
+  updatedAt: string,
+  simulationId = "draft_simulation"
+): ImageSceneTagPreset[] {
+  if (sourceId === targetId || isImageScenePresetDescendant(presets, sourceId, targetId)) {
+    return presets;
+  }
+
+  const removal = removeImageScenePresetNode(presets, sourceId);
+  if (!removal.removed) {
+    return presets;
+  }
+
+  const insertion = insertImageScenePresetNode(removal.nodes, removal.removed, targetId, position, updatedAt, simulationId);
+  return insertion.inserted ? insertion.nodes : presets;
+}
+
+function removeImageScenePresetNode<T extends ImageSceneTagPresetNode>(
+  nodes: T[],
+  sourceId: string
+): { nodes: T[]; removed?: ImageSceneTagPresetNode } {
+  let removed: ImageSceneTagPresetNode | undefined;
+  const nextNodes: T[] = [];
+
+  for (const node of nodes) {
+    if (node.id === sourceId) {
+      removed = node;
+      continue;
+    }
+
+    const childRemoval = removeImageScenePresetNode(node.children ?? [], sourceId);
+    if (childRemoval.removed) {
+      removed = childRemoval.removed;
+      nextNodes.push({
+        ...node,
+        children: childRemoval.nodes
+      } as T);
+    } else {
+      nextNodes.push(node);
+    }
+  }
+
+  return { nodes: nextNodes, removed };
+}
+
+function insertImageScenePresetNode<T extends ImageSceneTagPresetNode>(
+  nodes: T[],
+  movingNode: ImageSceneTagPresetNode,
+  targetId: string,
+  position: ImageScenePresetDropPosition,
+  updatedAt: string,
+  rootSimulationId?: string
+): { nodes: T[]; inserted: boolean } {
+  const nextNodes: T[] = [];
+  let inserted = false;
+
+  for (const node of nodes) {
+    if (node.id === targetId && position === "before") {
+      nextNodes.push(createImageScenePresetNodeForLevel(movingNode, rootSimulationId) as T);
+      inserted = true;
+    }
+
+    if (node.id === targetId && position === "inside") {
+      nextNodes.push({
+        ...node,
+        updatedAt,
+        children: [...(node.children ?? []), createImageScenePresetChildNode(movingNode)]
+      } as T);
+      inserted = true;
+      continue;
+    }
+
+    const childInsertion: { nodes: ImageSceneTagPresetNode[]; inserted: boolean } | undefined =
+      inserted || node.id === targetId
+        ? undefined
+        : insertImageScenePresetNode(node.children ?? [], movingNode, targetId, position, updatedAt);
+    nextNodes.push(
+      childInsertion?.inserted
+        ? ({
+            ...node,
+            updatedAt,
+            children: childInsertion.nodes
+          } as T)
+        : node
+    );
+    inserted = inserted || Boolean(childInsertion?.inserted);
+
+    if (node.id === targetId && position === "after") {
+      nextNodes.push(createImageScenePresetNodeForLevel(movingNode, rootSimulationId) as T);
+      inserted = true;
+    }
+  }
+
+  return { nodes: nextNodes, inserted };
+}
+
+function createImageScenePresetNodeForLevel(node: ImageSceneTagPresetNode, rootSimulationId?: string): ImageSceneTagPresetNode {
+  return rootSimulationId ? createImageScenePresetRootNode(node, rootSimulationId) : createImageScenePresetChildNode(node);
+}
+
+function createImageScenePresetRootNode(node: ImageSceneTagPresetNode, simulationId: string): ImageSceneTagPreset {
+  return {
+    ...node,
+    simulationId: "simulationId" in node && typeof node.simulationId === "string" ? node.simulationId : simulationId
+  };
+}
+
+function createImageScenePresetChildNode(node: ImageSceneTagPresetNode): ImageSceneTagPresetNode {
+  const { simulationId, ...childNode } = node as ImageSceneTagPresetNode & { simulationId?: string };
+  void simulationId;
+  return childNode;
+}
+
+function deleteImageScenePresetNode<T extends ImageSceneTagPresetNode>(nodes: T[], presetId: string): T[] {
+  return nodes
+    .filter((node) => node.id !== presetId)
+    .map((node) => ({
+      ...node,
+      children: deleteImageScenePresetNode(node.children ?? [], presetId)
+    }) as T);
+}
+
+function collectImageScenePresetNodeIds(nodes: ImageSceneTagPresetNode[]): string[] {
+  return nodes.flatMap((node) => [node.id, ...collectImageScenePresetNodeIds(node.children ?? [])]);
+}
+
+function createImageScenePresetDescendantMap(nodes: ImageSceneTagPresetNode[]): Map<string, Set<string>> {
+  const descendantMap = new Map<string, Set<string>>();
+  const visit = (node: ImageSceneTagPresetNode): string[] => {
+    const descendants = (node.children ?? []).flatMap((child) => [child.id, ...visit(child)]);
+    descendantMap.set(node.id, new Set(descendants));
+    return descendants;
+  };
+  nodes.forEach(visit);
+  return descendantMap;
+}
+
+function isImageScenePresetDescendant(nodes: ImageSceneTagPresetNode[], sourceId: string, targetId: string): boolean {
+  return Boolean(createImageScenePresetDescendantMap(nodes).get(sourceId)?.has(targetId));
+}
+
+function countEnabledImageScenePresetNodes(nodes: ImageSceneTagPresetNode[]): number {
+  return nodes.reduce(
+    (count, node) => count + (node.enabled ? 1 + countEnabledImageScenePresetNodes(node.children ?? []) : 0),
+    0
+  );
 }
 
 function createDraftFromState(source: AppState): SimulationDraft {
@@ -1826,6 +2439,13 @@ function createDraftFromState(source: AppState): SimulationDraft {
     outfitPrompts: firstVisual?.outfitPrompts ?? defaultOutfitPrompts,
     expressionPrompts: firstVisual?.expressionPrompts ?? defaultExpressionPrompts,
     realtimeImageEnabled: source.simulation.realtimeImageEnabled,
+    imageScenePresets: ensureDraftImageScenePresetIds(
+      (source.imageScenePresets ?? []).map((preset) => ({
+        ...preset,
+        tags: [...preset.tags],
+        children: cloneImageScenePresetNodes(preset.children)
+      }))
+    ),
     characters: source.characters.map((character) => {
       const visual = source.visualProfiles.find((profile) => profile.characterId === character.id);
       return {
@@ -1849,6 +2469,13 @@ function createDraftFromState(source: AppState): SimulationDraft {
     relationshipMap: { ...source.relationshipMap },
     llm: toShareableLlmSettings(source.llm),
     novelAi: toShareableNovelAiSettings(source.novelAi)
+  };
+}
+
+function normalizeBuilderDraft(draft: SimulationDraft): SimulationDraft {
+  return {
+    ...draft,
+    imageScenePresets: ensureDraftImageScenePresetIds(draft.imageScenePresets ?? [])
   };
 }
 
@@ -1904,6 +2531,23 @@ function updateStateFromDraft(existing: AppState, draft: SimulationDraft): AppSt
       defaultSafetyLevel: character.defaultSafetyLevel
     };
   });
+  const scenePresetSeenIds = new Set<string>();
+  const imageScenePresets: ImageSceneTagPreset[] = (draft.imageScenePresets ?? []).map((preset, index) => ({
+    ...preset,
+    id: reserveImageScenePresetId(
+      preset.id && !preset.id.startsWith("draft_") ? preset.id : undefined,
+      `scene_preset_${index + 1}`,
+      scenePresetSeenIds
+    ),
+    simulationId: existing.simulation.id,
+    keyword: preset.keyword.trim() || `scene-${index + 1}`,
+    tags: preset.tags.map((tag) => tag.trim()).filter(Boolean),
+    note: preset.note.trim(),
+    enabled: preset.enabled,
+    priority: Math.min(120, Math.max(0, Number(preset.priority) || 70)),
+    updatedAt: now,
+    children: normalizeDraftImageScenePresetNodes(preset.children, now, scenePresetSeenIds, `${index + 1}`)
+  }));
   const openingContent = draft.startSituationPrompt.trim();
   const shouldUpdateOpeningMessage =
     Boolean(openingContent) && existing.messages.filter((message) => message.role === "user").length === 0;
@@ -1940,6 +2584,7 @@ function updateStateFromDraft(existing: AppState, draft: SimulationDraft): AppSt
     modules,
     characters,
     visualProfiles,
+    imageScenePresets,
     messages,
     imageProfile: {
       ...existing.imageProfile,
@@ -2004,6 +2649,10 @@ function createReplySuggestions(state: AppState): string[] {
     latestAssistantLine ? "방금 나온 대사에 맞춰 감정을 드러내며 대답한다." : "주변 상황을 관찰하고 먼저 말을 건다.",
     latestMemoryTag ? `최근 기억(${latestMemoryTag})을 떠올리며 다음 행동을 정한다.` : "현재 목표를 짧게 정리하고 다음 행동을 선택한다."
   ];
+}
+
+function createTurnSubmissionText(draft: string): string {
+  return draft.trim() || AUTO_CONTINUE_TURN_TEXT;
 }
 
 function insertActionNotation(
@@ -2612,7 +3261,7 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
   const segments: DynamicTextSegment[] = [];
   const markdownLines: string[] = [];
   const flushMarkdown = () => {
-    const markdown = markdownLines.join("\n").trim();
+    const markdown = normalizeLooseMarkdownTables(markdownLines.join("\n").trim());
     if (markdown) {
       segments.push({
         id: `markdown-${segments.length}`,
@@ -2708,9 +3357,17 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
 }
 
 function findMessageAssets(message: AppState["messages"][number], assetsById: Map<string, ImageAsset>): ImageAsset[] {
+  if (message.imageAssetIds.length === 0) {
+    return EMPTY_IMAGE_ASSETS;
+  }
+
   const assets = message.imageAssetIds
     .map((assetId) => assetsById.get(assetId))
     .filter((asset): asset is ImageAsset => Boolean(asset));
+  if (assets.length === 0) {
+    return EMPTY_IMAGE_ASSETS;
+  }
+
   const generatedAssets = assets.filter((asset) => asset.source === "generated");
   if (generatedAssets.length > 0) {
     return generatedAssets;
@@ -3281,6 +3938,7 @@ function App() {
   const [builderMode, setBuilderMode] = useState<BuilderMode>("create");
   const [builderSource, setBuilderSource] = useState<AppState | undefined>();
   const [draft, setDraft] = useState("");
+  const [pendingUserText, setPendingUserText] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   const [personalSettingsOpen, setPersonalSettingsOpen] = useState(false);
@@ -3290,10 +3948,41 @@ function App() {
   const [storageReady, setStorageReady] = useState(false);
   const imageJobQueueRef = useRef<Promise<void>>(Promise.resolve());
   const imageAssetHydrationAttemptsRef = useRef<Map<string, number>>(new Map());
+  const imagePayloadCompactionAttemptsRef = useRef<Map<string, number>>(new Map());
   const neuralMapPrimeAttemptsRef = useRef<Set<string>>(new Set());
+  const pendingStateSaveRef = useRef<AppState | undefined>(undefined);
+  const pendingStateSaveOptionsRef = useRef<SaveStateOptions>({});
+  const stateSaveScheduledRef = useRef(false);
 
   const showRuntimeNotice = useCallback((message: string) => {
     setRuntimeNotice({ id: Date.now(), message });
+  }, []);
+
+  const scheduleStatePersistence = useCallback((snapshot: AppState, options: SaveStateOptions = {}) => {
+    pendingStateSaveRef.current = snapshot;
+    pendingStateSaveOptionsRef.current = {
+      ...pendingStateSaveOptionsRef.current,
+      ...options,
+      includeImagePayloads:
+        pendingStateSaveOptionsRef.current.includeImagePayloads === true ||
+        options.includeImagePayloads === true
+    };
+
+    if (stateSaveScheduledRef.current) {
+      return;
+    }
+
+    stateSaveScheduledRef.current = true;
+    scheduleIdleTask(() => {
+      const stateToSave = pendingStateSaveRef.current;
+      const saveOptions = pendingStateSaveOptionsRef.current;
+      pendingStateSaveRef.current = undefined;
+      pendingStateSaveOptionsRef.current = {};
+      stateSaveScheduledRef.current = false;
+      if (stateToSave) {
+        saveStateSnapshot(stateToSave, saveOptions);
+      }
+    });
   }, []);
 
   const primeNeuralMapSimulation = useCallback(
@@ -3438,13 +4127,68 @@ function App() {
   }, [showRuntimeNotice]);
 
   useEffect(() => {
-    if (!storageReady || isSending) {
+    if (!storageReady) {
       return;
     }
 
-    saveState(state);
-    setSimulationLibrary((current) => upsertSimulationInLibrary(current, state));
-  }, [isSending, state, storageReady]);
+    scheduleStatePersistence(state);
+    if (!isSending) {
+      setSimulationLibrary((current) => upsertSimulationInLibrary(current, state));
+    }
+  }, [isSending, scheduleStatePersistence, state, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) {
+      return undefined;
+    }
+
+    const persistBeforeUnload = () => {
+      saveStateSnapshot(state, { skipServer: true });
+    };
+
+    window.addEventListener("pagehide", persistBeforeUnload);
+    return () => window.removeEventListener("pagehide", persistBeforeUnload);
+  }, [state, storageReady]);
+
+  useEffect(() => {
+    if (!storageReady) {
+      return;
+    }
+
+    const compactionSignature = createImagePayloadCompactionSignature(state);
+    if (!compactionSignature) {
+      return;
+    }
+
+    const now = Date.now();
+    const lastAttempt = imagePayloadCompactionAttemptsRef.current.get(compactionSignature) ?? 0;
+    if (now - lastAttempt < 30_000) {
+      return;
+    }
+    imagePayloadCompactionAttemptsRef.current.set(compactionSignature, now);
+
+    const assetsWithPayload = collectImageAssetsWithPayload(state);
+    let cancelled = false;
+
+    async function compactExistingImagePayloads() {
+      const persistedAssets = await persistRuntimeImagePayloads(state.simulation.id, assetsWithPayload);
+      if (cancelled || !persistedAssets.some((asset) => asset.objectKey && !asset.dataUrl)) {
+        return;
+      }
+
+      setState((current) =>
+        current.simulation.id === state.simulation.id
+          ? compactImagePayloadsInState(current, persistedAssets)
+          : current
+      );
+    }
+
+    void compactExistingImagePayloads();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state, storageReady]);
 
   useEffect(() => {
     if (!storageReady || isSending) {
@@ -3877,10 +4621,16 @@ function App() {
     let result: Awaited<ReturnType<typeof executeImageJob>>;
     try {
       result = await executeImageJob(snapshot, executableJob, {
-        onProgress: (progress) => {
-          const progressAssetIds = progress.assets.map((asset) => asset.id);
+        onProgress: async (progress) => {
+          const progressAssets = await persistRuntimeImagePayloads(snapshot.simulation.id, progress.assets);
+          const progressAssetIds = progressAssets.map((asset) => asset.id);
+          const progressJob = {
+            ...progress.job,
+            assetIds: progressAssetIds,
+            representativeAssetId: progressAssets[0]?.id ?? progress.job.representativeAssetId
+          };
           setState((current) => {
-            const existing = current.imageJobs.find((candidate) => candidate.id === progress.job.id);
+            const existing = current.imageJobs.find((candidate) => candidate.id === progressJob.id);
             if (existing?.status === "canceled") {
               return current;
             }
@@ -3888,25 +4638,25 @@ function App() {
             const nextState = {
               ...current,
               imageJobs: current.imageJobs.map((candidate) =>
-                candidate.id === progress.job.id
+                candidate.id === progressJob.id
                   ? {
                       ...candidate,
-                      ...progress.job,
-                      status: candidate.status === "canceled" ? candidate.status : progress.job.status
+                      ...progressJob,
+                      status: candidate.status === "canceled" ? candidate.status : progressJob.status
                     }
                   : candidate
               ),
-              imageAssets: upsertImageAssets(current.imageAssets, progress.assets),
+              imageAssets: upsertImageAssets(current.imageAssets, progressAssets),
               messages: current.messages.map((message) =>
-                message.id === progress.job.turnId
+                message.id === progressJob.turnId
                   ? {
                       ...message,
-                      imageAssetIds: mergeGeneratedMessageImageAssetIds(message.imageAssetIds, current.imageAssets, progress.assets)
+                      imageAssetIds: mergeGeneratedMessageImageAssetIds(message.imageAssetIds, current.imageAssets, progressAssets)
                     }
                   : message
               ),
               turnTraces: current.turnTraces.map((trace) => {
-                if (trace.imageJobId !== progress.job.id && trace.assistantMessageId !== progress.job.turnId) {
+                if (trace.imageJobId !== progressJob.id && trace.assistantMessageId !== progressJob.turnId) {
                   return trace;
                 }
 
@@ -3921,7 +4671,7 @@ function App() {
                 };
               })
             };
-            persistStateSnapshotImmediately(nextState);
+            scheduleStatePersistence(nextState);
             return nextState;
           });
         }
@@ -3936,6 +4686,17 @@ function App() {
       showRuntimeNotice(`NovelAI 이미지 생성 실패: ${message}`);
       return;
     }
+
+    const resultAssets = await persistRuntimeImagePayloads(snapshot.simulation.id, result.assets);
+    result = {
+      ...result,
+      assets: resultAssets,
+      job: {
+        ...result.job,
+        assetIds: resultAssets.map((asset) => asset.id),
+        representativeAssetId: resultAssets[0]?.id ?? result.job.representativeAssetId
+      }
+    };
 
     setState((current) => {
       const existing = current.imageJobs.find((candidate) => candidate.id === executableJob.id);
@@ -3980,7 +4741,7 @@ function App() {
             : message
         )
       };
-      persistStateSnapshotImmediately(nextState);
+      scheduleStatePersistence(nextState, { includeImagePayloads: result.assets.some((asset) => Boolean(asset.dataUrl)) });
       return nextState;
     });
     };
@@ -3988,7 +4749,7 @@ function App() {
     const queued = imageJobQueueRef.current.then(run, run);
     imageJobQueueRef.current = queued.catch(() => undefined);
     return queued;
-  }, [showRuntimeNotice]);
+  }, [scheduleStatePersistence, showRuntimeNotice]);
 
   const cancelImageJob = useCallback((jobId: string) => {
     setState((current) => ({
@@ -4219,27 +4980,29 @@ function App() {
 
   const planAndQueueImageForTurn = useCallback(
     async (result: TurnResult, snapshot: AppState, manual: boolean) => {
-      const imagePlan = await planImageJobForCompletedTurn(snapshot, {
-        userMessage: result.userMessage,
-        assistantMessage: result.assistantMessage,
-        contextPack: result.contextPack,
-        promptModuleUsages: result.promptModuleUsages,
-        sidecar: result.sidecar,
-        sidecarTrace: result.sidecarTrace,
-        manualImage: manual
-      });
-      const imageJobs = imagePlan.imageJobs.length > 0 ? imagePlan.imageJobs : imagePlan.imageJob ? [imagePlan.imageJob] : [];
-      const primaryImageJob = imagePlan.imageJob ?? imageJobs[0];
-      const reusedAssetIds = imagePlan.reusedAssetIds ?? [];
-      const imageEstimatedCost = imageJobs.reduce(
-        (sum, job) => sum + (readProviderCost(job.providerPayload) ?? 0),
-        0
-      );
+      try {
+        const runtimeSnapshot = await resolveStateWithRuntimeSecrets(snapshot);
+        const imagePlan = await planImageJobForCompletedTurn(runtimeSnapshot, {
+          userMessage: result.userMessage,
+          assistantMessage: result.assistantMessage,
+          contextPack: result.contextPack,
+          promptModuleUsages: result.promptModuleUsages,
+          sidecar: result.sidecar,
+          sidecarTrace: result.sidecarTrace,
+          manualImage: manual
+        });
+        const imageJobs = imagePlan.imageJobs.length > 0 ? imagePlan.imageJobs : imagePlan.imageJob ? [imagePlan.imageJob] : [];
+        const primaryImageJob = imagePlan.imageJob ?? imageJobs[0];
+        const reusedAssetIds = imagePlan.reusedAssetIds ?? [];
+        const imageEstimatedCost = imageJobs.reduce(
+          (sum, job) => sum + (readProviderCost(job.providerPayload) ?? 0),
+          0
+        );
 
-      setState((current) => {
-        const existingJobIds = new Set(current.imageJobs.map((job) => job.id));
-        const newImageJobs = imageJobs.filter((job) => !existingJobIds.has(job.id));
-        return {
+        setState((current) => {
+          const existingJobIds = new Set(current.imageJobs.map((job) => job.id));
+          const newImageJobs = imageJobs.filter((job) => !existingJobIds.has(job.id));
+          return {
           ...current,
           messages: reusedAssetIds.length > 0
             ? current.messages.map((message) =>
@@ -4276,68 +5039,77 @@ function App() {
                   status: imageJob.status,
                   triggerMode: imageJob.providerPayload.triggerMode,
                   requiresConfirmation: imageJob.providerPayload.requiresConfirmation,
-                  planner: "image-cue-sidecar"
+                  planner: readImageCuePlannerSource(imageJob.providerPayload) ?? "image-cue-sidecar"
                 }))
               ]
             : current.auditLog
-        };
-      });
-
-      const runnableImageJobs = imageJobs.filter(shouldAutoRunImageJob);
-      if (runnableImageJobs.length > 0) {
-        const snapshotWithImageJobs = {
-          ...snapshot,
-          messages: reusedAssetIds.length > 0
-            ? snapshot.messages.map((message) =>
-                message.id === result.assistantMessage.id
-                  ? {
-                      ...message,
-                      imageAssetIds: uniqueIds([...message.imageAssetIds, ...reusedAssetIds])
-                    }
-                  : message
-              )
-            : snapshot.messages,
-          imageJobs: [...snapshot.imageJobs, ...imageJobs],
-          turnTraces: snapshot.turnTraces.map((trace) =>
-            trace.id === result.turnTrace.id
-              ? {
-                  ...trace,
-                  imageCue: imagePlan.imageCue,
-                  imageJobId: primaryImageJob?.id,
-                  imageAssetIds: uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]),
-                  metrics: {
-                    ...trace.metrics,
-                    imageJobCount: imageJobs.length,
-                    imageAssetCount: Math.max(trace.metrics.imageAssetCount, uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]).length),
-                    imageEstimatedCost:
-                      imageEstimatedCost > 0 ? imageEstimatedCost : trace.metrics.imageEstimatedCost
-                  }
-                }
-              : trace
-          )
-        };
-
-        runAfterNextPaint(() => {
-          void (async () => {
-            for (const imageJob of runnableImageJobs) {
-              await runQueuedImageJob(imageJob, snapshotWithImageJobs);
-            }
-          })();
+          };
         });
+
+        if (manual && imageJobs.length === 0 && reusedAssetIds.length === 0) {
+          showRuntimeNotice(imagePlan.imageCue.suppressionReason ?? "이미지 cue가 렌더 가능한 NAI 태그를 만들지 못해 작업을 만들지 않았습니다.");
+        }
+
+        const runnableImageJobs = imageJobs.filter(shouldAutoRunImageJob);
+        if (runnableImageJobs.length > 0) {
+          const snapshotWithImageJobs = {
+            ...runtimeSnapshot,
+            messages: reusedAssetIds.length > 0
+              ? runtimeSnapshot.messages.map((message) =>
+                  message.id === result.assistantMessage.id
+                    ? {
+                        ...message,
+                        imageAssetIds: uniqueIds([...message.imageAssetIds, ...reusedAssetIds])
+                      }
+                    : message
+                )
+              : runtimeSnapshot.messages,
+            imageJobs: [...runtimeSnapshot.imageJobs, ...imageJobs],
+            turnTraces: runtimeSnapshot.turnTraces.map((trace) =>
+              trace.id === result.turnTrace.id
+                ? {
+                    ...trace,
+                    imageCue: imagePlan.imageCue,
+                    imageJobId: primaryImageJob?.id,
+                    imageAssetIds: uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]),
+                    metrics: {
+                      ...trace.metrics,
+                      imageJobCount: imageJobs.length,
+                      imageAssetCount: Math.max(trace.metrics.imageAssetCount, uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]).length),
+                      imageEstimatedCost:
+                        imageEstimatedCost > 0 ? imageEstimatedCost : trace.metrics.imageEstimatedCost
+                    }
+                  }
+                : trace
+            )
+          };
+
+          runAfterNextPaint(() => {
+            void (async () => {
+              for (const imageJob of runnableImageJobs) {
+                await runQueuedImageJob(imageJob, snapshotWithImageJobs);
+              }
+            })();
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "이미지 작업 계획 중 알 수 없는 오류가 발생했습니다.";
+        showRuntimeNotice(`이미지 작업 계획 실패: ${message}`);
       }
     },
-    [runQueuedImageJob]
+    [resolveStateWithRuntimeSecrets, runQueuedImageJob, showRuntimeNotice]
   );
 
   const handleSubmit = useCallback(
     async (event: FormEvent) => {
       event.preventDefault();
-      const text = draft.trim();
-      if (!text || isSending || isResetting) {
+      if (isSending || isResetting) {
         return;
       }
 
+      const text = createTurnSubmissionText(draft);
       setIsSending(true);
+      setPendingUserText(text);
       try {
         const runtimeState = await resolveStateWithRuntimeSecrets(state);
         const resetDecision = createAutoResetAgentSessionDecision(runtimeState, text);
@@ -4380,6 +5152,7 @@ function App() {
         const message = error instanceof Error ? error.message : "시뮬레이션 턴 실행 중 알 수 없는 오류가 발생했습니다.";
         showRuntimeNotice(`시뮬레이션 진행 실패: ${message}`);
       } finally {
+        setPendingUserText("");
         setIsSending(false);
       }
     },
@@ -4400,6 +5173,7 @@ function App() {
       }
 
       setIsSending(true);
+      setPendingUserText(regeneration.userMessage.content);
       setDraft(regeneration.userMessage.content);
       setState(regeneration.baseState);
 
@@ -4444,6 +5218,7 @@ function App() {
         setState(state);
         showRuntimeNotice(`응답 재생성 실패: ${message}`);
       } finally {
+        setPendingUserText("");
         setDraft("");
         setManualImage(false);
         setIsSending(false);
@@ -4546,6 +5321,37 @@ function App() {
     setDraft("첫 장면에서 주변을 살피고 주요 인물에게 말을 건다.");
     setView("simulation");
   }, [getActivePersonalApiVault]);
+
+  const copySimulation = useCallback(
+    (simulationId: string) => {
+      const source =
+        simulationId === state.simulation.id
+          ? state
+          : simulationLibrary.find((item) => item.simulation.id === simulationId);
+      if (!source) {
+        showRuntimeNotice("복사할 시뮬레이션을 찾지 못했습니다.");
+        return;
+      }
+
+      const activeVault = getActivePersonalApiVault();
+      const hydratedSource = hydrateState(source);
+      const existingTitles = simulationLibrary.map((item) => item.simulation.title);
+      const copyDraft: SimulationDraft = {
+        ...createDraftFromState(hydratedSource),
+        title: createCopiedSimulationTitle(hydratedSource.simulation.title, existingTitles)
+      };
+      const nextState = applyPersonalApiVault(createStateFromDraft(copyDraft), activeVault);
+      setState(nextState);
+      setSimulationLibrary((current) => upsertSimulationInLibrary(current, nextState));
+      setBuilderSource(nextState);
+      setBuilderMode("edit");
+      setDraft("");
+      setRightPanel("neuralmap");
+      setView("create");
+      showRuntimeNotice(`"${hydratedSource.simulation.title}" 복사본 제작 화면을 열었습니다.`);
+    },
+    [getActivePersonalApiVault, showRuntimeNotice, simulationLibrary, state]
+  );
 
   const updateSimulation = useCallback(
     (simulationDraft: SimulationDraft) => {
@@ -4680,6 +5486,7 @@ function App() {
           activeSimulationId={state.simulation.id}
           simulations={simulationLibrary}
           onCreate={() => openBuilder()}
+          onCopy={copySimulation}
           onEdit={editSimulation}
           onOpen={openSimulation}
           onStartNewRun={startNewSimulationRun}
@@ -4698,6 +5505,7 @@ function App() {
             state={state}
             latestAssets={latestAssets}
             draft={draft}
+            pendingUserText={pendingUserText}
             isSending={isSending}
             isResetting={isResetting}
             manualImage={manualImage}
@@ -4783,6 +5591,7 @@ function CrackSimulationRunPage({
   state,
   latestAssets,
   draft,
+  pendingUserText,
   isSending,
   isResetting,
   manualImage,
@@ -4814,6 +5623,7 @@ function CrackSimulationRunPage({
   state: AppState;
   latestAssets: ImageAsset[];
   draft: string;
+  pendingUserText: string;
   isSending: boolean;
   isResetting: boolean;
   manualImage: boolean;
@@ -4893,6 +5703,7 @@ function CrackSimulationRunPage({
   const latestImageJob = state.imageJobs.at(-1);
   const rightMenuStatus = state.novelAi.enabled ? "NovelAI 연결" : "저장 이미지";
   const autoResetDecision = useMemo(() => createAutoResetAgentSessionDecision(state), [state]);
+  const activePendingUserText = isSending ? pendingUserText || createTurnSubmissionText(draft) : draft;
 
   const toggleTriggerMode = () => {
     onImageProfileChange({
@@ -5137,8 +5948,8 @@ function CrackSimulationRunPage({
                 key={message.id}
                 message={message}
                 assets={findMessageAssets(message, assetsById)}
-                jobs={pendingJobsByTurnId.get(message.id) ?? []}
-                relatedJobs={allJobsByTurnId.get(message.id) ?? []}
+                jobs={pendingJobsByTurnId.get(message.id) ?? EMPTY_IMAGE_JOBS}
+                relatedJobs={allJobsByTurnId.get(message.id) ?? EMPTY_IMAGE_JOBS}
                 evidenceCount={message.id === latestMessageId ? latestContextPack?.evidence.length ?? 0 : message.referencedNodeIds.length}
                 onCancelJob={onCancelImageJob}
                 onDraftChange={onDraftChange}
@@ -5150,7 +5961,7 @@ function CrackSimulationRunPage({
                 regenerationDisabled={isSending || isResetting}
               />
             ))}
-            {isSending ? <CrackPendingTurn userText={draft} state={state} manualImage={manualImage} /> : null}
+            {isSending ? <CrackPendingTurn userText={activePendingUserText} state={state} manualImage={manualImage} /> : null}
           </div>
 
           <form className="crack-composer" onSubmit={onSubmit}>
@@ -5210,7 +6021,7 @@ function CrackSimulationRunPage({
                   <Parentheses size={16} />
                 </button>
               </div>
-              <button className="crack-send-button" disabled={isSending || isResetting || !draft.trim()} type="submit" aria-label="전송">
+              <button className="crack-send-button" disabled={isSending || isResetting} type="submit" aria-label="전송">
                 {isSending || isResetting ? <Activity size={18} /> : <Play size={18} fill="currentColor" />}
               </button>
             </div>
@@ -5239,7 +6050,7 @@ function CrackSimulationRunPage({
             isSending={isSending}
             latestAssets={latestAssets}
             latestContextPackId={latestContextPack?.id}
-            pendingUserText={draft}
+            pendingUserText={activePendingUserText}
             onCancelImageJob={onCancelImageJob}
             onDeleteImageAsset={onDeleteImageAsset}
             onImageFeedback={onImageFeedback}
@@ -5263,7 +6074,7 @@ function CrackSimulationRunPage({
           isSending={isSending}
           latestAssets={latestAssets}
           latestContextPackId={latestContextPack?.id}
-          pendingUserText={draft}
+          pendingUserText={activePendingUserText}
           onCancelImageJob={onCancelImageJob}
           onDeleteImageAsset={onDeleteImageAsset}
           onImageFeedback={onImageFeedback}
@@ -5487,15 +6298,17 @@ function DynamicRichText({ content }: { content: string }) {
   );
 }
 
-function MarkdownStageText({ content }: { content: string }) {
+const MarkdownStageText = memo(function MarkdownStageText({ content }: { content: string }) {
+  const normalizedContent = useMemo(() => normalizeLooseMarkdownTables(content), [content]);
+
   return (
-    <ReactMarkdown components={dynamicMarkdownComponents} remarkPlugins={[remarkGfm]}>
-      {content}
+    <ReactMarkdown components={dynamicMarkdownComponents} remarkPlugins={markdownRemarkPlugins}>
+      {normalizedContent}
     </ReactMarkdown>
   );
-}
+});
 
-function DynamicTextEffectBlock({ content, kind }: { content: string; kind: DynamicTextBlockKind }) {
+const DynamicTextEffectBlock = memo(function DynamicTextEffectBlock({ content, kind }: { content: string; kind: DynamicTextBlockKind }) {
   return (
     <aside className={`dynamic-text-block ${kind}`} aria-label={dynamicTextBlockLabels[kind]}>
       <div className="dynamic-text-content">
@@ -5503,7 +6316,7 @@ function DynamicTextEffectBlock({ content, kind }: { content: string; kind: Dyna
       </div>
     </aside>
   );
-}
+});
 
 function CrackTimelineMessage({
   message,
@@ -5599,7 +6412,7 @@ function CrackTimelineMessage({
     );
   }
 
-  const flow = createNarrationFlow(message.content, assets, jobs);
+  const flow = useMemo(() => createNarrationFlow(message.content, assets, jobs), [assets, jobs, message.content]);
 
   return (
     <article className="crack-narration-block">
@@ -5613,7 +6426,13 @@ function CrackTimelineMessage({
         ) : item.kind === "image" ? (
           <CrackInlineImage asset={item.asset} key={item.id} onFeedback={onFeedback} />
         ) : (
-          <CrackInlineImageJob job={item.job} key={item.id} onCancel={onCancelJob} onRun={onRunJob} />
+          <CrackInlineImageJob
+            job={item.job}
+            key={item.id}
+            onCancel={onCancelJob}
+            onRegenerate={onRegenerateImageJob}
+            onRun={onRunJob}
+          />
         )
       )}
       <div className="crack-message-controls">
@@ -5651,7 +6470,7 @@ function CrackTimelineMessage({
   );
 }
 
-function CrackInlineImage({ asset, onFeedback }: { asset: ImageAsset; onFeedback: (assetId: string, rating: ImageFeedbackRating) => void }) {
+const CrackInlineImage = memo(function CrackInlineImage({ asset, onFeedback }: { asset: ImageAsset; onFeedback: (assetId: string, rating: ImageFeedbackRating) => void }) {
   const style = {
     "--tone-a": asset.palette[0],
     "--tone-b": asset.palette[1],
@@ -5677,7 +6496,7 @@ function CrackInlineImage({ asset, onFeedback }: { asset: ImageAsset; onFeedback
       </figcaption>
     </figure>
   );
-}
+});
 
 function createImageAssetAspectRatio(asset: ImageAsset): string {
   const width = asset.providerMetadata ? readProviderPayloadNumber(asset.providerMetadata, "width") : undefined;
@@ -5685,36 +6504,59 @@ function createImageAssetAspectRatio(asset: ImageAsset): string {
   return width && height ? `${Math.round(width)} / ${Math.round(height)}` : "1 / 1";
 }
 
-function CrackInlineImageJob({
+const CrackInlineImageJob = memo(function CrackInlineImageJob({
   job,
   onCancel,
+  onRegenerate,
   onRun
 }: {
   job: ImageGenerationJob;
   onCancel: (jobId: string) => void;
+  onRegenerate: (job: ImageGenerationJob) => void;
   onRun: (job: ImageGenerationJob) => void;
 }) {
   const requiresConfirmation = Boolean(job.providerPayload.requiresConfirmation);
+  const canCancel = ["queued", "planning", "generating"].includes(job.status);
+  const canRegenerate = ["queued", "failed", "canceled", "completed"].includes(job.status);
+  const statusLabel =
+    job.status === "queued"
+      ? "이미지 생성 대기"
+      : job.status === "planning"
+        ? "이미지 준비 중"
+        : job.status === "generating"
+          ? "이미지 생성 중"
+          : job.status === "failed"
+            ? "이미지 생성 실패"
+            : job.status === "canceled"
+              ? "이미지 생성 취소됨"
+              : "이미지 생성 완료";
   return (
     <div className={`crack-inline-image-job ${job.status}`}>
       <ImageIcon size={18} />
-      <div>
-        <strong>{job.status === "generating" ? "이미지 생성 중" : job.status === "planning" ? "이미지 준비 중" : "이미지 생성 대기"}</strong>
+      <div className="crack-inline-image-job-copy">
+        <strong>{statusLabel}</strong>
         <p>{job.reason}</p>
       </div>
-      {requiresConfirmation && job.status === "queued" ? (
-        <button type="button" onClick={() => onRun(job)}>
-          생성
-        </button>
-      ) : null}
-      {["queued", "planning", "generating"].includes(job.status) ? (
-        <button type="button" onClick={() => onCancel(job.id)} aria-label="이미지 생성 취소">
-          <Trash2 size={15} />
-        </button>
-      ) : null}
+      <div className="crack-inline-image-job-actions">
+        {requiresConfirmation && job.status === "queued" ? (
+          <button type="button" onClick={() => onRun(job)}>
+            생성
+          </button>
+        ) : null}
+        {canRegenerate ? (
+          <button type="button" onClick={() => onRegenerate(job)} aria-label="같은 프롬프트로 이미지 재생성" title="이미지 재생성">
+            <RefreshCcw size={15} />
+          </button>
+        ) : null}
+        {canCancel ? (
+          <button type="button" onClick={() => onCancel(job.id)} aria-label="이미지 생성 취소" title="이미지 생성 취소">
+            <Trash2 size={15} />
+          </button>
+        ) : null}
+      </div>
     </div>
   );
-}
+});
 
 function SimulationRunPage({
   state,
@@ -5897,7 +6739,7 @@ function SimulationRunPage({
               <input checked={manualImage} type="checkbox" onChange={(event) => onToggleManualImage(event.target.checked)} />
               {state.imageProfile.triggerMode === "realtime_confirm" ? "이번 턴 이미지 생성 승인" : "이번 턴 이미지 생성 요청"}
             </label>
-            <button className="send-button" disabled={isSending || isResetting || !draft.trim()} type="submit">
+            <button className="send-button" disabled={isSending || isResetting} type="submit">
               <Send size={17} />
               {isResetting ? "handoff 중" : isSending ? "진행 중" : "전송"}
             </button>
@@ -5967,6 +6809,7 @@ function HomePage({
   activeSimulationId,
   simulations,
   onCreate,
+  onCopy,
   onEdit,
   onOpen,
   onStartNewRun
@@ -5974,6 +6817,7 @@ function HomePage({
   activeSimulationId: string;
   simulations: SimulationLibrary;
   onCreate: () => void;
+  onCopy: (simulationId: string) => void;
   onEdit: (simulationId: string) => void;
   onOpen: (simulationId: string) => void;
   onStartNewRun: (simulationId: string) => void;
@@ -6046,6 +6890,10 @@ function HomePage({
                 <Settings2 size={17} />
                 수정
               </button>
+              <button className="icon-text-button" type="button" onClick={() => onCopy(activeState.simulation.id)}>
+                <Copy size={17} />
+                복사
+              </button>
               <button className="icon-text-button" type="button" onClick={onCreate}>
                 <WandSparkles size={17} />
                 새 시뮬레이션
@@ -6078,6 +6926,7 @@ function HomePage({
                 active={item.simulation.id === activeSimulationId}
                 key={item.simulation.id}
                 state={item}
+                onCopy={() => onCopy(item.simulation.id)}
                 onEdit={() => onEdit(item.simulation.id)}
                 onOpen={() => onOpen(item.simulation.id)}
                 onStartNewRun={() => onStartNewRun(item.simulation.id)}
@@ -6100,12 +6949,14 @@ function HomePage({
 function SimulationLibraryCard({
   active,
   state,
+  onCopy,
   onEdit,
   onOpen,
   onStartNewRun
 }: {
   active: boolean;
   state: AppState;
+  onCopy: () => void;
   onEdit: () => void;
   onOpen: () => void;
   onStartNewRun: () => void;
@@ -6142,6 +6993,10 @@ function SimulationLibraryCard({
           <button className="icon-text-button" type="button" onClick={onEdit}>
             <Settings2 size={16} />
             수정
+          </button>
+          <button className="icon-text-button" type="button" onClick={onCopy}>
+            <Copy size={16} />
+            복사
           </button>
         </div>
       </div>
@@ -6328,6 +7183,438 @@ function PromptMeaningGuide() {
   );
 }
 
+type SceneTagPresetTreeProps = {
+  presets: ImageSceneTagPreset[];
+  onAddRoot: () => void;
+  onAddChild: (presetId: string) => void;
+  onChange: (presetId: string, patch: Partial<ImageSceneTagPresetNode>) => void;
+  onDelete: (presetId: string) => void;
+  onMove: (sourceId: string, targetId: string, position: ImageScenePresetDropPosition) => void;
+};
+
+function SceneTagPresetTree({ presets, onAddRoot, onAddChild, onChange, onDelete, onMove }: SceneTagPresetTreeProps) {
+  const [collapsedPresetIds, setCollapsedPresetIds] = useState<Set<string>>(() => new Set());
+  const [draggedPresetId, setDraggedPresetId] = useState<string | undefined>();
+  const [presetDropTarget, setPresetDropTarget] = useState<{ presetId: string; position: ImageScenePresetDropPosition } | undefined>();
+  const presetIds = useMemo(() => collectImageScenePresetNodeIds(presets), [presets]);
+  const descendantIdsById = useMemo(() => createImageScenePresetDescendantMap(presets), [presets]);
+  const allCollapsed = presetIds.length > 0 && presetIds.every((presetId) => collapsedPresetIds.has(presetId));
+
+  useEffect(() => {
+    const activeIds = new Set(presetIds);
+    setCollapsedPresetIds((current) => {
+      const next = new Set([...current].filter((presetId) => activeIds.has(presetId)));
+      return next.size === current.size ? current : next;
+    });
+  }, [presetIds]);
+
+  const togglePresetCollapsed = useCallback((presetId: string, descendantIds: string[]) => {
+    setCollapsedPresetIds((current) => {
+      const next = new Set(current);
+      if (next.has(presetId)) {
+        next.delete(presetId);
+      } else {
+        next.add(presetId);
+        descendantIds.forEach((descendantId) => next.add(descendantId));
+      }
+      return next;
+    });
+  }, []);
+
+  const collapseAllPresets = useCallback(() => {
+    setCollapsedPresetIds(new Set(presetIds));
+  }, [presetIds]);
+
+  const expandAllPresets = useCallback(() => {
+    setCollapsedPresetIds(new Set());
+  }, []);
+
+  const addChildAndExpand = useCallback(
+    (presetId: string) => {
+      setCollapsedPresetIds((current) => {
+        if (!current.has(presetId)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.delete(presetId);
+        return next;
+      });
+      onAddChild(presetId);
+    },
+    [onAddChild]
+  );
+
+  const canDropPreset = useCallback(
+    (sourceId: string | undefined, targetId: string) =>
+      Boolean(sourceId && sourceId !== targetId && !descendantIdsById.get(sourceId)?.has(targetId)),
+    [descendantIdsById]
+  );
+
+  const handlePresetDragStart = useCallback((event: ReactDragEvent<HTMLElement>, presetId: string) => {
+    setDraggedPresetId(presetId);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-dynamicchat-scene-preset", presetId);
+    event.dataTransfer.setData("text/plain", presetId);
+  }, []);
+
+  const handlePresetDragOver = useCallback(
+    (event: ReactDragEvent<HTMLElement>, targetId: string) => {
+      event.stopPropagation();
+      if (!canDropPreset(draggedPresetId, targetId)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      const position = getImageScenePresetDropPosition(event);
+      setPresetDropTarget((current) =>
+        current?.presetId === targetId && current.position === position ? current : { presetId: targetId, position }
+      );
+    },
+    [canDropPreset, draggedPresetId]
+  );
+
+  const handlePresetDrop = useCallback(
+    (event: ReactDragEvent<HTMLElement>, targetId: string) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const sourceId =
+        draggedPresetId ||
+        event.dataTransfer.getData("application/x-dynamicchat-scene-preset") ||
+        event.dataTransfer.getData("text/plain");
+
+      if (canDropPreset(sourceId, targetId)) {
+        const position = getImageScenePresetDropPosition(event);
+        onMove(sourceId, targetId, position);
+        if (position === "inside") {
+          setCollapsedPresetIds((current) => {
+            if (!current.has(targetId)) {
+              return current;
+            }
+            const next = new Set(current);
+            next.delete(targetId);
+            return next;
+          });
+        }
+      }
+
+      setDraggedPresetId(undefined);
+      setPresetDropTarget(undefined);
+    },
+    [canDropPreset, draggedPresetId, onMove]
+  );
+
+  const handlePresetDragEnd = useCallback(() => {
+    setDraggedPresetId(undefined);
+    setPresetDropTarget(undefined);
+  }, []);
+
+  return (
+    <section className="builder-panel span-2 scene-tag-preset-panel">
+      <div className="runtime-card-subhead">
+        <strong>장면 태그 키워드</strong>
+        <div className="scene-tag-preset-toolbar">
+          {presetIds.length > 0 ? (
+            <button className="icon-text-button" type="button" onClick={allCollapsed ? expandAllPresets : collapseAllPresets}>
+              {allCollapsed ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              {allCollapsed ? "전체 펼치기" : "전체 접기"}
+            </button>
+          ) : null}
+          <button className="icon-text-button" type="button" onClick={onAddRoot}>
+            <Plus size={16} />
+            키워드 추가
+          </button>
+        </div>
+      </div>
+      <div className="scene-tag-preset-list">
+        {presets.length > 0 ? (
+          presets.map((preset) => (
+            <SceneTagPresetNodeEditor
+              collapsedIds={collapsedPresetIds}
+              depth={0}
+              draggedPresetId={draggedPresetId}
+              dropTarget={presetDropTarget}
+              key={preset.id}
+              node={preset}
+              onAddChild={addChildAndExpand}
+              onChange={onChange}
+              onDelete={onDelete}
+              onDragEnd={handlePresetDragEnd}
+              onDragOver={handlePresetDragOver}
+              onDragStart={handlePresetDragStart}
+              onDrop={handlePresetDrop}
+              onToggleCollapsed={togglePresetCollapsed}
+            />
+          ))
+        ) : (
+          <div className="empty-panel compact">
+            <strong>장면 키워드 없음</strong>
+            <button className="icon-text-button" type="button" onClick={onAddRoot}>
+              <Plus size={16} />
+              키워드 추가
+            </button>
+          </div>
+        )}
+      </div>
+      <p className="settings-note">
+        하위 키워드는 원하는 만큼 만들 수 있고, LLM에는 현재 문맥과 가까운 가지를 우선해 압축 전달합니다.
+      </p>
+    </section>
+  );
+}
+
+const SceneTagPresetNodeEditor = memo(function SceneTagPresetNodeEditor({
+  collapsedIds,
+  depth,
+  draggedPresetId,
+  dropTarget,
+  node,
+  onAddChild,
+  onChange,
+  onDelete,
+  onDragEnd,
+  onDragOver,
+  onDragStart,
+  onDrop,
+  onToggleCollapsed
+}: {
+  collapsedIds: Set<string>;
+  depth: number;
+  draggedPresetId?: string;
+  dropTarget?: { presetId: string; position: ImageScenePresetDropPosition };
+  node: ImageSceneTagPresetNode;
+  onAddChild: (presetId: string) => void;
+  onChange: (presetId: string, patch: Partial<ImageSceneTagPresetNode>) => void;
+  onDelete: (presetId: string) => void;
+  onDragEnd: () => void;
+  onDragOver: (event: ReactDragEvent<HTMLElement>, targetId: string) => void;
+  onDragStart: (event: ReactDragEvent<HTMLElement>, presetId: string) => void;
+  onDrop: (event: ReactDragEvent<HTMLElement>, targetId: string) => void;
+  onToggleCollapsed: (presetId: string, descendantIds: string[]) => void;
+}) {
+  const children = node.children ?? [];
+  const collapsed = collapsedIds.has(node.id);
+  const descendantIds = useMemo(() => collectImageScenePresetNodeIds(children), [children]);
+  const title = node.keyword.trim() || "새 키워드";
+  const dropPosition = dropTarget?.presetId === node.id ? dropTarget.position : undefined;
+  const className = [
+    "scene-tag-preset-node",
+    collapsed ? "is-collapsed" : "",
+    draggedPresetId === node.id ? "dragging" : "",
+    dropPosition ? `drop-${dropPosition}` : ""
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <div
+      className={className}
+      style={{ "--scene-preset-depth": depth } as CSSProperties}
+      onDragOver={(event) => onDragOver(event, node.id)}
+      onDrop={(event) => onDrop(event, node.id)}
+    >
+      <div className="scene-tag-preset-row">
+        <div className="scene-tag-preset-row-head">
+          <button
+            aria-label={`${title} 이동`}
+            className="icon-button subtle scene-tag-preset-drag-handle"
+            draggable
+            title="드래그해서 이동"
+            type="button"
+            onDragEnd={onDragEnd}
+            onDragStart={(event) => onDragStart(event, node.id)}
+          >
+            <GripVertical size={16} />
+          </button>
+          <button
+            aria-expanded={!collapsed}
+            aria-label={`${title} ${collapsed ? "펼치기" : "접기"}`}
+            className="icon-button subtle scene-tag-preset-toggle"
+            title={collapsed ? "펼치기" : "접기"}
+            type="button"
+            onClick={() => onToggleCollapsed(node.id, descendantIds)}
+          >
+            {collapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+          </button>
+          <label className="checkline">
+            <input checked={node.enabled} type="checkbox" onChange={(event) => onChange(node.id, { enabled: event.target.checked })} />
+            사용
+          </label>
+          <span className="scene-tag-preset-level">
+            {depth === 0 ? "상위 키워드" : `${depth + 1}단계`}
+            <span className="scene-tag-preset-title">{title}</span>
+            {children.length > 0 ? <span className="scene-tag-preset-child-count">{children.length}개 하위</span> : null}
+          </span>
+          <div className="scene-tag-preset-actions">
+            <button className="icon-text-button" type="button" onClick={() => onAddChild(node.id)}>
+              <Plus size={15} />
+              하위
+            </button>
+            <button
+              aria-label={`${node.keyword || "장면 키워드"} 삭제`}
+              className="icon-button subtle"
+              type="button"
+              onClick={() => onDelete(node.id)}
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+        </div>
+        {collapsed ? (
+          <div className="scene-tag-preset-collapsed-summary">
+            {[node.tags.length > 0 ? `태그 ${node.tags.length}개` : undefined, node.note.trim() ? "메모 있음" : undefined, children.length > 0 ? `하위 ${children.length}개 숨김` : undefined]
+              .filter(Boolean)
+              .join(" · ") || "접힌 키워드"}
+          </div>
+        ) : (
+          <>
+            <div className="two-fields">
+              <label>
+                키워드
+                <input value={node.keyword} onChange={(event) => onChange(node.id, { keyword: event.target.value })} placeholder="expression" />
+              </label>
+              <label>
+                우선순위
+                <input
+                  max="120"
+                  min="0"
+                  type="number"
+                  value={node.priority}
+                  onChange={(event) => onChange(node.id, { priority: Number(event.target.value) })}
+                />
+              </label>
+            </div>
+            <label>
+              기본 장면 태그
+              <TagListTextarea
+                placeholder="rain, wet street, city lights, night, reflection"
+                rows={3}
+                tags={node.tags}
+                onCommit={(tags) => onChange(node.id, { tags })}
+              />
+            </label>
+            <label>
+              메모
+              <textarea
+                rows={2}
+                value={node.note}
+                onChange={(event) => onChange(node.id, { note: event.target.value })}
+                placeholder="활용 방식, 추천 변형, 와일드카드 규칙, 함께 쓰면 좋은 태그"
+              />
+            </label>
+          </>
+        )}
+      </div>
+      {!collapsed && children.length > 0 ? (
+        <div className="scene-tag-preset-children">
+          {children.map((child) => (
+            <SceneTagPresetNodeEditor
+              collapsedIds={collapsedIds}
+              depth={depth + 1}
+              draggedPresetId={draggedPresetId}
+              dropTarget={dropTarget}
+              key={child.id}
+              node={child}
+              onAddChild={onAddChild}
+              onChange={onChange}
+              onDelete={onDelete}
+              onDragEnd={onDragEnd}
+              onDragOver={onDragOver}
+              onDragStart={onDragStart}
+              onDrop={onDrop}
+              onToggleCollapsed={onToggleCollapsed}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
+function TagListTextarea({
+  tags,
+  onCommit,
+  placeholder,
+  rows
+}: {
+  tags: string[];
+  onCommit: (tags: string[]) => void;
+  placeholder?: string;
+  rows?: number;
+}) {
+  const formattedTags = useMemo(() => tags.join(", "), [tags]);
+  const [draftTags, setDraftTags] = useState(formattedTags);
+
+  useEffect(() => {
+    setDraftTags(formattedTags);
+  }, [formattedTags]);
+
+  return (
+    <textarea
+      placeholder={placeholder}
+      rows={rows}
+      value={draftTags}
+      onBlur={() => onCommit(parseScenePresetTags(draftTags))}
+      onChange={(event) => {
+        const nextValue = event.target.value;
+        setDraftTags(nextValue);
+        if (!shouldDeferDelimitedTagCommit(nextValue)) {
+          onCommit(parseScenePresetTags(nextValue));
+        }
+      }}
+    />
+  );
+}
+
+function ActivationTagInput({
+  tags,
+  onCommit
+}: {
+  tags: string[];
+  onCommit: (tags: string[]) => void;
+}) {
+  const formattedTags = useMemo(() => formatActivationTags(tags), [tags]);
+  const [draftTags, setDraftTags] = useState(formattedTags);
+
+  useEffect(() => {
+    setDraftTags(formattedTags);
+  }, [formattedTags]);
+
+  return (
+    <input
+      value={draftTags}
+      onBlur={() => onCommit(parseActivationTags(draftTags))}
+      onChange={(event) => {
+        const nextValue = event.target.value;
+        setDraftTags(nextValue);
+        if (!shouldDeferDelimitedTagCommit(nextValue)) {
+          onCommit(parseActivationTags(nextValue));
+        }
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+function shouldDeferDelimitedTagCommit(value: string): boolean {
+  return /(?:[,;\n]|\s)$/u.test(value);
+}
+
+function getImageScenePresetDropPosition(event: ReactDragEvent<HTMLElement>): ImageScenePresetDropPosition {
+  const bounds = event.currentTarget.getBoundingClientRect();
+  const ratio = bounds.height > 0 ? (event.clientY - bounds.top) / bounds.height : 0.5;
+  if (ratio < 0.25) {
+    return "before";
+  }
+  if (ratio > 0.75) {
+    return "after";
+  }
+  return "inside";
+}
+
 function CreateSimulationPage({
   mode,
   initialDraft,
@@ -6339,7 +7626,7 @@ function CreateSimulationPage({
   onCancel: () => void;
   onCreate: (draft: SimulationDraft) => void;
 }) {
-  const [draft, setDraft] = useState<SimulationDraft>(() => initialDraft ?? createInitialSimulationDraft());
+  const [draft, setDraft] = useState<SimulationDraft>(() => normalizeBuilderDraft(initialDraft ?? createInitialSimulationDraft()));
   const [activeTab, setActiveTab] = useState<BuilderTab>("overview");
   const [selectedModuleId, setSelectedModuleId] = useState(() => initialDraft?.modules[0]?.id ?? "draft_main");
   const [draggedModuleId, setDraggedModuleId] = useState<string | undefined>();
@@ -6357,6 +7644,7 @@ function CreateSimulationPage({
   const activeImageGenerationCadence =
     imageGenerationCadenceOptions.find((option) => option.value === draft.imageProfile.generationCadence) ??
     imageGenerationCadenceOptions[1];
+  const draftImageScenePresets = draft.imageScenePresets ?? [];
 
   const updateDraft = useCallback((patch: Partial<SimulationDraft>) => {
     setDraft((current) => ({
@@ -6504,6 +7792,71 @@ function CreateSimulationPage({
         parameters: current.relationshipMap.parameters.filter((parameter) => parameter.id !== parameterId),
         updatedAt: new Date().toISOString()
       }
+    }));
+  }, []);
+
+  const addImageScenePreset = useCallback(() => {
+    setDraft((current) => {
+      const now = new Date().toISOString();
+      const currentPresets = current.imageScenePresets ?? [];
+      const presetIndex = currentPresets.length + 1;
+      const preset: ImageSceneTagPreset = {
+        id: createId("draft_scene_preset"),
+        simulationId: "draft_simulation",
+        keyword: `scene keyword ${presetIndex}`,
+        tags: ["indoors", "soft light", "depth of field"],
+        note: "",
+        enabled: true,
+        priority: 70,
+        updatedAt: now,
+        children: []
+      };
+      return {
+        ...current,
+        imageScenePresets: [...currentPresets, preset]
+      };
+    });
+  }, []);
+
+  const addImageScenePresetChild = useCallback((parentId: string) => {
+    setDraft((current) => {
+      const now = new Date().toISOString();
+      const child = createDraftImageScenePresetNode(now, countEnabledImageScenePresetNodes(current.imageScenePresets ?? []) + 1);
+      return {
+        ...current,
+        imageScenePresets: appendImageScenePresetChild(current.imageScenePresets ?? [], parentId, child, now)
+      };
+    });
+  }, []);
+
+  const updateImageScenePreset = useCallback((presetId: string, patch: Partial<ImageSceneTagPresetNode>) => {
+    setDraft((current) => ({
+      ...current,
+      imageScenePresets: updateImageScenePresetNodes(current.imageScenePresets ?? [], presetId, patch, new Date().toISOString())
+    }));
+  }, []);
+
+  const moveImageScenePreset = useCallback((sourceId: string, targetId: string, position: ImageScenePresetDropPosition) => {
+    setDraft((current) => {
+      const presets = current.imageScenePresets ?? [];
+      return {
+        ...current,
+        imageScenePresets: moveImageScenePresetNodes(
+          presets,
+          sourceId,
+          targetId,
+          position,
+          new Date().toISOString(),
+          presets[0]?.simulationId ?? "draft_simulation"
+        )
+      };
+    });
+  }, []);
+
+  const deleteImageScenePreset = useCallback((presetId: string) => {
+    setDraft((current) => ({
+      ...current,
+      imageScenePresets: deleteImageScenePresetNode(current.imageScenePresets ?? [], presetId)
     }));
   }, []);
 
@@ -7126,6 +8479,15 @@ function CreateSimulationPage({
                 <textarea rows={5} value={draft.imageProfile.userRules} onChange={(event) => updateImageProfile({ userRules: event.target.value })} />
               </label>
             </section>
+
+            <SceneTagPresetTree
+              presets={draftImageScenePresets}
+              onAddChild={addImageScenePresetChild}
+              onAddRoot={addImageScenePreset}
+              onChange={updateImageScenePreset}
+              onDelete={deleteImageScenePreset}
+              onMove={moveImageScenePreset}
+            />
           </div>
         ) : null}
 
@@ -7455,7 +8817,7 @@ function CreateSimulationPage({
                 <input value={draft.neuralMap.baseUrl} onChange={(event) => updateNeuralMap({ baseUrl: event.target.value })} />
               </label>
               <label>
-                문맥 토큰 예산
+                검색 문맥 토큰 예산
                 <input min="800" max="12000" step="200" type="number" value={draft.neuralMap.tokenBudget} onChange={(event) => updateNeuralMap({ tokenBudget: Number(event.target.value) })} />
               </label>
             </section>
@@ -7474,6 +8836,7 @@ function CreateSimulationPage({
                 <Capability label="NovelAI" value={draft.novelAi.enabled ? `${draft.novelAi.modelPreset} ${draft.novelAi.requestMode}` : "mock"} />
                 <Capability label="NeuralMap" value={draft.neuralMap.enabled ? draft.neuralMap.baseUrl : "로컬 대체"} />
                 <Capability label="이미지 밀도" value={activeImageGenerationCadence.label} />
+                <Capability label="장면 키워드" value={`${countEnabledImageScenePresetNodes(draftImageScenePresets)}개`} />
                 <Capability label="시작상황" value={draft.startSituationPrompt.trim() ? "지정됨" : "기본 시작"} />
               </div>
               <label>
@@ -7526,6 +8889,7 @@ function createInitialSimulationDraft(runtimeSource?: AppState): SimulationDraft
     visualPrompt,
     negativeVisualPrompt: preset.negativeVisualPrompt,
     realtimeImageEnabled: true,
+    imageScenePresets: createDefaultDraftImageScenePresets(now, preset.promptMode),
     characters: [
       {
         id: "draft_character_id",
@@ -8037,11 +9401,11 @@ function ModuleEditor({
           guide="이 모듈을 불러올 단서입니다. 장면, 장소, 캐릭터, 시스템 이름처럼 사용자 입력이나 기억 근거와 맞을 짧은 키워드를 쉼표로 입력하세요."
           title="호출 키워드"
         />
-        <input
-          value={formatActivationTags(module.activationTags)}
-          onChange={(event) =>
+        <ActivationTagInput
+          tags={module.activationTags}
+          onCommit={(activationTags) =>
             onChange(module.id, {
-              activationTags: parseActivationTags(event.target.value)
+              activationTags
             })
           }
         />
@@ -9122,7 +10486,7 @@ function createRelationshipStatusSections(state: AppState, node: RelationshipMap
   const parameterKeys = new Set(
     state.relationshipMap.parameters
       .filter((parameter) => parameter.enabled && parameter.title.trim())
-      .map((parameter) => normalizeRelationshipStatusKey(parameter.title))
+      .flatMap((parameter) => createRelationshipParameterAliases(parameter.title).map(normalizeRelationshipStatusKey))
   );
   const extraStateSections = currentStateRecords
     .filter((record) => !parameterKeys.has(normalizeRelationshipStatusKey(getRelationshipRecordStatusKey(record))))
@@ -9292,7 +10656,6 @@ function createRelationshipParameterFallbackValue(state: AppState, node: Relatio
 }
 
 function createRelationshipMemoryRecord(event: AppState["memoryEvents"][number]): RelationshipMemoryRecord {
-  const metadata = event.metadata ?? {};
   const kind = readRelationshipMapMemoryKind(event);
   return {
     event,
@@ -9300,13 +10663,10 @@ function createRelationshipMemoryRecord(event: AppState["memoryEvents"][number])
     content: event.content,
     actorId: event.actorId,
     actorName: event.actorName,
-    ownerId: readRelationshipMapMetadataText(metadata, "owner_id") ?? readRelationshipMapMetadataText(metadata, "local_owner_id") ?? event.actorId,
-    targetId: readRelationshipMapMetadataText(metadata, "target_id") ?? readRelationshipMapMetadataText(metadata, "local_target_id"),
-    stateType: readRelationshipMapMetadataText(metadata, "state_type"),
-    value:
-      readRelationshipMapMetadataText(metadata, "value") ??
-      readRelationshipMapMetadataText(metadata, "state_value") ??
-      readRelationshipMapMetadataText(metadata, "stateValue"),
+    ownerId: readStateMemoryOwnerId(event) ?? event.actorId,
+    targetId: readStateMemoryTargetId(event),
+    stateType: readStateMemoryStateType(event),
+    value: readStateMemoryValue(event),
     createdAt: event.createdAt,
     importance: event.importance,
     tags: event.tags
@@ -9314,12 +10674,7 @@ function createRelationshipMemoryRecord(event: AppState["memoryEvents"][number])
 }
 
 function readRelationshipMapMemoryKind(event: AppState["memoryEvents"][number]): string {
-  const metadataKind = readRelationshipMapMetadataText(event.metadata, "memory_kind");
-  if (metadataKind) {
-    return metadataKind;
-  }
-
-  return event.tags.find((tag) => tag.startsWith("kind:"))?.slice("kind:".length) ?? "event";
+  return readStateMemoryKind(event);
 }
 
 function readRelationshipMapMetadataText(metadata: Record<string, unknown> | undefined, key: string): string | undefined {
@@ -10348,7 +11703,7 @@ function OperationalPanel({
       </div>
 
       <div className="ops-metrics">
-        <Metric label="문맥 예산" value={summary.tokenBudget} />
+        <Metric label="검색 문맥" value={summary.tokenBudget} />
         <Metric label="토큰 절감" value={summary.ragSaved} />
         <Metric label="지연 시간" value={summary.latency} />
         <Metric label="이미지" value={summary.images} />
@@ -10440,7 +11795,7 @@ function TurnTraceCard({ state, trace }: { state: AppState; trace: TurnTrace }) 
       <div className="trace-metric-grid">
         <Metric label="모듈" value={trace.metrics.selectedModuleCount.toString()} />
         <Metric label="근거" value={trace.metrics.contextEvidenceCount.toString()} />
-        <Metric label="토큰" value={`${trace.metrics.selectedModuleTokenEstimate + trace.metrics.contextTokenEstimate}`} />
+        <Metric label="사용 토큰" value={`${trace.metrics.selectedModuleTokenEstimate + trace.metrics.contextTokenEstimate}`} />
         <Metric label="LLM" value={`${trace.metrics.llmRequestMs}ms`} />
         <Metric label="RAG" value={`${trace.metrics.retrievalLatencyMs}ms`} />
         <Metric label="전체" value={`${trace.metrics.turnLatencyMs}ms`} />
@@ -10648,8 +12003,8 @@ function createOperationalSummary(state: AppState, trace?: TurnTrace) {
   const imageCount = generatedAssets.length;
   const cost = state.imageJobs.reduce((sum, job) => sum + (readProviderCost(job.providerPayload) ?? 0), 0);
   return {
-    tokenBudget: state.neuralMap.tokenBudget.toString(),
-    ragSaved: trace ? trace.metrics.ragTokenSavingsEstimate.toString() : "0",
+    tokenBudget: `${state.neuralMap.tokenBudget}토큰`,
+    ragSaved: trace ? `${trace.metrics.ragTokenSavingsEstimate}토큰` : "0토큰",
     latency: trace ? `${trace.metrics.llmRequestMs}ms / ${trace.metrics.turnLatencyMs}ms` : "0ms",
     images: cost > 0 ? `${imageCount} / ${cost}` : imageCount.toString()
   };
@@ -11196,6 +12551,10 @@ function SettingsPanel({
     : "custom";
   const activeOutputLengthPreset =
     outputLengthPresets.find((preset) => preset.tokens === state.llm.maxTokens)?.id ?? "custom";
+  const activeOutputLengthLabel =
+    activeOutputLengthPreset === "custom"
+      ? `${state.llm.maxTokens}토큰`
+      : outputLengthPresets.find((preset) => preset.id === activeOutputLengthPreset)?.label ?? `${state.llm.maxTokens}토큰`;
   const activeImageGenerationCadence =
     imageGenerationCadenceOptions.find((option) => option.value === state.imageProfile.generationCadence) ?? imageGenerationCadenceOptions[1];
   const activePromptModeOption = getPromptModeOption(state.simulation.promptMode);
@@ -11307,6 +12666,8 @@ function SettingsPanel({
         </div>
         <div className="runtime-settings-metrics">
           <Metric label="LLM" value={llmProvider.label} />
+          <Metric label="출력" value={activeOutputLengthLabel} />
+          <Metric label="문맥" value={`${state.neuralMap.tokenBudget}토큰`} />
           <Metric label="등급" value={activeContentRatingOption.label} />
           <Metric label="Prompt" value={`${state.modules.filter((module) => module.enabled).length}개`} />
           <Metric label="Image" value={activeImageGenerationCadence.label} />
@@ -11537,7 +12898,7 @@ function SettingsPanel({
             </div>
           </label>
           <label>
-            최대 출력 토큰 <span className="inline-value">{activeOutputLengthPreset === "custom" ? "직접" : outputLengthPresets.find((preset) => preset.id === activeOutputLengthPreset)?.label}</span>
+            응답 출력 토큰 <span className="inline-value">{activeOutputLengthLabel}</span>
             <input
               type="number"
               min="512"
@@ -11894,7 +13255,7 @@ function SettingsPanel({
         />
       </label>
       <label>
-        문맥 토큰 예산
+        검색 문맥 토큰 예산
         <input
           min="800"
           max="12000"

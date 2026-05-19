@@ -415,14 +415,15 @@ export class NeuralMapClient {
         reason: "NeuralMap continuity evidence"
       }));
       const scopedEvidence = filterScopedContextEvidence(state, rawEvidence);
+      const castScopedEvidence = scopeContextEvidenceForCurrentSceneCast(state, scopedEvidence, query);
       const localEvidence = createLocalContextEvidence(state);
       const displayEvidence = uniqueContextEvidence([
-        ...filterPublicContextEvidence(state, scopedEvidence),
+        ...filterPublicContextEvidence(state, castScopedEvidence),
         ...localEvidence
       ])
         .sort((a, b) => b.score - a.score)
         .slice(0, 12);
-      const moduleEvidence = uniqueContextEvidence([...scopedEvidence, ...localEvidence])
+      const moduleEvidence = uniqueContextEvidence([...castScopedEvidence, ...localEvidence])
         .sort((a, b) => b.score - a.score)
         .slice(0, 24);
 
@@ -431,7 +432,7 @@ export class NeuralMapClient {
         simulationId: state.simulation.id,
         sessionId: getSafeContextPackSessionId(state, response.pack.session_id),
         objective: response.pack.objective,
-        tokenBudget: response.pack.token_budget,
+        tokenBudget: state.neuralMap.tokenBudget,
         evidence: displayEvidence,
         moduleEvidence,
         decisions: response.pack.decisions ?? [],
@@ -643,7 +644,8 @@ interface GraphActorRef {
 
 function collectGraphActorRefs(state: AppState, delta: MemoryDelta): Map<string, GraphActorRef> {
   const refs = new Map<string, GraphActorRef>();
-  for (const character of state.characters) {
+  const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state));
+  for (const character of state.characters.filter((candidate) => activeCharacterIds.has(candidate.id) || state.characters.length === 1)) {
     const ref = createGraphActorRef(state, character.id, character.name);
     refs.set(ref.localId, ref);
   }
@@ -652,7 +654,8 @@ function collectGraphActorRefs(state: AppState, delta: MemoryDelta): Map<string,
     for (const ref of [
       createOptionalGraphActorRef(state, record.actorId, record.actorName),
       createOptionalGraphActorRef(state, record.ownerId),
-      ...(record.observers ?? []).map((observerId) => createOptionalGraphActorRef(state, observerId))
+      createOptionalCharacterGraphRef(state, record.targetId),
+      ...(record.observers ?? []).map((observerId) => createOptionalCharacterGraphRef(state, observerId))
     ]) {
       if (ref) {
         refs.set(ref.localId, ref);
@@ -685,6 +688,20 @@ function createOptionalGraphActorRef(state: AppState, id?: string, name?: string
   }
   const fallbackId = id ?? name ?? "unknown";
   return createGraphActorRef(state, fallbackId, name);
+}
+
+function createOptionalCharacterGraphRef(state: AppState, id?: string, name?: string): GraphActorRef | undefined {
+  if (!id && !name) {
+    return undefined;
+  }
+
+  const character = state.characters.find(
+    (candidate) =>
+      candidate.id === id ||
+      candidate.name === name ||
+      candidate.name.toLowerCase() === name?.toLowerCase()
+  );
+  return character ? createGraphActorRef(state, character.id, character.name) : undefined;
 }
 
 function createCharacterNeuron(state: AppState, actor: GraphActorRef): NeuralMapGraphDeltaNeuron {
@@ -770,6 +787,7 @@ function createMemoryNeuron(
   const owner = getRecordOwnerRef(state, record, actorRefs);
   const holder = getRecordActorRef(state, record, actorRefs) ?? owner;
   const observer = getRecordObserverRefs(state, record, actorRefs)[0] ?? holder;
+  const target = getRecordTargetRef(state, record, actorRefs);
   const stateType = record.stateType ?? "State";
   const stateValue = record.value ?? record.content;
   const properties: Record<string, unknown> = {
@@ -790,6 +808,7 @@ function createMemoryNeuron(
     local_actor_id: record.actorId,
     local_owner_id: record.ownerId,
     local_target_id: record.targetId,
+    target_character_node_id: target?.nodeId,
     observer_ids: record.observers,
     importance_reasons: record.importanceReasons
   };
@@ -801,7 +820,7 @@ function createMemoryNeuron(
   }
   if (ontologyType === "Observation") {
     properties.observer_id = observer?.nodeId ?? "unknown";
-    properties.target_id = record.targetId ?? createMemoryGraphNeuronId(state, delta, record);
+    properties.target_id = target?.nodeId ?? record.targetId ?? createMemoryGraphNeuronId(state, delta, record);
   }
   if (ontologyType === "Belief") {
     properties.holder_id = holder?.nodeId ?? "unknown";
@@ -851,9 +870,41 @@ function createMemorySynapses(
   actorRefs: ReadonlyMap<string, GraphActorRef>
 ): NeuralMapGraphDeltaSynapse[] {
   const nodeId = createMemoryGraphNeuronId(state, delta, record);
+  const sceneNodeId = createSceneNodeId(state, delta.sceneId);
   const actor = getRecordActorRef(state, record, actorRefs);
   const owner = getRecordOwnerRef(state, record, actorRefs);
+  const target = getRecordTargetRef(state, record, actorRefs);
   const synapses: NeuralMapGraphDeltaSynapse[] = [];
+
+  synapses.push(createSynapse({
+    from: sceneNodeId,
+    to: nodeId,
+    type: "SCENE_HAS_MEMORY",
+    confidence: record.confidence,
+    weight: record.kind === "state" ? 0.72 : 0.9,
+    validFrom: delta.simTime,
+    properties: createBaseSynapseProperties(state, delta, record, {
+      scene_node_id: sceneNodeId,
+      memory_node_id: nodeId
+    })
+  }));
+
+  for (const participant of collectSceneParticipantRefs(state, record, actorRefs)) {
+    synapses.push(createSynapse({
+      from: sceneNodeId,
+      to: participant.ref.nodeId,
+      type: "SCENE_PARTICIPANT",
+      confidence: record.confidence,
+      weight: participant.role === "observer" ? 0.72 : 0.82,
+      validFrom: delta.simTime,
+      properties: createBaseSynapseProperties(state, delta, record, {
+        role: participant.role,
+        local_character_id: participant.ref.localId,
+        scene_node_id: sceneNodeId,
+        memory_node_id: nodeId
+      })
+    }));
+  }
 
   if (record.kind === "state" && owner) {
     const stateType = record.stateType ?? "State";
@@ -864,16 +915,11 @@ function createMemorySynapses(
       confidence: record.confidence,
       weight: 1,
       validFrom: delta.simTime,
-      properties: {
+      properties: createBaseSynapseProperties(state, delta, record, {
         current_pointer_key: `${owner.nodeId}:${state.activeProgressRunId}:${stateType}`,
         owner_id: owner.nodeId,
-        state_type: stateType,
-        simulation_id: state.simulation.id,
-        session_id: state.simulation.activeSessionId,
-        progress_run_id: state.activeProgressRunId,
-        run_id: state.activeProgressRunId,
-        source_turn_id: delta.turnId
-      }
+        state_type: stateType
+      })
     }));
   }
 
@@ -886,15 +932,10 @@ function createMemorySynapses(
       confidence: record.confidence,
       weight: 0.82,
       validFrom: delta.simTime,
-      properties: {
+      properties: createBaseSynapseProperties(state, delta, record, {
         source: "compiled_memory_delta",
-        holder_id: beliefHolder.nodeId,
-        simulation_id: state.simulation.id,
-        session_id: state.simulation.activeSessionId,
-        progress_run_id: state.activeProgressRunId,
-        run_id: state.activeProgressRunId,
-        source_turn_id: delta.turnId
-      }
+        holder_id: beliefHolder.nodeId
+      })
     }));
   }
 
@@ -907,15 +948,10 @@ function createMemorySynapses(
         confidence: record.confidence,
         weight: 0.88,
         validFrom: delta.simTime,
-        properties: {
+        properties: createBaseSynapseProperties(state, delta, record, {
           method: "compiled_from_turn",
-          observer_id: observer.nodeId,
-          simulation_id: state.simulation.id,
-          session_id: state.simulation.activeSessionId,
-          progress_run_id: state.activeProgressRunId,
-          run_id: state.activeProgressRunId,
-          source_turn_id: delta.turnId
-        }
+          observer_id: observer.nodeId
+        })
       }));
     }
   }
@@ -928,17 +964,103 @@ function createMemorySynapses(
       confidence: record.confidence,
       weight: 0.78,
       validFrom: delta.simTime,
-      properties: {
-        simulation_id: state.simulation.id,
-        session_id: state.simulation.activeSessionId,
-        progress_run_id: state.activeProgressRunId,
-        run_id: state.activeProgressRunId,
-        source_turn_id: delta.turnId
-      }
+      properties: createBaseSynapseProperties(state, delta, record, {
+        actor_id: actor.nodeId
+      })
+    }));
+  }
+
+  if (target) {
+    synapses.push(createSynapse({
+      from: target.nodeId,
+      to: nodeId,
+      type: "TARGET_OF",
+      confidence: record.confidence,
+      weight: 0.76,
+      validFrom: delta.simTime,
+      properties: createBaseSynapseProperties(state, delta, record, {
+        target_id: target.nodeId,
+        local_target_id: target.localId
+      })
+    }));
+  }
+
+  if (record.kind === "relationship" && actor && target) {
+    synapses.push(createSynapse({
+      from: actor.nodeId,
+      to: target.nodeId,
+      type: "RELATIONSHIP_TO",
+      confidence: record.confidence,
+      weight: Math.max(0.72, record.importance),
+      validFrom: delta.simTime,
+      properties: createBaseSynapseProperties(state, delta, record, {
+        relationship_memory_node_id: nodeId,
+        local_actor_id: actor.localId,
+        local_target_id: target.localId,
+        relationship_summary: record.content
+      })
     }));
   }
 
   return synapses;
+}
+
+function createBaseSynapseProperties(
+  state: AppState,
+  delta: MemoryDelta,
+  record: MemoryDeltaRecord,
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    simulation_id: state.simulation.id,
+    session_id: state.simulation.activeSessionId,
+    progress_run_id: state.activeProgressRunId,
+    run_id: state.activeProgressRunId,
+    source_turn_id: delta.turnId,
+    scene_id: delta.sceneId,
+    sim_time: delta.simTime,
+    memory_record_id: record.id,
+    memory_kind: record.kind,
+    event_type: record.eventType ?? getDefaultEventType(record),
+    ...extra
+  };
+}
+
+function collectSceneParticipantRefs(
+  state: AppState,
+  record: MemoryDeltaRecord,
+  actorRefs: ReadonlyMap<string, GraphActorRef>
+): Array<{ ref: GraphActorRef; role: "actor" | "owner" | "observer" }> {
+  const participants = [
+    ...withParticipantRole(getRecordActorRef(state, record, actorRefs), "actor" as const),
+    ...withParticipantRole(getRecordOwnerRef(state, record, actorRefs), "owner" as const),
+    ...getRecordObserverRefs(state, record, actorRefs).map((ref) => ({ ref, role: "observer" as const }))
+  ];
+  const byId = new Map<string, { ref: GraphActorRef; role: "actor" | "owner" | "observer" }>();
+  for (const participant of participants) {
+    const existing = byId.get(participant.ref.localId);
+    if (!existing || getParticipantRoleRank(participant.role) < getParticipantRoleRank(existing.role)) {
+      byId.set(participant.ref.localId, participant);
+    }
+  }
+  return [...byId.values()];
+}
+
+function withParticipantRole<T extends "actor" | "owner" | "observer">(
+  ref: GraphActorRef | undefined,
+  role: T
+): Array<{ ref: GraphActorRef; role: T }> {
+  return ref ? [{ ref, role }] : [];
+}
+
+function getParticipantRoleRank(role: "actor" | "owner" | "observer"): number {
+  if (role === "actor") {
+    return 0;
+  }
+  if (role === "owner") {
+    return 1;
+  }
+  return 2;
 }
 
 function createSynapse(input: {
@@ -977,22 +1099,22 @@ function createContextPackFromNeuralMapPack(
   pack: NeuralMapContextPackResponse,
   query: string
 ): ContextPack {
-  void query;
-  const sections = normalizeContextSections(state, pack.sections);
+  const sections = normalizeContextSections(state, pack.sections, query);
   const sectionSummaryEvidence = createSectionedContextEvidence(state, pack, sections);
   const rawEvidence = normalizeNeuralMapEvidenceItems(state, pack.evidence, "NeuralMap profile evidence");
   const neuralEvidence = uniqueContextEvidence([
     ...(sectionSummaryEvidence ? [sectionSummaryEvidence] : []),
     ...rawEvidence
   ]);
+  const castScopedNeuralEvidence = scopeContextEvidenceForCurrentSceneCast(state, neuralEvidence, query);
   const localEvidence = createLocalContextEvidence(state);
   const displayEvidence = uniqueContextEvidence([
-    ...filterPublicContextEvidence(state, neuralEvidence),
+    ...filterPublicContextEvidence(state, castScopedNeuralEvidence),
     ...localEvidence
   ])
     .sort((a, b) => b.score - a.score)
     .slice(0, 12);
-  const moduleEvidence = uniqueContextEvidence([...neuralEvidence, ...localEvidence])
+  const moduleEvidence = uniqueContextEvidence([...castScopedNeuralEvidence, ...localEvidence])
     .sort((a, b) => b.score - a.score)
     .slice(0, 24);
 
@@ -1001,7 +1123,7 @@ function createContextPackFromNeuralMapPack(
     simulationId: state.simulation.id,
     sessionId: getSafeContextPackSessionId(state, pack.session_id),
     objective: pack.objective,
-    tokenBudget: pack.token_budget,
+    tokenBudget: state.neuralMap.tokenBudget,
     evidence: displayEvidence,
     sections,
     moduleEvidence,
@@ -1014,7 +1136,8 @@ function createContextPackFromNeuralMapPack(
 
 function normalizeContextSections(
   state: AppState,
-  sections: NeuralMapContextPackResponse["sections"]
+  sections: NeuralMapContextPackResponse["sections"],
+  currentText = ""
 ): ContextPack["sections"] {
   if (!sections) {
     return undefined;
@@ -1023,7 +1146,11 @@ function normalizeContextSections(
   const scopedSections = Object.entries(sections)
     .map(([section, evidence]) => [
       section,
-      normalizeNeuralMapEvidenceItems(state, evidence, `NeuralMap section: ${formatContextSectionName(section)}`)
+      scopeContextEvidenceForCurrentSceneCast(
+        state,
+        normalizeNeuralMapEvidenceItems(state, evidence, `NeuralMap section: ${formatContextSectionName(section)}`),
+        currentText
+      )
     ] as const)
     .filter(([, evidence]) => evidence.length > 0);
 
@@ -1085,6 +1212,96 @@ function formatContextSectionName(section: string): string {
     open_threads: "Open Threads"
   };
   return known[section] ?? section.replace(/[_-]+/gu, " ").replace(/\b\w/gu, (letter) => letter.toUpperCase());
+}
+
+function scopeContextEvidenceForCurrentSceneCast(
+  state: AppState,
+  evidence: ContextPack["evidence"],
+  currentText = ""
+): ContextPack["evidence"] {
+  const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, currentText));
+
+  return evidence.flatMap((item) => {
+    const mentionedCharacterIds = getEvidenceMentionedCharacterIds(state, item);
+    if (mentionedCharacterIds.length === 0) {
+      return [item];
+    }
+
+    if (state.characters.length === 1 && mentionedCharacterIds.includes(state.characters[0].id)) {
+      return [item];
+    }
+
+    const activeMentions = mentionedCharacterIds.filter((characterId) => activeCharacterIds.has(characterId));
+    if (activeMentions.length === 0) {
+      return [];
+    }
+
+    const offStageNames = mentionedCharacterIds
+      .filter((characterId) => !activeCharacterIds.has(characterId))
+      .map((characterId) => state.characters.find((character) => character.id === characterId)?.name)
+      .filter((name): name is string => Boolean(name));
+
+    return offStageNames.length > 0
+      ? [
+          {
+            ...item,
+            snippet: appendOffStageCharacterGuard(item.snippet, offStageNames)
+          }
+        ]
+      : [item];
+  });
+}
+
+function getEvidenceMentionedCharacterIds(
+  state: AppState,
+  item: ContextPack["evidence"][number]
+): string[] {
+  const evidenceText = [item.nodeId, item.reason, item.snippet].join("\n");
+  return state.characters
+    .filter((character) =>
+      evidenceContainsCharacterTerm(evidenceText, character.id) ||
+      evidenceContainsCharacterTerm(evidenceText, character.name) ||
+      item.nodeId.endsWith(`:person:${graphIdPart(character.id)}`)
+    )
+    .map((character) => character.id);
+}
+
+function evidenceContainsCharacterTerm(text: string, term: string): boolean {
+  const normalizedText = text.toLowerCase();
+  const normalizedTerm = term.trim().toLowerCase();
+  if (!normalizedTerm) {
+    return false;
+  }
+
+  if (/^[a-z0-9_-]+$/iu.test(normalizedTerm)) {
+    return new RegExp(`(^|[^\\p{L}\\p{N}_-])${escapeRegExp(normalizedTerm)}($|[^\\p{L}\\p{N}_-])`, "iu").test(
+      normalizedText
+    );
+  }
+
+  if (/^[\u3131-\uD79D]$/u.test(normalizedTerm)) {
+    return new RegExp(
+      `(^|[^\\p{L}\\p{N}_-])${escapeRegExp(normalizedTerm)}(?:은|는|이|가|을|를|와|과|도|만|에|로|의)?($|[^\\p{L}\\p{N}_-])`,
+      "iu"
+    ).test(normalizedText);
+  }
+
+  return normalizedText.includes(normalizedTerm);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function appendOffStageCharacterGuard(snippet: string, characterNames: string[]): string {
+  if (/Off-stage character reference only|무대 밖 인물 참조/iu.test(snippet)) {
+    return snippet;
+  }
+
+  return [
+    snippet,
+    `[무대 밖 인물 참조 전용: ${characterNames.join(", ")}는 이 기록에 언급되지만 최근 transcript/current action의 현재 장면 등장 인물은 아니다.]`
+  ].join("\n");
 }
 
 function getRecordOntologyType(record: MemoryDeltaRecord): "Event" | "State" | "Observation" | "Belief" {
@@ -1180,6 +1397,14 @@ function getRecordOwnerRef(
 ): GraphActorRef | undefined {
   const ownerId = record.ownerId ?? record.actorId;
   return ownerId ? actorRefs.get(ownerId) ?? createOptionalGraphActorRef(state, ownerId, record.actorName) : undefined;
+}
+
+function getRecordTargetRef(
+  state: AppState,
+  record: MemoryDeltaRecord,
+  actorRefs: ReadonlyMap<string, GraphActorRef>
+): GraphActorRef | undefined {
+  return record.targetId ? actorRefs.get(record.targetId) ?? createOptionalCharacterGraphRef(state, record.targetId) : undefined;
 }
 
 function getRecordObserverRefs(
@@ -2079,6 +2304,7 @@ export function createLocalContextPack(state: AppState, query: string): ContextP
 function createLocalContextEvidence(state: AppState): ContextPack["evidence"] {
   const immediateContinuityEvidence = createImmediateContinuityEvidence(state);
   const personaLine = createUserPersonaLine(state);
+  const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state));
   const personaEvidence = personaLine
     ? [
         {
@@ -2091,6 +2317,7 @@ function createLocalContextEvidence(state: AppState): ContextPack["evidence"] {
     : [];
   const structuredEvidence = createStructuredContextEvidence(state);
   const memoryEvidence = state.memoryEvents
+    .filter((event) => memoryEventIsRelevantToCurrentSceneCast(state, event, activeCharacterIds))
     .slice(-5)
     .map((event) => ({
       nodeId: event.neuralMapNodeId ?? event.id,
@@ -2106,6 +2333,32 @@ function createLocalContextEvidence(state: AppState): ContextPack["evidence"] {
     ...personaEvidence,
     ...memoryEvidence
   ]);
+}
+
+function memoryEventIsRelevantToCurrentSceneCast(
+  state: AppState,
+  event: MemoryEvent,
+  activeCharacterIds: ReadonlySet<string>
+): boolean {
+  const characterIds = getMemoryEventCharacterIds(state, event);
+  if (characterIds.length === 0) {
+    return true;
+  }
+
+  if (state.characters.length === 1 && characterIds.includes(state.characters[0].id)) {
+    return true;
+  }
+
+  return characterIds.some((characterId) => activeCharacterIds.has(characterId));
+}
+
+function getMemoryEventCharacterIds(state: AppState, event: MemoryEvent): string[] {
+  const knownCharacterIds = new Set(state.characters.map((character) => character.id));
+  return uniqueStrings([
+    event.actorId,
+    readMetadataText(event.metadata, "owner_id"),
+    readMetadataText(event.metadata, "target_id")
+  ].filter((characterId): characterId is string => Boolean(characterId))).filter((characterId) => knownCharacterIds.has(characterId));
 }
 
 function createImmediateContinuityEvidence(state: AppState): ContextPack["evidence"][number] | undefined {

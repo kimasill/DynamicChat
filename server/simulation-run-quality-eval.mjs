@@ -19,11 +19,16 @@ try {
   const { NeuralMapClient } = await vite.ssrLoadModule("/src/services/neuralMapClient.ts");
   const { createLocalContextPack } = await vite.ssrLoadModule("/src/services/neuralMapClient.ts");
   const { generateAssistantText } = await vite.ssrLoadModule("/src/services/llmClient.ts");
+  const { runSimulationTurn } = await vite.ssrLoadModule("/src/services/simulationEngine.ts");
   const { createStructuredContextSummary } = await vite.ssrLoadModule("/src/services/memoryCompiler.ts");
+  const { inferCurrentSceneCharacterIds } = await vite.ssrLoadModule("/src/services/sceneCast.ts");
   evaluateFreshSimulationRun(seedState, createFreshSimulationRun, activateSimulationProgressRun);
   await evaluateNeuralMapScopeFiltering(seedState, NeuralMapClient);
+  await evaluateNeuralMapGraphDeltaRoles(seedState, NeuralMapClient);
+  await evaluateNeuralMapCastFiltering(seedState, NeuralMapClient, runSimulationTurn);
   await evaluateContinuityAnchors(seedState, createLocalContextPack, generateAssistantText);
   await evaluateSceneCastGuard(seedState, createLocalContextPack, generateAssistantText, createStructuredContextSummary);
+  evaluateImageCastContinuity(seedState, inferCurrentSceneCharacterIds);
 } finally {
   await vite.close();
 }
@@ -311,6 +316,299 @@ async function evaluateNeuralMapScopeFiltering(seedState, NeuralMapClient) {
   }
 }
 
+async function evaluateNeuralMapGraphDeltaRoles(seedState, NeuralMapClient) {
+  const simulationId = "sim_graph_roles";
+  const sessionId = "session_graph_roles";
+  const runId = "run_graph_roles";
+  const now = new Date().toISOString();
+  const state = {
+    ...structuredClone(seedState),
+    simulation: {
+      ...seedState.simulation,
+      id: simulationId,
+      title: "Graph Role Eval",
+      activeSessionId: sessionId
+    },
+    security: {
+      ...seedState.security,
+      scope: {
+        ownerId: "owner_graph",
+        workspaceId: "workspace_graph",
+        projectId: simulationId,
+        environment: "local"
+      }
+    },
+    activeProgressRunId: runId,
+    characters: [
+      createEvalCharacter(simulationId, "char_mina", "미나", "관계 변화의 actor"),
+      createEvalCharacter(simulationId, "char_sora", "소라", "관계 변화의 target")
+    ],
+    messages: [],
+    memoryEvents: [],
+    contextPacks: [],
+    neuralMap: {
+      enabled: true,
+      baseUrl: "https://neuralmap.invalid",
+      tokenBudget: 1800
+    }
+  };
+  const delta = {
+    id: "memdelta_graph_roles",
+    turnId: "turn_graph_roles",
+    simTime: now,
+    sceneId: "scene:graph-role-room",
+    warnings: [],
+    upsertRecords: [
+      createDeltaRecord("rec_event", "event", {
+        content: "미나가 소라에게 오래된 약속을 확인했다.",
+        actorId: "char_mina",
+        actorName: "미나",
+        targetId: "char_sora",
+        eventType: "PromiseChecked",
+        tags: ["promise"]
+      }),
+      createDeltaRecord("rec_relationship", "relationship", {
+        content: "미나와 소라의 신뢰가 조금 회복되었다.",
+        actorId: "char_mina",
+        actorName: "미나",
+        targetId: "char_sora",
+        eventType: "RelationshipUpdated",
+        tags: ["relationship", "trust"]
+      }),
+      createDeltaRecord("rec_state", "state", {
+        content: "미나 Emotion: relieved",
+        actorId: "char_mina",
+        actorName: "미나",
+        ownerId: "char_mina",
+        stateType: "Emotion",
+        value: "relieved",
+        tags: ["state", "Emotion"]
+      }),
+      createDeltaRecord("rec_observation", "observation", {
+        content: "미나는 소라가 약속을 숨기지 않는다고 관찰했다.",
+        actorId: "char_mina",
+        actorName: "미나",
+        targetId: "char_sora",
+        observers: ["char_mina"],
+        eventType: "Observed",
+        tags: ["observation"]
+      })
+    ]
+  };
+  const requests = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    requests.push({
+      url: String(url),
+      body: JSON.parse(String(init?.body ?? "{}"))
+    });
+    return {
+      ok: true,
+      json: async () => ({ accepted: true })
+    };
+  };
+
+  try {
+    await new NeuralMapClient(state.neuralMap).applyMemoryDelta(delta, state);
+    const request = requests.find((item) => item.url.includes("/graph/deltas"))?.body;
+    const synapses = request?.upsert_synapses ?? [];
+    const neurons = request?.upsert_neurons ?? [];
+    const sceneNodeId = `simulation:${simulationId}:scene:graph-role-room`;
+    const minaNodeId = `simulation:${simulationId}:person:char_mina`;
+    const soraNodeId = `simulation:${simulationId}:person:char_sora`;
+    const edgeTypes = new Set(synapses.map((edge) => edge.type));
+
+    assertCheck("neuralmap.graph", Boolean(request), "Graph delta request is sent to NeuralMap.");
+    assertCheck("neuralmap.graph", neurons.some((node) => node.id === sceneNodeId && node.ontology?.type === "Scene"), "Graph delta includes a scene neuron.");
+    assertCheck("neuralmap.graph", neurons.some((node) => node.id === minaNodeId) && neurons.some((node) => node.id === soraNodeId), "Graph delta includes actor and target character neurons.");
+    assertCheck("neuralmap.graph", synapses.filter((edge) => edge.type === "SCENE_HAS_MEMORY").length === delta.upsertRecords.length, "Every memory record is linked to its scene.");
+    assertCheck("neuralmap.graph", synapses.some((edge) => edge.type === "SCENE_PARTICIPANT" && edge.from === sceneNodeId && edge.to === minaNodeId), "Scene participant edge records the active actor/observer.");
+    assertCheck("neuralmap.graph", synapses.some((edge) => edge.type === "TARGET_OF" && edge.from === soraNodeId), "Target character is linked to targeted memories.");
+    assertCheck("neuralmap.graph", synapses.some((edge) => edge.type === "RELATIONSHIP_TO" && edge.from === minaNodeId && edge.to === soraNodeId), "Relationship deltas connect actor to target.");
+    assertCheck("neuralmap.graph", edgeTypes.has("HAS_CURRENT_STATE") && edgeTypes.has("OBSERVED") && edgeTypes.has("ACTOR_OF"), "State, observation, and event role edges are preserved.");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
+async function evaluateNeuralMapCastFiltering(seedState, NeuralMapClient, runSimulationTurn) {
+  const simulationId = "sim_cast_filter";
+  const sessionId = "session_cast_filter";
+  const runId = "run_cast_filter";
+  const now = new Date().toISOString();
+  const characters = [
+    createEvalCharacter(simulationId, "char_mina", "미나", "현재 복도 장면에서 사용자와 함께 있는 인물"),
+    createEvalCharacter(simulationId, "char_sora", "소라", "관계도에는 있으나 현재 장면 밖에 있는 인물"),
+    createEvalCharacter(simulationId, "char_jun", "준", "NeuralMap에는 있으나 현재 장면 밖에 있는 인물")
+  ];
+  const state = {
+    ...structuredClone(seedState),
+    simulation: {
+      ...seedState.simulation,
+      id: simulationId,
+      title: "Cast Filtering Eval",
+      description: "현재 장면은 복도에서 한 명과 이어진다.",
+      activeSessionId: sessionId
+    },
+    security: {
+      ...seedState.security,
+      scope: {
+        ownerId: "owner_cast",
+        workspaceId: "workspace_cast",
+        projectId: simulationId,
+        environment: "local"
+      }
+    },
+    activeProgressRunId: runId,
+    progressRuns: [],
+    llm: {
+      ...seedState.llm,
+      enabled: false,
+      provider: "mock",
+      apiKey: ""
+    },
+    neuralMap: {
+      enabled: true,
+      baseUrl: "https://neuralmap.invalid",
+      tokenBudget: 1800
+    },
+    relationshipMap: {
+      ...seedState.relationshipMap,
+      enabled: true
+    },
+    characters,
+    visualProfiles: characters.map((character) => ({
+      id: `visual_${character.id}`,
+      simulationId,
+      characterId: character.id,
+      displayName: character.name,
+      positivePrompt: `${character.name} visual profile marker`,
+      negativePrompt: "",
+      defaultOutfitPrompt: `${character.name} outfit marker`,
+      outfitPrompts: {},
+      expressionPrompts: {},
+      defaultSafetyLevel: "safe",
+      updatedAt: now
+    })),
+    modules: [
+      {
+        id: "module_cast_main",
+        simulationId,
+        kind: "main_prompt",
+        title: "메인 규칙",
+        body: "현재 장면의 실제 등장 인물만 움직인다.",
+        enabled: true,
+        priority: 100,
+        activationTags: ["core"],
+        tokenPolicy: "always",
+        version: 1,
+        updatedAt: now
+      },
+      createEvalCharacterModule(simulationId, "module_cast_mina", "char_mina", "미나", "rag"),
+      createEvalCharacterModule(simulationId, "module_cast_sora", "char_sora", "소라", "rag"),
+      createEvalCharacterModule(simulationId, "module_cast_jun", "char_jun", "준", "always")
+    ],
+    messages: [
+      createUserMessage(seedState, "미나에게 복도 끝을 확인해 달라고 한다."),
+      createAssistantMessage(seedState, "미나는 복도 끝을 보고 돌아와, 아직 아무도 오지 않았다고 말한다.")
+    ].map((message) => ({
+      ...message,
+      simulationId,
+      sessionId
+    })),
+    memoryEvents: [
+      createStateMemoryEvent({ simulationId, sessionId, runId, characterId: "char_mina", characterName: "미나", value: "quiet, standing" }),
+      createStateMemoryEvent({ simulationId, sessionId, runId, characterId: "char_sora", characterName: "소라", value: "offstage, waiting" }),
+      createStateMemoryEvent({ simulationId, sessionId, runId, characterId: "char_jun", characterName: "준", value: "offstage, waiting" })
+    ],
+    contextPacks: [],
+    handoffs: [],
+    continuityChecks: [],
+    promptModuleUsages: [],
+    sidecarTraces: [],
+    turnTraces: [],
+    imageJobs: []
+  };
+  const neuralMapResponse = {
+    id: "ctx_cast_remote",
+    objective: "Continue Cast Filtering Eval",
+    session_id: sessionId,
+    evidence: [
+      {
+        node_id: `simulation:${simulationId}:memory:mina`,
+        snippet: "미나는 복도 문 앞에서 사용자의 다음 행동을 기다린다.",
+        score: 0.98,
+        metadata: { simulation_id: simulationId, session_id: sessionId, progress_run_id: runId }
+      },
+      {
+        node_id: `simulation:${simulationId}:person:char_sora`,
+        snippet: "소라는 관계도와 NeuralMap 상태에는 있지만 현재 복도 장면 밖에 있다.",
+        score: 0.97,
+        metadata: { simulation_id: simulationId, session_id: sessionId, progress_run_id: runId }
+      },
+      {
+        node_id: `simulation:${simulationId}:person:char_jun`,
+        snippet: "준은 항상 캐릭터 프롬프트가 있는 등록 인물이지만 현재 장면 밖에 있다.",
+        score: 0.96,
+        metadata: { simulation_id: simulationId, session_id: sessionId, progress_run_id: runId }
+      }
+    ],
+    sections: {
+      current_scene: [
+        {
+          node_id: `simulation:${simulationId}:memory:jun-state`,
+          snippet: "준 상태: offstage, waiting.",
+          score: 0.93,
+          metadata: { simulation_id: simulationId, session_id: sessionId, progress_run_id: runId }
+        }
+      ]
+    },
+    decisions: [],
+    blockers: [],
+    token_budget: 1800,
+    created_at: now
+  };
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => neuralMapResponse
+  });
+
+  try {
+    const currentAction = "문을 닫고 미나와 잠깐 기다린다.";
+    const pack = await new NeuralMapClient(state.neuralMap).getSimulationContext(
+      {
+        ...state,
+        messages: [...state.messages, createUserMessage(state, currentAction)]
+      },
+      currentAction
+    );
+    const combinedEvidence = [
+      ...pack.evidence,
+      ...(pack.moduleEvidence ?? []),
+      ...Object.values(pack.sections ?? {}).flat()
+    ]
+      .map((item) => item.snippet)
+      .join("\n");
+    const turn = await runSimulationTurn(state, currentAction, false, {
+      deferMemoryIngest: true,
+      deferImagePlanning: true
+    });
+    const selectedModuleIds = turn.promptModuleUsages.map((usage) => usage.moduleId).join(",");
+    const preview = turn.sidecarTrace.requestPreview ?? "";
+
+    assertCheck("neuralmap.cast", combinedEvidence.includes("미나"), "NeuralMap context keeps active character evidence.");
+    assertCheck("neuralmap.cast", !combinedEvidence.includes("소라") && !combinedEvidence.includes("준"), "NeuralMap context drops inactive character-only evidence.");
+    assertCheck("neuralmap.cast", selectedModuleIds.includes("module_cast_mina"), "Active character prompt can still be selected.");
+    assertCheck("neuralmap.cast", !selectedModuleIds.includes("module_cast_sora"), "Inactive character prompt is not activated by NeuralMap evidence.");
+    assertCheck("neuralmap.cast", !selectedModuleIds.includes("module_cast_jun"), "Inactive always character prompt is not included as a current-turn module.");
+    assertCheck("neuralmap.cast", !preview.includes("소라 visual profile marker") && !preview.includes("준 visual profile marker"), "LLM prompt omits inactive character visual profiles.");
+    assertCheck("neuralmap.cast", !preview.includes("offstage, waiting"), "LLM prompt omits inactive character relationship/status records.");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
 async function evaluateContinuityAnchors(seedState, createLocalContextPack, generateAssistantText) {
   const longPreviousAssistant = [
     "OPENING_CONTEXT_SHOULD_NOT_BE_THE_ONLY_VISIBLE_PART",
@@ -426,6 +724,165 @@ async function evaluateSceneCastGuard(seedState, createLocalContextPack, generat
   assertCheck("scene.cast", combinedEvidence.includes("미나"), "Local Context Pack includes active character evidence.");
   assertCheck("scene.cast", !combinedEvidence.includes("소라") && !combinedEvidence.includes("준"), "Local Context Pack does not inject off-stage relationship-map characters as evidence.");
   assertCheck("scene.cast", preview.includes("relationship-map guard") || preview.includes("relationship map entries"), "LLM request preview includes the roster/relationship guard.");
+}
+
+function evaluateImageCastContinuity(seedState, inferCurrentSceneCharacterIds) {
+  const state = {
+    ...structuredClone(seedState),
+    userPersona: {
+      ...seedState.userPersona,
+      enabled: false
+    },
+    characters: [
+      {
+        id: "char_mina",
+        simulationId: seedState.simulation.id,
+        name: "미나",
+        role: "이전 장면 인물",
+        summary: "이번 컷에는 나오지 않는다.",
+        relationship: "",
+        currentMood: ""
+      },
+      {
+        id: "char_sora",
+        simulationId: seedState.simulation.id,
+        name: "소라",
+        role: "최근 이미지에 나온 인물",
+        summary: "이름이 반복되지 않아도 다음 컷의 주체로 유지되어야 한다.",
+        relationship: "",
+        currentMood: ""
+      }
+    ],
+    imageAssets: [
+      {
+        id: "asset_eval_sora",
+        simulationId: seedState.simulation.id,
+        title: "최근 소라 컷",
+        source: "generated",
+        prompt: "1girl, black hair, hallway",
+        negativePrompt: "",
+        safetyLevel: seedState.imageProfile.safetyLevel,
+        characterIds: ["char_sora"],
+        tags: ["1girl", "black hair", "hallway"],
+        createdAt: new Date().toISOString(),
+        jobId: "imgjob_eval_sora",
+        palette: ["#111111", "#eeeeee", "#777777"],
+        reuseTags: ["1girl", "black hair", "hallway"]
+      }
+    ],
+    imageJobs: [
+      {
+        id: "imgjob_eval_sora",
+        simulationId: seedState.simulation.id,
+        sessionId: seedState.simulation.activeSessionId,
+        turnId: "msg_eval_assistant_image",
+        status: "completed",
+        reason: "최근 이미지 컷",
+        prompt: "1girl, black hair, hallway",
+        negativePrompt: "",
+        providerPayload: {
+          cue: {
+            characters: ["char_sora"]
+          }
+        },
+        assetIds: ["asset_eval_sora"],
+        contextNodeIds: [],
+        createdAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        representativeAssetId: "asset_eval_sora"
+      }
+    ],
+    turnTraces: [],
+    messages: [
+      createUserMessage(seedState, "그녀에게 고개를 끄덕인다."),
+      {
+        ...createAssistantMessage(seedState, "그녀는 복도 쪽으로 몸을 돌린 채 잠시 숨을 고른다."),
+        id: "msg_eval_assistant_image",
+        imageAssetIds: ["asset_eval_sora"]
+      }
+    ]
+  };
+  const activeIds = inferCurrentSceneCharacterIds(state, "그대로 이어간다.");
+  const transitionIds = inferCurrentSceneCharacterIds(state, "장면 전환. 미나는 다른 방으로 이동한다.");
+
+  assertCheck("scene.cast", activeIds.includes("char_sora"), "Recent generated image metadata keeps the visible character active for pronoun-only continuation.");
+  assertCheck("scene.cast", !activeIds.includes("char_mina"), "Recent generated image metadata does not activate unrelated roster characters.");
+  assertCheck("scene.cast", transitionIds.includes("char_mina") && !transitionIds.includes("char_sora"), "Explicit scene transition with a named character drops prior image-only cast continuity.");
+}
+
+function createEvalCharacter(simulationId, id, name, summary) {
+  return {
+    id,
+    simulationId,
+    name,
+    role: "평가용 캐릭터",
+    summary,
+    relationship: "관계도 평가용 값",
+    currentMood: "대기 중"
+  };
+}
+
+function createEvalCharacterModule(simulationId, id, characterId, name, tokenPolicy) {
+  return {
+    id,
+    simulationId,
+    parentId: "module_cast_main",
+    kind: "character_prompt",
+    title: `캐릭터: ${name}`,
+    body: `${name} 전용 캐릭터 프롬프트. 현재 장면 증거 없이 등장하면 안 된다.`,
+    enabled: true,
+    priority: 82,
+    activationTags: [name.toLowerCase(), "character"],
+    characterId,
+    tokenPolicy,
+    version: 1,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function createStateMemoryEvent({ simulationId, sessionId, runId, characterId, characterName, value }) {
+  return {
+    id: `memory_${characterId}_state`,
+    simulationId,
+    sessionId,
+    actorId: characterId,
+    actorName: characterName,
+    content: `[State] ${characterName} StatusTags = ${value}`,
+    importance: 0.78,
+    tags: ["memory-delta", "kind:state", "state:StatusTags"],
+    createdAt: new Date().toISOString(),
+    metadata: {
+      simulation_id: simulationId,
+      session_id: sessionId,
+      progress_run_id: runId,
+      run_id: runId,
+      memory_kind: "state",
+      owner_id: characterId,
+      state_type: "StatusTags",
+      value
+    }
+  };
+}
+
+function createDeltaRecord(id, kind, patch) {
+  return {
+    id,
+    kind,
+    layer: kind === "summary" ? "semantic" : "episodic",
+    content: patch.content,
+    importance: patch.importance ?? 0.82,
+    confidence: patch.confidence ?? 0.86,
+    tags: patch.tags ?? [],
+    actorId: patch.actorId,
+    actorName: patch.actorName,
+    ownerId: patch.ownerId,
+    targetId: patch.targetId,
+    stateType: patch.stateType,
+    value: patch.value,
+    eventType: patch.eventType,
+    observers: patch.observers,
+    importanceReasons: patch.importanceReasons ?? ["eval_graph_roles"]
+  };
 }
 
 function createUserMessage(state, content) {

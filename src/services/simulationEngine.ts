@@ -19,8 +19,7 @@ import type {
 } from "../types";
 
 import { findReusableImageAsset, pickStoredAsset, planImageJob, shouldPlanImageJob } from "./imageOrchestrator";
-import { createCurrentImageCueStateTags } from "./imageStateTags";
-import { generateAssistantText, generateImageCuePlans } from "./llmClient";
+import { generateAssistantText } from "./llmClient";
 import {
   compileSimulationMemoryDelta,
   createStructuredContextSummary,
@@ -29,7 +28,7 @@ import {
 } from "./memoryCompiler";
 import { NeuralMapClient } from "./neuralMapClient";
 import { createImageUserRulesForContentRating, isAdultContentMode } from "./contentRating";
-import { getCurrentSceneCharacters, inferCurrentSceneCharacterIds } from "./sceneCast";
+import { characterIsReferencedInText, getCurrentSceneCharacters, inferCurrentSceneCharacterIds } from "./sceneCast";
 
 const IMPORTANT_PATTERN = /기억|약속|관계|갈등|위험|비밀|장소|문제|목표|선택|상태|변화|단서/u;
 const IMAGE_PATTERN =
@@ -41,6 +40,8 @@ const MAX_SELECTED_PROMPT_MODULES = 12;
 const RETRIEVAL_RECENT_MESSAGE_CHARS = 520;
 const RETRIEVAL_LATEST_ASSISTANT_CHARS = 1400;
 const RETRIEVAL_SETTING_MODULE_CHARS = 360;
+const MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON = "메인 LLM image_cues.tags가 비어 있어 이미지 작업을 만들지 않음";
+const IMAGE_PROGRESSION_CUE_TARGET = 10;
 
 interface RunSimulationTurnOptions {
   deferImagePlanning?: boolean;
@@ -57,10 +58,9 @@ interface RunSimulationTurnOptions {
 }
 
 interface ImageRuleBackedCueDraft extends AssistantImageCueDraft {
-  plannerSource?: "main_llm_sidecar" | "dedicated_image_planner" | "user_image_rules" | "image_generation_cadence";
+  plannerSource?: "main_llm_sidecar" | "user_image_rules" | "image_generation_cadence";
   forceFreshImage?: boolean;
   forceImagePlanning?: boolean;
-  forceLocalVisualTags?: boolean;
 }
 
 interface ImageUserRuleCuePlan {
@@ -107,7 +107,7 @@ export async function runSimulationTurn(
   const retrievalStartedAt = Date.now();
   const contextPack = await neuralMap.getSimulationContext(optimisticState, retrievalQuery);
   const retrievalLatencyMs = Date.now() - retrievalStartedAt;
-  const moduleSelections = selectRelevantModules(state, retrievalQuery, contextPack);
+  const moduleSelections = selectRelevantModules(state, retrievalQuery, contextPack, userText);
   const relevantModules = moduleSelections.map((selection) => selection.module);
   const promptModuleUsages = createPromptModuleUsages(
     state,
@@ -133,6 +133,7 @@ export async function runSimulationTurn(
     modules: relevantModules,
     evidence: contextPack.evidence,
     fallback: fallbackContent,
+    manualImage,
     onAssistantText: options.onAssistantText
       ? (content) =>
           options.onAssistantText?.({
@@ -343,18 +344,7 @@ export async function planImageJobForCompletedTurn(
     baseDrafts,
     Boolean(input.manualImage)
   );
-  const drafts = await planImageCueDraftsWithLlm(
-    state,
-    input.userMessage.content,
-    input.assistantMessage.content,
-    initialDrafts,
-    input.sidecarTrace,
-    Boolean(input.manualImage)
-  );
-  const includeLocalVisualTags = input.sidecarTrace
-    ? input.sidecarTrace.source !== "llm" || input.sidecarTrace.status !== "parsed"
-    : true;
-  const trustLlmCharacterScope = input.sidecarTrace?.source === "llm" && input.sidecarTrace.status === "parsed";
+  const drafts = requireMainLlmAuthoredImageTags(initialDrafts, Boolean(input.manualImage));
   const imageCues = drafts.map((draft) =>
     planImageCue(
       state,
@@ -363,11 +353,6 @@ export async function planImageJobForCompletedTurn(
       input.assistantMessage.content,
       {
         allowLocalTrigger: false,
-        includeLocalVisualTags:
-          draft.plannerSource === "dedicated_image_planner"
-            ? false
-            : includeLocalVisualTags || draft.forceLocalVisualTags === true,
-        trustLlmCharacterScope,
         manualImage: input.manualImage
       }
     )
@@ -377,6 +362,9 @@ export async function planImageJobForCompletedTurn(
   const imageJobs = imageCues
     .map((imageCue, index) => {
       const draft = drafts[index];
+      if (isImageCueSuppressedForMissingMainLlmTags(imageCue)) {
+        return undefined;
+      }
       const canForcePlanning = shouldForceImagePlanningFromUserRules(state, draft, imageCue, Boolean(input.manualImage));
       if (!shouldPlanImageJob(state, imageCue, input.manualImage) && !canForcePlanning) {
         return undefined;
@@ -415,95 +403,51 @@ export async function planImageJobForCompletedTurn(
   };
 }
 
-async function planImageCueDraftsWithLlm(
-  state: AppState,
-  userText: string,
-  assistantText: string,
+function requireMainLlmAuthoredImageTags(
   drafts: ImageRuleBackedCueDraft[],
-  sidecarTrace: SidecarTrace | undefined,
   manualImage: boolean
-): Promise<ImageRuleBackedCueDraft[]> {
-  if (!shouldUseDedicatedImageCuePlanner(state, manualImage)) {
-    return [];
-  }
+): ImageRuleBackedCueDraft[] {
+  return drafts.map((draft) => {
+    if (!isImageGenerationRequestedByDraft(draft, manualImage) || hasLlmAuthoredImageTags(draft)) {
+      return draft;
+    }
 
-  const planner = await generateImageCuePlans({
-    state,
-    userText,
-    assistantText,
-    drafts,
-    reason: [
-      "Dedicated image planner owns final image cue selection and NovelAI tag generation for this completed simulation turn.",
-      sidecarTrace ? `sidecar=${sidecarTrace.source}/${sidecarTrace.status}` : undefined
-    ].filter(Boolean).join(" ")
-  });
-
-  if (planner.imageCues.length === 0) {
-    return [];
-  }
-
-  const forceFreshImage = drafts.some((draft) => draft.forceFreshImage);
-  const forceImagePlanning = drafts.some((draft) => draft.forceImagePlanning);
-  const forceLocalVisualTags = drafts.some((draft) => draft.forceLocalVisualTags);
-
-  return planner.imageCues.map((cue, cueIndex) => {
-    const base = findImageCueHintForPlannerCue(cue, drafts, cueIndex);
-    const plannerTags = sanitizeImageCueTags(cue.tags);
-    const plannerHasOwnVisualTags = plannerTags.length > 0;
     return {
-      ...(base ?? {}),
-      ...cue,
-      shouldGenerate: cue.shouldGenerate,
-      reason: cue.reason || base?.reason || "전용 이미지 플래너가 현재 문맥을 이미지 cue로 선택함",
-      characters: cue.characters.length > 0 ? cue.characters : base?.characters ?? [],
-      tags: plannerTags,
-      scene: cue.scene || base?.scene || "current simulation scene",
-      visualContext: cue.visualContext ?? plannerTags.join(", "),
-      suppressionReason: cue.suppressionReason ?? base?.suppressionReason,
-      label: cue.label ?? base?.label,
-      kind: cue.kind ?? base?.kind,
-      cueType: cue.cueType ?? base?.cueType,
-      placement: cue.placement ?? base?.placement,
-      anchorText: cue.anchorText ?? base?.anchorText,
-      priority: cue.priority ?? base?.priority,
-      plannerSource: "dedicated_image_planner",
-      forceFreshImage: forceFreshImage || base?.forceFreshImage,
-      forceImagePlanning: forceImagePlanning || base?.forceImagePlanning,
-      forceLocalVisualTags: plannerHasOwnVisualTags ? false : forceLocalVisualTags || base?.forceLocalVisualTags
+      ...draft,
+      shouldGenerate: false,
+      forceFreshImage: undefined,
+      forceImagePlanning: false,
+      suppressionReason: MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON,
+      reason: draft.reason || MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON
     };
   });
 }
 
-function shouldUseDedicatedImageCuePlanner(state: AppState, manualImage: boolean): boolean {
-  if (!state.imageProfile.enabled || !state.simulation.realtimeImageEnabled || state.imageProfile.triggerMode === "stored_only") {
-    return false;
-  }
-  if (state.imageProfile.triggerMode === "manual" && !manualImage) {
-    return false;
-  }
-  return state.llm.enabled && state.llm.provider !== "mock" && Boolean(state.llm.apiKey.trim());
+function isImageGenerationRequestedByDraft(draft: ImageRuleBackedCueDraft, manualImage: boolean): boolean {
+  return (
+    draft.shouldGenerate ||
+    manualImage ||
+    draft.forceImagePlanning === true ||
+    draft.plannerSource === "user_image_rules" ||
+    draft.plannerSource === "image_generation_cadence"
+  );
 }
 
-function hasForcedImageCueDraft(drafts: ImageRuleBackedCueDraft[]): boolean {
-  return drafts.some((draft) => draft.forceImagePlanning || draft.forceFreshImage || draft.plannerSource === "user_image_rules" || draft.plannerSource === "image_generation_cadence");
+function hasLlmAuthoredImageTags(draft: Pick<AssistantImageCueDraft, "tags" | "baseTags" | "characterPrompts">): boolean {
+  return (
+    draft.tags.some((tag) => tag.trim().length > 0) ||
+    (draft.baseTags ?? []).some((tag) => tag.trim().length > 0) ||
+    (draft.characterPrompts ?? []).some((prompt) => prompt.prompt.trim().length > 0)
+  );
 }
 
-function findImageCueHintForPlannerCue(
-  cue: AssistantImageCueDraft,
-  drafts: ImageRuleBackedCueDraft[],
-  cueIndex: number
-): ImageRuleBackedCueDraft | undefined {
-  const cueKind = cue.kind ?? cue.cueType;
-  const sameKind = cueKind ? drafts.find((draft) => (draft.kind ?? draft.cueType) === cueKind) : undefined;
-  if (sameKind) {
-    return sameKind;
-  }
-
-  return drafts[cueIndex] ?? drafts.find((draft) => draft.shouldGenerate || draft.forceImagePlanning) ?? drafts[0];
+function isImageCueSuppressedForMissingMainLlmTags(cue: ImageCue): boolean {
+  return cue.suppressionReason?.startsWith(MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON) === true;
 }
 
 function isGenericImageSceneTag(value: string): boolean {
-  return /^(?:(?:current|generated|simulation|safe)\s+)*scene$/iu.test(value.trim());
+  const normalized = value.toLowerCase().replace(/[._-]+/gu, " ").trim();
+  return /^(?:(?:current|generated|simulation|safe)\s+)*scene$/iu.test(normalized);
 }
 
 function addImageCuePlannerMetadata(
@@ -532,6 +476,7 @@ function addImageCuePlannerMetadata(
         llmSource: sidecarTrace?.source ?? "fallback",
         status: sidecarTrace?.status ?? "fallback",
         model: state.llm.model,
+        mainModel: state.llm.model,
         errors: sidecarTrace?.errors ?? []
       }
     }
@@ -574,8 +519,7 @@ function applyImageUserRuleCuePlan(
                 : "메인 LLM 이미지 cue"),
         plannerSource: "main_llm_sidecar",
         forceFreshImage: cuePlan.forceFresh || cuePlan.ignoreCooldown || shouldImageCadenceForceFresh(cadence) || undefined,
-        forceImagePlanning: cuePlan.ignoreCooldown || shouldImageCadenceForcePlanning(cadence) || undefined,
-        forceLocalVisualTags: cuePlan.requiresGeneration || cadenceRequiresGeneration || undefined
+        forceImagePlanning: cuePlan.ignoreCooldown || shouldImageCadenceForcePlanning(cadence) || undefined
       }));
 
   const withRuleCues = [...preparedDrafts];
@@ -604,16 +548,22 @@ function applyImageUserRuleCuePlan(
 
 function resolveImageGenerationCadence(state: AppState): ImageGenerationCadence {
   const cadence = state.imageProfile.generationCadence;
-  return cadence === "sparse" || cadence === "balanced" || cadence === "rich" || cadence === "paragraph"
+  return cadence === "sparse" || cadence === "balanced" || cadence === "rich" || cadence === "paragraph" || cadence === "image_progression"
     ? cadence
     : "balanced";
 }
 
 function shouldImageCadenceRequireGeneration(cadence: ImageGenerationCadence, userText: string, assistantText: string): boolean {
+  if (cadence === "image_progression") {
+    return Boolean(`${userText}\n${assistantText}`.trim());
+  }
   if (cadence === "paragraph") {
     return Boolean(assistantText.trim());
   }
   if (cadence === "rich") {
+    return hasVisualCueText(`${userText}\n${assistantText}`);
+  }
+  if (cadence === "balanced") {
     return hasVisualCueText(`${userText}\n${assistantText}`);
   }
 
@@ -621,11 +571,11 @@ function shouldImageCadenceRequireGeneration(cadence: ImageGenerationCadence, us
 }
 
 function shouldImageCadenceForcePlanning(cadence: ImageGenerationCadence): boolean {
-  return cadence === "rich" || cadence === "paragraph";
+  return cadence === "balanced" || cadence === "rich" || cadence === "paragraph" || cadence === "image_progression";
 }
 
 function shouldImageCadenceForceFresh(cadence: ImageGenerationCadence): boolean {
-  return cadence === "rich" || cadence === "paragraph";
+  return cadence === "rich" || cadence === "paragraph" || cadence === "image_progression";
 }
 
 function applyImageGenerationCadenceCuePlan(
@@ -650,11 +600,26 @@ function applyImageGenerationCadenceCuePlan(
     if (!hasImageCueKind(withCadenceCues, "scene", "context")) {
       withCadenceCues.push(createImageCadenceCueDraft("scene", assistantText, selectImageCueAnchorText(assistantText, "scene"), 0));
     }
-    if (hasActionBeatText(`${userText}\n${assistantText}`) && !hasImageCueKind(withCadenceCues, "action")) {
+    const richAnchors = selectRichVisualBeatAnchors(assistantText);
+    if (richAnchors.length > 0) {
+      richAnchors.forEach((anchorText, index) => {
+        if (hasDraftAnchor(withCadenceCues, anchorText)) {
+          return;
+        }
+        withCadenceCues.push(createImageCadenceCueDraft(inferRichVisualBeatKind(anchorText), assistantText, anchorText, index + 1));
+      });
+    } else if (hasActionBeatText(`${userText}\n${assistantText}`) && !hasImageCueKind(withCadenceCues, "action")) {
       withCadenceCues.push(createImageCadenceCueDraft("action", assistantText, selectImageCueAnchorText(assistantText, "action"), 1));
     }
     if (hasDialogueText(assistantText) && !hasImageCueKind(withCadenceCues, "dialogue_face")) {
-      withCadenceCues.push(createImageCadenceCueDraft("dialogue_face", assistantText, selectImageCueAnchorText(assistantText, "dialogue_face"), 2));
+      const anchorText = selectImageCueAnchorText(assistantText, "dialogue_face");
+      if (!anchorText || !hasDraftAnchor(withCadenceCues, anchorText)) {
+        withCadenceCues.push(createImageCadenceCueDraft("dialogue_face", assistantText, anchorText, 2));
+      }
+    }
+  } else if (cadence === "balanced" && cadenceRequiresGeneration) {
+    if (!hasImageCueKind(withCadenceCues, "scene", "context", "action", "dialogue_face", "body_detail", "interaction")) {
+      withCadenceCues.push(createImageCadenceCueDraft("scene", assistantText, selectImageCueAnchorText(assistantText, "scene"), 0));
     }
   }
 
@@ -668,15 +633,17 @@ function applyImageGenerationCadenceCuePlan(
       suppressionReason: undefined,
       reason: draft.reason || "이미지 생성 밀도 설정이 현재 문맥 생성을 요구함",
       forceFreshImage: draft.forceFreshImage || shouldImageCadenceForceFresh(cadence) || undefined,
-      forceImagePlanning: draft.forceImagePlanning || shouldImageCadenceForcePlanning(cadence) || undefined,
-      forceLocalVisualTags: true
+      forceImagePlanning: draft.forceImagePlanning || shouldImageCadenceForcePlanning(cadence) || undefined
     };
   });
-  const maxCueCount = hasUserRuleRequirement ? 8 : getImageCadenceMaxCueCount(cadence);
+  const maxCueCount = cadence === "image_progression" ? IMAGE_PROGRESSION_CUE_TARGET : hasUserRuleRequirement ? 8 : getImageCadenceMaxCueCount(cadence);
   return normalizedDrafts.slice(0, maxCueCount);
 }
 
 function getImageCadenceMaxCueCount(cadence: ImageGenerationCadence): number {
+  if (cadence === "image_progression") {
+    return IMAGE_PROGRESSION_CUE_TARGET;
+  }
   if (cadence === "sparse") {
     return 1;
   }
@@ -698,18 +665,6 @@ function createImageCadenceCueDraft(
 ): ImageRuleBackedCueDraft {
   const normalizedKind = kind === "context" ? "scene" : kind;
   const placement = index === 0 || normalizedKind === "scene" ? "before" : "inline";
-  const tags =
-    normalizedKind === "dialogue_face"
-      ? ["face focus"]
-      : normalizedKind === "action"
-        ? []
-        : [];
-  const visualContext =
-    normalizedKind === "dialogue_face"
-      ? "face focus"
-      : normalizedKind === "action"
-        ? undefined
-        : undefined;
 
   return {
     shouldGenerate: true,
@@ -719,14 +674,12 @@ function createImageCadenceCueDraft(
     plannerSource: "image_generation_cadence",
     forceFreshImage: true,
     forceImagePlanning: true,
-    forceLocalVisualTags: true,
     anchorText,
     priority: Math.max(0.72, 0.9 - index * 0.03),
     kind: normalizedKind,
     label: normalizedKind === "dialogue_face" ? "dialogue face" : normalizedKind === "action" ? "action beat" : "scene establishing",
     placement,
-    tags,
-    visualContext
+    tags: []
   };
 }
 
@@ -749,6 +702,34 @@ function selectVisualParagraphAnchors(assistantText: string): string[] {
           .filter(Boolean);
 
   return uniqueStrings(candidates.filter((item) => item.length >= 8).map((item) => item.slice(0, 140))).slice(0, 8);
+}
+
+function selectRichVisualBeatAnchors(assistantText: string): string[] {
+  const trimmed = assistantText.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const blocks = trimmed
+    .split(/\n{2,}|\n+/u)
+    .map(cleanImageAnchorText)
+    .filter((block) => block.length >= 8);
+  const visualBlocks = blocks.filter((block) => hasVisualCueText(block));
+  const candidates = visualBlocks.length > 0 ? visualBlocks : blocks;
+  return uniqueStrings(candidates.map((item) => item.slice(0, 140))).slice(0, 4);
+}
+
+function inferRichVisualBeatKind(anchorText: string): NonNullable<AssistantImageCueDraft["kind"]> {
+  if (/말하|속삭|외치|신음|숨소리|표정|눈|입|시선|dialogue|voice|says?|said|whisper|moan|face|eyes?|mouth/iu.test(anchorText)) {
+    return "dialogue_face";
+  }
+  if (/손|손목|팔|어깨|가슴|허리|허벅지|다리|발|body|hand|wrist|arm|shoulder|chest|waist|thigh|leg|feet/iu.test(anchorText)) {
+    return "body_detail";
+  }
+  if (/잡|놓|밀|당기|닿|기대|grabs?|holds?|touch(?:es|ing)?|push(?:es|ing)?|pull(?:s|ing)?|leans?/iu.test(anchorText)) {
+    return "interaction";
+  }
+  return "action";
 }
 
 function cleanImageAnchorText(value: string): string {
@@ -807,47 +788,41 @@ function createImageUserRuleCueDraft(kind: NonNullable<AssistantImageCueDraft["k
     plannerSource: "user_image_rules" as const,
     forceFreshImage: cuePlan.forceFresh || cuePlan.ignoreCooldown,
     forceImagePlanning: cuePlan.ignoreCooldown,
-    forceLocalVisualTags: true,
     anchorText,
     priority: kind === "scene" ? 0.92 : 0.86,
     kind
   };
 
   if (kind === "action") {
-    const tags = createLocalImageCueTags(anchorText ?? assistantText, undefined, { ...base, kind });
     return {
       ...base,
       label: "action beat",
       placement: "inline",
-      tags
+      tags: []
     };
   }
   if (kind === "body_detail") {
-    const tags = createLocalImageCueTags(anchorText ?? assistantText, undefined, { ...base, kind });
     return {
       ...base,
       label: "body detail",
       placement: "inline",
-      tags: tags.length > 0 ? tags : ["close-up", "hands"]
+      tags: []
     };
   }
   if (kind === "dialogue_face") {
-    const tags = createLocalImageCueTags(anchorText ?? assistantText, undefined, { ...base, kind });
     return {
       ...base,
       label: "dialogue face",
       placement: "before",
-      tags: tags.length > 0 ? tags : ["close-up", "face focus", "open mouth"],
-      visualContext: (tags.length > 0 ? tags : ["close-up", "face focus", "open mouth"]).join(", ")
+      tags: []
     };
   }
 
-  const tags = createLocalImageCueTags(anchorText ?? assistantText, undefined, { ...base, kind });
   return {
     ...base,
     label: "scene establishing",
     placement: "before",
-    tags
+    tags: []
   };
 }
 
@@ -857,7 +832,7 @@ function shouldForceImagePlanningFromUserRules(
   cue: ImageCue,
   manualImage: boolean
 ): boolean {
-  if (!draft?.forceImagePlanning || !cue.shouldGenerate) {
+  if (!draft?.forceImagePlanning || (!cue.shouldGenerate && !draft.shouldGenerate && !manualImage)) {
     return false;
   }
   if (!state.imageProfile.enabled || !state.simulation.realtimeImageEnabled || state.imageProfile.triggerMode === "stored_only") {
@@ -1188,11 +1163,17 @@ interface PromptModuleSelection {
   score: number;
 }
 
-function selectRelevantModules(state: AppState, userText: string, contextPack: ContextPack): PromptModuleSelection[] {
+function selectRelevantModules(
+  state: AppState,
+  userText: string,
+  contextPack: ContextPack,
+  currentSceneText = userText
+): PromptModuleSelection[] {
   const modules = state.modules.filter((module) => !(module.kind === "safety_policy" && isAdultContentMode(state)));
   const normalizedText = userText.toLowerCase();
   const queryTerms = createSelectionTerms(userText);
   const selectionEvidence = getModuleSelectionEvidence(contextPack);
+  const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, currentSceneText));
 
   return modules
     .filter((module) => module.enabled && module.tokenPolicy !== "disabled")
@@ -1200,7 +1181,7 @@ function selectRelevantModules(state: AppState, userText: string, contextPack: C
       const character = findModuleCharacter(state, module);
       const tagMatch = module.activationTags.some((tag) => textContainsSelectionPhrase(normalizedText, tag));
       const titleMatch = normalizedText.includes(module.title.toLowerCase());
-      const characterNameMatch = character ? textContainsSelectionPhrase(normalizedText, character.name) : false;
+      const characterNameMatch = character ? characterIsReferencedInText(character, userText) : false;
       const moduleSignalScore = scoreModuleSignalMatch(module, character, queryTerms);
       const bodySignalScore = scoreModuleBodyQueryMatch(module, queryTerms);
       const bodySignalMatch = hasStrongBodyQueryMatch(bodySignalScore, queryTerms);
@@ -1214,6 +1195,16 @@ function selectRelevantModules(state: AppState, userText: string, contextPack: C
         contextPack.source,
         character
       );
+      const directCharacterSignal = character ? characterNameMatch : tagMatch || titleMatch;
+
+      if (
+        module.kind === "character_prompt" &&
+        character &&
+        !shouldIncludeCharacterScopedContext(state, character.id, activeCharacterIds) &&
+        !directCharacterSignal
+      ) {
+        return undefined;
+      }
 
       if (module.tokenPolicy === "always") {
         return {
@@ -1327,6 +1318,15 @@ function evidenceMatchesModule(
   const snippet = item.snippet.toLowerCase();
   const snippetTerms = createSelectionTerms(snippet);
   const moduleSignals = createModuleSignalTerms(module, character);
+  if (module.kind === "character_prompt" && character) {
+    return (
+      item.nodeId === module.id ||
+      item.nodeId.includes(module.id) ||
+      item.nodeId.includes(character.id) ||
+      characterIsReferencedInText(character, `${item.nodeId}\n${item.snippet}`)
+    );
+  }
+
   return (
     item.nodeId === module.id ||
     item.nodeId.includes(module.id) ||
@@ -1553,6 +1553,14 @@ function findModuleCharacter(state: AppState, module: PromptModule): AppState["c
   return state.characters.find((character) => character.id === module.characterId);
 }
 
+function shouldIncludeCharacterScopedContext(
+  state: AppState,
+  characterId: string,
+  activeCharacterIds: ReadonlySet<string>
+): boolean {
+  return activeCharacterIds.has(characterId) || (state.characters.length === 1 && state.characters[0]?.id === characterId);
+}
+
 function compactPromptModuleForActiveContext(module: PromptModule, userText: string, contextPack: ContextPack): PromptModule {
   if (module.body.length <= MAX_ACTIVE_MODULE_BODY_CHARS) {
     return module;
@@ -1666,7 +1674,7 @@ function createAssistantContent(
   const characterState = [character?.relationship, character?.currentMood].filter(Boolean).join(", ");
   const activeModules = modules.filter((module) => module.kind !== "image_prompt_profile" && module.kind !== "safety_policy");
   const activeGuidance = activeModules.map((module) => module.title).slice(0, 4).join(", ");
-  const memoryHint = evidence[0] ?? "아직 강한 장기 기억은 없다.";
+  const memoryHint = createFallbackMemoryHint(evidence);
   const personaHint = createPersonaNarrationHint(state);
   const asksForImage = /그려|보여|이미지/u.test(userText);
   const fallbackNotice = createLocalFallbackNotice(activeGuidance);
@@ -1701,6 +1709,42 @@ function createAssistantContent(
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function createFallbackMemoryHint(evidence: string[]): string {
+  for (const snippet of evidence) {
+    const safeHint = sanitizeFallbackEvidenceHint(snippet);
+    if (safeHint) {
+      return safeHint;
+    }
+  }
+
+  return "최근 대화 연속성 단서는 Context Pack에 보존되어 있다.";
+}
+
+function sanitizeFallbackEvidenceHint(value: string): string {
+  const normalized = value.replace(/\r\n?/gu, "\n").trim();
+  if (!normalized || looksLikeInternalFallbackEvidence(normalized)) {
+    return "";
+  }
+
+  const compact = normalized
+    .split("\n")
+    .map((line) => line.replace(/^#+\s*/u, "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/gu, " ")
+    .trim();
+
+  if (!compact || looksLikeInternalFallbackEvidence(compact)) {
+    return "";
+  }
+
+  return compact.length > 180 ? `${compact.slice(0, 177).trimEnd()}...` : compact;
+}
+
+function looksLikeInternalFallbackEvidence(value: string): boolean {
+  return /(?:#\s*Immediate Continuity Anchor|Use this before older retrieved memories|Immediate continuity anchor:|SYSTEM INSTRUCTION:|CONTEXT BLOCK:|USER ACTION:|Return JSON only\. The JSON schema is|Current scene cast guard:|Structured simulation memory:|Simulation foundation:|Selected prompt modules for this turn:|Memory\/context evidence:)/iu.test(value);
 }
 
 function createLocalFallbackNotice(activeGuidance: string): string {
@@ -1953,11 +1997,12 @@ function createPendingImageCue(
   assistantContent: string,
   manualImage = false
 ): ImageCue {
-  const currentTurnText = `${userText}\n${assistantContent}`;
+  void state;
+  void userText;
   return {
     shouldGenerate: manualImage,
     reason: manualImage ? "수동 이미지 생성 요청 대기" : "메인 LLM 이미지 cue 대기",
-    characters: findMentionedCharacterIds(state, currentTurnText),
+    characters: [],
     tags: [],
     scene: "current simulation scene",
     suppressionReason: manualImage ? undefined : "메인 LLM 이미지 cue가 아직 적용되지 않음",
@@ -1970,164 +2015,44 @@ function planImageCue(
   userText: string,
   draft: AssistantImageCueDraft,
   assistantContent: string,
-  options: { allowLocalTrigger?: boolean; includeLocalVisualTags?: boolean; trustLlmCharacterScope?: boolean; manualImage?: boolean } = {}
+  options: { allowLocalTrigger?: boolean; manualImage?: boolean } = {}
 ): ImageCue {
-  const currentTurnText = `${userText}\n${assistantContent}`;
-  const recentContext = createRecentImageCueContext(state);
-  const combinedText = `${recentContext}\n${currentTurnText}`;
-  const includeLocalVisualTags = options.includeLocalVisualTags ?? true;
-  const visualInferenceText = includeLocalVisualTags
-    ? createFocusedImageCueInferenceText(currentTurnText, recentContext, userText, draft)
-    : currentTurnText;
-  const focusedCueText = createFocusedImageCueText(currentTurnText, draft);
-  const characterScopeText = createImageCueCharacterScopeText(currentTurnText, draft);
-  const allowLocalTrigger = options.allowLocalTrigger ?? true;
-  const rawResolvedCharacters = resolveCharacterIds(state, draft.characters);
-  const mentionedCharacters = uniqueStrings([
-    ...findMentionedCharacterIds(state, focusedCueText),
-    ...findPersonaActionCharacterIds(state, userText, focusedCueText, characterScopeText)
-  ]);
-  const resolvedCharacters = filterImageCueCharactersForCurrentTurn(
-    state,
-    rawResolvedCharacters,
-    mentionedCharacters,
-    currentTurnText,
-    characterScopeText,
-    Boolean(options.trustLlmCharacterScope)
-  );
-  const alwaysVisual = state.modules.some(
-    (module) =>
-      module.enabled &&
-      module.kind === "image_prompt_profile" &&
-      /항상|모든 assistant|기본 이미지/u.test(module.body)
-  );
-  const hasVisualTrigger = allowLocalTrigger && IMAGE_PATTERN.test(combinedText);
-  let shouldGenerate =
+  void userText;
+  void assistantContent;
+  const backedDraft = draft as ImageRuleBackedCueDraft;
+  const generationRequested =
     draft.shouldGenerate ||
     Boolean(options.manualImage) ||
-    (allowLocalTrigger && alwaysVisual) ||
-    hasVisualTrigger;
+    Boolean(backedDraft.forceImagePlanning);
+  const rawResolvedCharacters = resolveCharacterIds(state, draft.characters);
+  const shouldGenerate = generationRequested;
   const scene = resolveImageScene(draft.scene);
-  const defaultCharacters = shouldDropCharactersForExternalCue(
-    state,
-    uniqueStrings([...rawResolvedCharacters, ...mentionedCharacters]),
-    characterScopeText
-  )
-    ? []
-    : mentionedCharacters;
-  const inferredPlannerCharacters =
-    resolvedCharacters.length === 0 && defaultCharacters.length === 0 && isDedicatedPlannerDraft(draft)
-      ? inferDedicatedPlannerCharacterIds(state, focusedCueText, characterScopeText, draft)
-      : [];
-  const characterIds = resolvedCharacters.length > 0 ? resolvedCharacters : defaultCharacters.length > 0 ? defaultCharacters : inferredPlannerCharacters;
-  const localCueTags = includeLocalVisualTags ? createLocalImageCueTags(visualInferenceText, state, draft) : [];
-  const plannerSubjectTags = isDedicatedPlannerDraft(draft) ? createPlannerSubjectCountTags(state, characterIds, draft.tags) : [];
-  const tags = uniqueStrings([
-    ...filterRosterNameCueTags(
-      state,
-      sanitizeImageCueTags([...plannerSubjectTags, ...draft.tags, ...localCueTags])
-    )
-  ].filter((tag): tag is string => Boolean(tag)));
-  const stateBackedTags = createCurrentImageCueStateTags(state, characterIds);
-  const visualContext = createImageCueVisualContext(
-    state,
-    visualInferenceText,
-    scene,
-    characterIds,
-    draft.visualContext,
-    includeLocalVisualTags,
-    draft
-  );
-  const concreteVisualContextTags = sanitizeImageCueTags(visualContext.split(/[,;\n|]+/u))
-    .filter((tag) => !isGenericImageSceneTag(tag));
-  const hasConcreteLlmVisualInput =
-    tags.length > 0 ||
-    concreteVisualContextTags.length > 0 ||
-    stateBackedTags.length > 0;
-  if (shouldGenerate && !options.manualImage && !hasConcreteLlmVisualInput) {
-    shouldGenerate = false;
-  }
+  const characterIds = rawResolvedCharacters;
+  const tags = sanitizeImageCueTags(draft.tags, state);
+  const baseTags = draft.baseTags ? sanitizeImageCueTags(draft.baseTags, state) : undefined;
+  const characterPrompts = (draft.characterPrompts ?? [])
+    .map((prompt) => ({
+      ...prompt,
+      characterId: prompt.characterId ? resolveCharacterIds(state, [prompt.characterId])[0] ?? prompt.characterId : undefined,
+      prompt: sanitizeImageCueTags(prompt.prompt.split(","), state).join(", "),
+      negativePrompt: prompt.negativePrompt ? sanitizeImageCueTags(prompt.negativePrompt.split(","), state).join(", ") : undefined
+    }))
+    .filter((prompt) => prompt.prompt.trim());
+  const visualContext = draft.visualContext?.trim() || tags.join(", ");
 
   return {
     shouldGenerate,
     reason: draft.reason || (shouldGenerate ? "메인 LLM이 현재 장면을 이미지 cue로 선택함" : "메인 LLM이 이미지 생성을 생략함"),
     characters: characterIds,
     tags,
+    baseTags,
+    characterPrompts,
     scene,
     suppressionReason: shouldGenerate
       ? draft.suppressionReason
-      : draft.suppressionReason ?? "LLM image cue에 사용할 수 있는 태그/상태가 부족함",
+      : draft.suppressionReason ?? "메인 LLM이 이미지 생성을 생략함",
     visualContext
   };
-}
-
-function isDedicatedPlannerDraft(draft: AssistantImageCueDraft): boolean {
-  return (draft as ImageRuleBackedCueDraft).plannerSource === "dedicated_image_planner";
-}
-
-function inferDedicatedPlannerCharacterIds(
-  state: AppState,
-  focusedCueText: string,
-  characterScopeText: string,
-  draft: AssistantImageCueDraft
-): string[] {
-  const explicitCueText = [focusedCueText, characterScopeText, draft.scene, draft.visualContext, draft.tags.join(", ")]
-    .filter(Boolean)
-    .join("\n");
-  if (!hasVisibleCharacterCueSignal(explicitCueText)) {
-    return [];
-  }
-
-  const activeIds = inferCurrentSceneCharacterIds(state, explicitCueText);
-  return activeIds.length === 1 ? activeIds : [];
-}
-
-function hasVisibleCharacterCueSignal(text: string): boolean {
-  return /\b(?:\d+(?:girls?|boys?|others?)|girl|boy|woman|man|solo|upper body|cowboy shot|full body|portrait|face focus|eye focus|open mouth|smile|standing|sitting|walking|holding|grabbing|touching|microphone|hand|hands|body focus)\b|그녀|그|캐릭터|인물|얼굴|표정|손|몸|말하|속삭|걷|잡|쥐|들고/u.test(
-    text
-  );
-}
-
-function createPlannerSubjectCountTags(state: AppState, characterIds: string[], existingTags: string[]): string[] {
-  if (existingTags.some((tag) => isImageSubjectCountTag(tag)) || characterIds.length === 0 || characterIds.length > 2) {
-    return [];
-  }
-
-  const subjectKinds = characterIds.map((characterId) => detectCharacterSubjectKind(state, characterId));
-  if (characterIds.length === 1) {
-    return [`1${subjectKinds[0]}`];
-  }
-  const [first, second] = subjectKinds;
-  if (first && first === second) {
-    return [`2${first}s`];
-  }
-  return [];
-}
-
-function isImageSubjectCountTag(tag: string): boolean {
-  return /^\d+(?:girls?|boys?|others?)$/iu.test(tag.trim());
-}
-
-function detectCharacterSubjectKind(state: AppState, characterId: string): "girl" | "boy" | "other" {
-  const character = state.characters.find((candidate) => candidate.id === characterId);
-  const visualProfile = state.visualProfiles.find((candidate) => candidate.characterId === characterId);
-  const text = [
-    character?.role,
-    character?.summary,
-    visualProfile?.displayName,
-    visualProfile?.positivePrompt
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-
-  if (/\b(?:girl|female|woman|schoolgirl|breasts?)\b|여학생|소녀|여자|여성/u.test(text)) {
-    return "girl";
-  }
-  if (/\b(?:boy|male|man|schoolboy)\b|남학생|소년|남자|남성/u.test(text)) {
-    return "boy";
-  }
-  return "other";
 }
 
 function resolveImageScene(draftScene: string | undefined): string {
@@ -2137,96 +2062,6 @@ function resolveImageScene(draftScene: string | undefined): string {
   }
 
   return "current simulation scene";
-}
-
-function createFocusedImageCueInferenceText(
-  currentTurnText: string,
-  recentContext: string,
-  userText: string,
-  draft: AssistantImageCueDraft
-): string {
-  const anchoredText = createAnchorFocusedImageCueText(currentTurnText, draft);
-  const cueText = createFocusedImageCueText(currentTurnText, draft);
-
-  if (anchoredText) {
-    return cueText === currentTurnText ? anchoredText : `${anchoredText}\n${cueText}`;
-  }
-
-  if (recentContext && isDeicticImageRequest(userText)) {
-    return `${recentContext}\n${cueText === currentTurnText ? currentTurnText : cueText}`;
-  }
-
-  if (hasSpecificImageCueDraft(draft) || hasCurrentTurnSceneSignal(currentTurnText)) {
-    return cueText;
-  }
-
-  return currentTurnText;
-}
-
-function hasSpecificImageCueDraft(draft: AssistantImageCueDraft): boolean {
-  return (
-    sanitizeImageCueTags(draft.tags).length > 0 ||
-    Boolean(draft.visualContext?.trim()) ||
-    Boolean(normalizeImageSceneLabel(draft.scene))
-  );
-}
-
-function createAnchorFocusedImageCueText(currentTurnText: string, draft: AssistantImageCueDraft): string | undefined {
-  const anchor = cleanImageAnchorText(draft.anchorText ?? "");
-  if (!anchor) {
-    return undefined;
-  }
-
-  const lines = currentTurnText
-    .split(/\n+/u)
-    .map(cleanImageAnchorText)
-    .filter(Boolean);
-  const normalizedAnchor = normalizeAnchorForComparison(anchor);
-  const directIndex = lines.findIndex((line) => normalizeAnchorForComparison(line).includes(normalizedAnchor));
-  if (directIndex >= 0) {
-    return selectAnchorNeighborLines(lines, directIndex).join("\n");
-  }
-
-  const anchorTerms = createAnchorSearchTerms(anchor);
-  let bestIndex = -1;
-  let bestScore = 0;
-  lines.forEach((line, index) => {
-    const normalizedLine = normalizeAnchorForComparison(line);
-    const score = anchorTerms.reduce((sum, term) => (normalizedLine.includes(term) ? sum + Math.min(8, term.length) : sum), 0);
-    if (score > bestScore) {
-      bestIndex = index;
-      bestScore = score;
-    }
-  });
-
-  return bestIndex >= 0 && bestScore >= 4 ? selectAnchorNeighborLines(lines, bestIndex).join("\n") : anchor;
-}
-
-function selectAnchorNeighborLines(lines: string[], index: number): string[] {
-  const start = Math.max(0, index - 1);
-  const end = Math.min(lines.length, index + 2);
-  return lines.slice(start, end);
-}
-
-function createAnchorSearchTerms(value: string): string[] {
-  return uniqueStrings(
-    value
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]+/gu, " ")
-      .split(/\s+/u)
-      .map((term) => term.trim())
-      .filter((term) => term.length >= 2)
-      .slice(0, 16)
-  );
-}
-
-function hasCurrentTurnSceneSignal(text: string): boolean {
-  void text;
-  return false;
-}
-
-function isDeicticImageRequest(text: string): boolean {
-  return /(?:이|현재|방금|지금)\s*(?:장면|상황|모습|컷)|this\s+scene|current\s+scene|show\s+(?:this|current)/iu.test(text);
 }
 
 function normalizeImageSceneLabel(value: string | undefined): string | undefined {
@@ -2263,512 +2098,51 @@ function normalizeImageSceneLabel(value: string | undefined): string | undefined
   return normalized.split(" ").length <= 4 ? normalized : undefined;
 }
 
-function createLocalImageCueTags(text: string, state?: AppState, draft?: Pick<AssistantImageCueDraft, "kind" | "cueType">): string[] {
-  void state;
-  const kind = normalizeImageCueKind(draft?.kind ?? draft?.cueType);
-  return filterContradictoryLocalImageTags(uniqueStrings([
-    ...selectCueFramingTags(kind, text),
-    ...selectCueEnvironmentTags(text),
-    ...selectCueWeatherAndLightingTags(text),
-    ...selectCuePoseActionTags(text),
-    ...selectCueBodyDetailTags(kind, text),
-    ...selectCuePropTags(text),
-    ...selectCueExpressionTags(kind, text)
-  ])).slice(0, 18);
-}
-
-function normalizeImageCueKind(kind: string | undefined): string {
-  const normalized = kind?.trim().toLowerCase().replace(/[\s-]+/gu, "_");
-  if (normalized === "context") {
-    return "scene";
-  }
-  return normalized ?? "";
-}
-
-function selectCueFramingTags(kind: string, text: string): string[] {
-  const tags: string[] = [];
-  if (/\b(?:pov|first person)\b|1인칭/u.test(text)) {
-    tags.push("pov");
-  }
-  if (/측면|옆모습|\b(?:from side|side view)\b/iu.test(text)) {
-    tags.push("from side");
-  }
-  if (/뒤에서|뒷모습|\b(?:from behind|back view)\b/iu.test(text)) {
-    tags.push("from behind");
-  }
-  if (/낮은\s*각도|로우앵글|\b(?:low angle|from below)\b/iu.test(text)) {
-    tags.push("low angle");
-  }
-  if (/높은\s*각도|하이앵글|\b(?:high angle|from above)\b/iu.test(text)) {
-    tags.push("high angle");
-  }
-  if (kind === "dialogue_face") {
-    tags.push("close-up", "face focus");
-  } else if (kind === "body_detail") {
-    tags.push("close-up", "body focus");
-  } else if (kind === "scene") {
-    tags.push("wide shot");
-  } else if (kind === "action" || kind === "interaction") {
-    tags.push("cowboy shot");
-  }
-  return tags;
-}
-
-function selectCueEnvironmentTags(text: string): string[] {
-  const rules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /archive|library|bookshelf|기록\s*보관|도서관|책장|서가/iu, tags: ["archive library", "bookshelf"] },
-    { pattern: /classroom|school|교실|학교/iu, tags: ["classroom", "indoors"] },
-    { pattern: /stage|performance|spotlight|무대|공연|스포트라이트/iu, tags: ["stage", "stage lights"] },
-    { pattern: /hallway|corridor|복도/iu, tags: ["hallway", "indoors"] },
-    { pattern: /bedroom|침실/iu, tags: ["bedroom", "indoors"] },
-    { pattern: /kitchen|주방|부엌/iu, tags: ["kitchen", "indoors"] },
-    { pattern: /street|alley|거리|골목/iu, tags: ["street", "outdoors"] },
-    { pattern: /cafe|카페/iu, tags: ["cafe", "indoors"] },
-    { pattern: /hospital|clinic|병원|진료실/iu, tags: ["hospital", "indoors"] },
-    { pattern: /lab|laboratory|실험실|연구실/iu, tags: ["laboratory", "indoors"] },
-    { pattern: /forest|woods|숲/iu, tags: ["forest", "outdoors"] },
-    { pattern: /beach|바닷가|해변/iu, tags: ["beach", "outdoors"] },
-    { pattern: /battlefield|전장/iu, tags: ["battlefield", "outdoors"] },
-    { pattern: /room|방\b/iu, tags: ["room", "indoors"] }
-  ];
-  const matches = rules
-    .map((rule) => {
-      const match = rule.pattern.exec(text);
-      return match ? { tags: rule.tags, index: match.index } : undefined;
-    })
-    .filter((match): match is { tags: string[]; index: number } => Boolean(match))
-    .sort((a, b) => a.index - b.index);
-  return matches[0]?.tags ?? [];
-}
-
-function selectCueWeatherAndLightingTags(text: string): string[] {
-  const rules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /rain|rainy|storm|비가|빗물|폭우/iu, tags: ["rain"] },
-    { pattern: /snow|눈이|눈발/iu, tags: ["snow"] },
-    { pattern: /night|밤|야간/iu, tags: ["night"] },
-    { pattern: /daylight|sunlight|낮|햇빛/iu, tags: ["daylight"] },
-    { pattern: /spotlight|스포트라이트/iu, tags: ["spotlight"] },
-    { pattern: /neon|네온/iu, tags: ["neon lights"] },
-    { pattern: /backlight|역광/iu, tags: ["backlighting"] }
-  ];
-  return uniqueStrings(rules.flatMap((rule) => (rule.pattern.test(text) ? rule.tags : [])));
-}
-
-function selectCuePoseActionTags(text: string): string[] {
-  const rules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /standing up|stands? up|일어나|몸을 일으/iu, tags: ["standing", "chair"] },
-    { pattern: /\bstanding\b|서\s*있|선 채/iu, tags: ["standing"] },
-    { pattern: /\bsitting\b|앉/iu, tags: ["sitting"] },
-    { pattern: /\bkneeling\b|무릎/iu, tags: ["kneeling"] },
-    { pattern: /\blying\b|누워/iu, tags: ["lying"] },
-    { pattern: /\bleaning\b|기대|숙이/iu, tags: ["leaning forward"] },
-    { pattern: /walks?|steps?|걸음|다가/iu, tags: ["walking"] },
-    { pattern: /runs?|달리/iu, tags: ["running"] },
-    { pattern: /danc|춤|안무/iu, tags: ["dancing"] },
-    { pattern: /fight|combat|전투|싸움/iu, tags: ["dynamic action"] },
-    { pattern: /reaches?|손을\s*뻗|팔을\s*뻗|뻗어/iu, tags: ["reaching out"] },
-    { pattern: /raises?\s+(?:her|his|their)?\s*(?:hand|arm)|hand\s+up|arm\s+up|손을\s*들|팔을\s*올/iu, tags: ["arm up", "hand up"] },
-    { pattern: /grabs?|움켜쥐|붙잡|잡아/iu, tags: ["grabbing"] },
-    { pattern: /holds?|쥐|쥔|쥐고|들고|안고/iu, tags: ["holding"] },
-    { pattern: /touch(?:es|ing)?|손을\s*대|만지/iu, tags: ["touching"] }
-  ];
-  return uniqueStrings(rules.flatMap((rule) => (rule.pattern.test(text) ? rule.tags : [])));
-}
-
-function selectCueBodyDetailTags(kind: string, text: string): string[] {
-  const tags: string[] = [];
-  const rules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /손목|wrist/iu, tags: ["hands", "wrist grab"] },
-    { pattern: /손|hand/iu, tags: ["hands"] },
-    { pattern: /팔|arm/iu, tags: ["arm focus"] },
-    { pattern: /어깨|shoulder/iu, tags: ["shoulder"] },
-    { pattern: /가슴|chest|breast/iu, tags: ["chest focus"] },
-    { pattern: /허리|waist|hip/iu, tags: ["hip focus"] },
-    { pattern: /허벅지|thigh/iu, tags: ["thigh focus"] },
-    { pattern: /다리|leg/iu, tags: ["leg focus"] },
-    { pattern: /발|feet|foot/iu, tags: ["feet focus"] },
-    { pattern: /눈|eye|시선/iu, tags: ["eye focus"] },
-    { pattern: /입술|mouth|lip/iu, tags: ["mouth focus"] }
-  ];
-  tags.push(...rules.flatMap((rule) => (rule.pattern.test(text) ? rule.tags : [])));
-  if (kind === "body_detail" && tags.length === 0) {
-    tags.push("hands");
-  }
-  return uniqueStrings(tags);
-}
-
-function selectCuePropTags(text: string): string[] {
-  const rules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /key|열쇠/iu, tags: ["holding key"] },
-    { pattern: /notebook|노트/iu, tags: ["holding notebook"] },
-    { pattern: /\bbook\b|책\b/iu, tags: ["book"] },
-    { pattern: /phone|휴대폰|스마트폰/iu, tags: ["phone"] },
-    { pattern: /microphone|마이크/iu, tags: ["microphone"] },
-    { pattern: /sword|검\b|칼\b/iu, tags: ["sword"] },
-    { pattern: /gun|총\b/iu, tags: ["gun"] }
-  ];
-  return uniqueStrings(rules.flatMap((rule) => (rule.pattern.test(text) ? rule.tags : [])));
-}
-
-function selectCueExpressionTags(kind: string, text: string): string[] {
-  const tags: string[] = [];
-  if (kind === "dialogue_face" || /["“”「」『』]|말하|속삭|외치|신음|voice|says?|said|whisper|moan/iu.test(text)) {
-    tags.push("open mouth");
-  }
-  const rules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /smile|미소|웃/iu, tags: ["smile"] },
-    { pattern: /tense|nervous|긴장|불안/iu, tags: ["tense expression"] },
-    { pattern: /angry|frustrated|화난|분노|짜증/iu, tags: ["angry"] },
-    { pattern: /sad|슬픈|울먹/iu, tags: ["sad"] },
-    { pattern: /cry|tear|눈물|울/iu, tags: ["tears"] },
-    { pattern: /blush|붉어|홍조/iu, tags: ["blush"] },
-    { pattern: /sweat|땀/iu, tags: ["sweat"] },
-    { pattern: /surpris|놀라|당황/iu, tags: ["surprised"] },
-    { pattern: /look(?:ing)? at viewer|바라본|쳐다본|시선/iu, tags: ["looking at viewer"] }
-  ];
-  tags.push(...rules.flatMap((rule) => (rule.pattern.test(text) ? rule.tags : [])));
-  return uniqueStrings(tags);
-}
-
-function filterContradictoryLocalImageTags(tags: string[]): string[] {
-  const hasStage = tags.some((tag) => /\b(?:stage|spotlight|stage lights)\b/iu.test(tag));
-  const hasStreet = tags.some((tag) => /\b(?:street|alley|outdoors)\b/iu.test(tag));
-  const hasIndoor = tags.some((tag) => /\b(?:indoors|classroom|archive library|hallway|room|bedroom|kitchen|cafe|hospital|laboratory|practice room)\b/iu.test(tag));
-
-  return tags.filter((tag) => {
-    if (hasStage && hasStreet && /\b(?:street|alley|outdoors)\b/iu.test(tag)) {
-      return false;
-    }
-    if (hasIndoor && /\b(?:street|alley|outdoors|forest|beach|battlefield)\b/iu.test(tag)) {
-      return false;
-    }
-    return true;
-  });
-}
-
-function createRecentImageCueContext(state: AppState): string {
-  return state.messages
-    .slice(-3)
-    .map((message) => `${message.role}: ${message.content}`)
-    .join("\n")
-    .slice(-1000);
-}
-
-function sanitizeImageCueTags(tags: string[]): string[] {
-  return uniqueStrings(
+function sanitizeImageCueTags(tags: string[], state?: AppState): string[] {
+  const sanitized = uniqueStrings(
     tags
       .map((tag) =>
         tag
           .trim()
-          .replace(/[._-]+/gu, " ")
           .replace(/[.!?。！？:：]+$/gu, "")
           .replace(/\s+/gu, " ")
       )
-      .filter((tag) => tag.length > 0 && !/[\u3131-\uD79D]/u.test(tag))
-      .filter((tag) => !isStaleSceneLabelTag(tag))
+      .filter((tag) => tag.length > 0)
   );
+  return state ? filterRosterNameCueTags(state, sanitized) : sanitized;
 }
 
 function filterRosterNameCueTags(state: AppState, tags: string[]): string[] {
-  const rosterTagNames = new Set(
-    state.characters.flatMap((character) => [
-      normalizeRosterCueTag(character.id),
-      normalizeRosterCueTag(character.name)
-    ])
+  const rosterNames = createRosterCueTagNameSet(state);
+  if (rosterNames.size === 0) {
+    return tags;
+  }
+
+  return tags.filter((tag) => !rosterNames.has(normalizeRosterCueTag(tag)));
+}
+
+function createRosterCueTagNameSet(state: AppState): Set<string> {
+  return new Set(
+    state.characters.flatMap((character) => {
+      const visualProfile = state.visualProfiles.find((profile) => profile.characterId === character.id);
+      return [
+        normalizeRosterCueTag(character.id),
+        normalizeRosterCueTag(character.name),
+        normalizeRosterCueTag(visualProfile?.id ?? ""),
+        normalizeRosterCueTag(visualProfile?.displayName ?? "")
+      ].filter(Boolean);
+    })
   );
-  return tags.filter((tag) => !containsRosterCueNameTag(rosterTagNames, tag));
 }
 
 function normalizeRosterCueTag(value: string): string {
-  return value.toLowerCase().replace(/[._\s]+/gu, "-").trim();
-}
-
-function containsRosterCueNameTag(rosterTagNames: Set<string>, value: string): boolean {
-  const normalized = normalizeRosterCueTag(value);
-  if (rosterTagNames.has(normalized)) {
-    return true;
-  }
-
-  const parts = new Set(normalized.split(/-+/u).filter(Boolean));
-  return [...rosterTagNames].some((name) => {
-    if (!name) {
-      return false;
-    }
-    const nameParts = name.split(/-+/u).filter(Boolean);
-    return nameParts.length > 0 && nameParts.every((part) => parts.has(part));
-  });
-}
-
-function isStaleSceneLabelTag(tag: string): boolean {
-  return /\b(?:commute|chapter|episode|cut|shot)\s+\d+\b/iu.test(tag) || /\bschool uniform commute\b/iu.test(tag);
-}
-
-function createImageCueVisualContext(
-  state: AppState,
-  combinedText: string,
-  scene: string,
-  characterIds: string[],
-  assistantVisualContext?: string,
-  includeLocalVisualTags = true,
-  draft?: Pick<AssistantImageCueDraft, "kind" | "cueType">
-): string {
-  return [
-    scene,
-    ...createLocalImageCueTags(includeLocalVisualTags ? combinedText : "", state, draft),
-    ...createCurrentImageCueStateTags(state, characterIds),
-    ...sanitizeImageCueTags(assistantVisualContext ? assistantVisualContext.split(/[,;\n|]+/u) : [])
-  ]
-    .filter((item): item is string => Boolean(item?.trim()))
-    .join(", ");
-}
-
-function createImageCueCharacterScopeText(currentTurnText: string, draft: AssistantImageCueDraft): string {
-  return [
-    draft.anchorText,
-    draft.scene,
-    draft.visualContext,
-    draft.tags.join(", "),
-    currentTurnText
-  ]
-    .filter((item): item is string => Boolean(item?.trim()))
-    .join("\n");
-}
-
-function createFocusedImageCueText(currentTurnText: string, draft: AssistantImageCueDraft): string {
-  const focused = [
-    draft.anchorText,
-    normalizeImageSceneLabel(draft.scene) ? draft.scene : undefined,
-    draft.visualContext,
-    draft.tags.join(", ")
-  ]
-    .filter((item): item is string => Boolean(item?.trim()))
-    .join("\n");
-
-  return focused || currentTurnText;
-}
-
-function findMentionedCharacterIds(state: AppState, text: string): string[] {
-  const normalizedText = text.toLowerCase();
-  const explicitCharacterIds = state.characters
-      .filter((character) => {
-        const normalizedName = character.name.toLowerCase();
-        return Boolean(normalizedName && normalizedText.includes(normalizedName));
-      })
-      .map((character) => character.id);
-  const personaCharacter = resolvePersonaCharacter(state);
-  const personaIds =
-    personaCharacter && hasFirstPersonSubjectCue(text) && !hasFirstPersonAsObjectOfExternalActor(text)
-      ? [personaCharacter.id]
-      : [];
-
-  return uniqueStrings([...explicitCharacterIds, ...personaIds]);
-}
-
-function findPersonaActionCharacterIds(state: AppState, userText: string, focusedCueText: string, characterScopeText: string): string[] {
-  const personaCharacter = resolvePersonaCharacter(state);
-  if (!personaCharacter) {
-    return [];
-  }
-
-  const userAction = userText.trim();
-  if (!userAction) {
-    return [];
-  }
-
-  const text = `${focusedCueText}\n${userText}`;
-  if (hasFirstPersonAsObjectOfExternalActor(characterScopeText) || hasUnnamedExternalActorFocus(characterScopeText)) {
-    return [];
-  }
-
-  if (!isLikelyPersonaCharacterAction(userAction, text)) {
-    return [];
-  }
-
-  if (
-    mentionsOtherRosterCharacter(state, personaCharacter.id, text) &&
-    !hasFirstPersonSubjectCue(text) &&
-    !isUserStageDirectionText(userAction)
-  ) {
-    return [];
-  }
-
-  return [personaCharacter.id];
-}
-
-function isLikelyPersonaCharacterAction(userText: string, cueText: string): boolean {
-  if (hasFirstPersonSubjectCue(`${userText}\n${cueText}`) || isUserStageDirectionText(userText)) {
-    return true;
-  }
-
-  return !isLikelyImageOnlyRequest(userText);
-}
-
-function isUserStageDirectionText(text: string): boolean {
-  return /(?:\*\(|\)\*)|^\s*[\[(（(].+[\])）)]\s*$/u.test(text);
-}
-
-function isLikelyImageOnlyRequest(text: string): boolean {
-  const normalized = text.trim();
-  if (!normalized) {
-    return true;
-  }
-
-  return /(?:이미지|그림|컷|장면|프롬프트|태그|생성|그려|보여줘|image|picture|prompt|tag|draw|generate|show)/iu.test(normalized) && !hasFirstPersonSubjectCue(normalized) && !isUserStageDirectionText(normalized);
-}
-
-function mentionsOtherRosterCharacter(state: AppState, personaCharacterId: string, text: string): boolean {
-  const normalizedText = text.toLowerCase();
-  return state.characters.some((character) => {
-    if (character.id === personaCharacterId) {
-      return false;
-    }
-
-    const normalizedName = character.name.toLowerCase().trim();
-    return Boolean(normalizedName && normalizedText.includes(normalizedName));
-  });
-}
-
-function filterImageCueCharactersForCurrentTurn(
-  state: AppState,
-  resolvedCharacters: string[],
-  mentionedCharacters: string[],
-  currentTurnText: string,
-  characterScopeText: string = currentTurnText,
-  trustLlmCharacterScope = false
-): string[] {
-  if (resolvedCharacters.length === 0) {
-    return [];
-  }
-
-  if (trustLlmCharacterScope) {
-    if (shouldDropCharactersForExternalCue(state, resolvedCharacters, characterScopeText)) {
-      return [];
-    }
-
-    if (mentionedCharacters.length > 0) {
-      const mentionedSet = new Set(mentionedCharacters);
-      return resolvedCharacters.filter((characterId) => mentionedSet.has(characterId));
-    }
-
-    if (hasFullRosterSelectionWithoutGroupEvidence(state, resolvedCharacters, characterScopeText)) {
-      return [];
-    }
-
-    return uniqueStrings(resolvedCharacters);
-  }
-
-  if (shouldDropCharactersForExternalCue(state, resolvedCharacters, characterScopeText)) {
-    return [];
-  }
-
-  if (mentionedCharacters.length > 0) {
-    const mentionedSet = new Set(mentionedCharacters);
-    return resolvedCharacters.filter((characterId) => mentionedSet.has(characterId));
-  }
-
-  if (hasSoloExternalSubjectCue(characterScopeText)) {
-    return [];
-  }
-
-  if (resolvedCharacters.length > 1) {
-    return [];
-  }
-
-  const resolvedCharacter = state.characters.find((character) => character.id === resolvedCharacters[0]);
-  return resolvedCharacter && hasCharacterEvidenceInCurrentTurn(resolvedCharacter, currentTurnText)
-    ? resolvedCharacters
-    : [];
-}
-
-function shouldDropCharactersForExternalCue(state: AppState, candidateCharacterIds: string[], text: string): boolean {
-  if (
-    !(
-      hasUnnamedExternalActorFocus(text) ||
-      hasClearUnnamedOutsiderImageFocus(text) ||
-      hasUnregisteredSoloSubjectCue(text)
-    )
-  ) {
-    return false;
-  }
-
-  return !hasResolvedCharacterActorEvidence(state, uniqueStrings(candidateCharacterIds), text);
-}
-
-function hasSoloExternalSubjectCue(text: string): boolean {
-  return /혼자|홀로|단독|1인칭|일인칭|나\s*(?:혼자|만)|놈|녀석|사내|남자|남성|남학생|남자애|소년|낯선\s*(?:사람|인물)|모르는\s*(?:사람|인물|남자)|다른\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독|\b(?:solo|alone|single subject|first[-\s]?person|pov|guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)\b/iu.test(text);
-}
-
-function hasUnregisteredSoloSubjectCue(text: string): boolean {
-  const normalized = text.replace(/\s+/gu, " ");
-  const soloSubject = "(?:혼자|홀로|단독|single subject|solo|alone)";
-  const externalSubject = "(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|낯선\\s*(?:사람|인물)|모르는\\s*(?:사람|인물|남자)|다른\\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독|1인칭|일인칭|first[-\\s]?person|pov|1boy|guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)";
-  return new RegExp(`(?:${soloSubject})[^.\\n]{0,70}(?:${externalSubject})|(?:${externalSubject})[^.\\n]{0,70}(?:${soloSubject})`, "iu").test(normalized);
-}
-
-function hasClearUnnamedOutsiderImageFocus(text: string): boolean {
-  return /무명|이름\s*없는|낯선|처음\s*보는|외부인|다른\s*(?:사람|인물)|모르는\s*(?:사람|인물|남자|남성|소년)|선생|교사|직원|스태프|경비|감독|놈|녀석|사내|1인칭|일인칭|first[-\s]?person|pov|unnamed|unknown|stranger|outsider|teacher|staff|guard|director|lone unnamed|solo unnamed/iu.test(text);
-}
-
-function hasCharacterEvidenceInCurrentTurn(character: AppState["characters"][number], text: string): boolean {
-  const normalizedText = text.toLowerCase();
-  return [character.id, character.name]
-    .map((value) => value.toLowerCase().trim())
-    .some((value) => Boolean(value && normalizedText.includes(value)));
-}
-
-function hasUnnamedExternalActorFocus(text: string): boolean {
-  return hasExternalSubjectActingCue(text) || hasFirstPersonAsObjectOfExternalActor(text);
-}
-
-function hasExternalSubjectActingCue(text: string): boolean {
-  const normalized = text.replace(/\s+/gu, " ");
-  const externalSubject = "(?:그\\s*)?(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|낯선\\s*(?:사람|인물)|모르는\\s*(?:사람|인물|남자)|다른\\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독)|(?:guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)";
-  const actorVerb = "(?:웃|미소|말하|말했|말했다|말했다|지목|가리키|노려|쳐다|위협|협박|leering|leer|smil|speak|spoke|said|point|threaten)";
-  return new RegExp(`(?:${externalSubject})(?:은|는|이|가|도)?[^.\\n]{0,90}${actorVerb}`, "iu").test(normalized);
-}
-
-function hasFirstPersonAsObjectOfExternalActor(text: string): boolean {
-  const normalized = text.replace(/\s+/gu, " ");
-  const firstPersonObject = "(?:나를|날|나에게|내게|나한테|내\\s*쪽으로|toward\\s+me|at\\s+me)";
-  const externalSubject = "(?:그\\s*)?(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|낯선\\s*(?:사람|인물)|모르는\\s*(?:사람|인물|남자)|다른\\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독)|(?:guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)";
-  const action = "(?:지목|가리키|노려|쳐다|위협|협박|비웃|웃|미소|말하|말했|말했다|point|stare|look|threaten|speak|spoke|said|smil|leer)";
-  return new RegExp(`${firstPersonObject}[^.\\n]{0,90}(?:${action})?[^.\\n]{0,90}(?:${externalSubject})`, "iu").test(normalized);
-}
-
-function hasFullRosterSelectionWithoutGroupEvidence(state: AppState, resolvedCharacters: string[], text: string): boolean {
-  if (state.characters.length < 3 || resolvedCharacters.length < state.characters.length) {
-    return false;
-  }
-
-  if (/(?:전원|모두|다 같이|함께|세\s*명|네\s*명|전체|all|everyone|together|full cast|group shot|\b3girls\b|\b3boys\b)/iu.test(text)) {
-    return false;
-  }
-
-  const mentionedIds = new Set(findMentionedCharacterIds(state, text));
-  return mentionedIds.size < resolvedCharacters.length;
-}
-
-function hasFirstPersonSubjectCue(text: string): boolean {
-  return /(?:^|[\s"'“”‘’([{])(?:나는|난|내가|나도|나\s*역시|내\s*(?:손|얼굴|몸|시선|입술|머리|눈)|i\s+(?:am|look|smile|speak|say|step|turn|reach)\b)/iu.test(text);
-}
-
-function hasResolvedCharacterActorEvidence(state: AppState, characterIds: string[], text: string): boolean {
-  const actionPattern = /웃|미소|말하|말했|말했다|지목|가리키|노려|쳐다|위협|협박|leering|leer|smil|speak|spoke|said|point|threaten/iu;
-  return characterIds.some((characterId) => {
-    const character = state.characters.find((candidate) => candidate.id === characterId);
-    const name = character?.name.trim();
-    if (!name) {
-      return false;
-    }
-
-    const index = text.toLowerCase().indexOf(name.toLowerCase());
-    if (index < 0) {
-      return false;
-    }
-
-    const segment = text.slice(index, index + 120);
-    return actionPattern.test(segment) && !/(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|\b(?:guy|boy|man|male)\b)/iu.test(segment.replace(name, ""));
-  });
+  return value
+    .toLowerCase()
+    .replace(/'s\b/gu, "")
+    .replace(/[._\s-]+/gu, " ")
+    .replace(/[^\p{L}\p{N} ]+/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 function curateMemoryEvents(

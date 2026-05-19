@@ -31,8 +31,10 @@ async function readSourceChecks() {
   const llmClient = await readFile(path.join(workspaceRoot, "src", "services", "llmClient.ts"), "utf8");
   const simulationEngine = await readFile(path.join(workspaceRoot, "src", "services", "simulationEngine.ts"), "utf8");
   const imageOrchestrator = await readFile(path.join(workspaceRoot, "src", "services", "imageOrchestrator.ts"), "utf8");
+  const novelAiClient = await readFile(path.join(workspaceRoot, "src", "services", "novelAiClient.ts"), "utf8");
   const memoryCompiler = await readFile(path.join(workspaceRoot, "src", "services", "memoryCompiler.ts"), "utf8");
   const neuralMapClient = await readFile(path.join(workspaceRoot, "src", "services", "neuralMapClient.ts"), "utf8");
+  const sceneCast = await readFile(path.join(workspaceRoot, "src", "services", "sceneCast.ts"), "utf8");
   const dynamicChatServer = await readFile(path.join(workspaceRoot, "server", "dynamicchat-server.mjs"), "utf8");
   const appSource = await readFile(path.join(workspaceRoot, "src", "App.tsx"), "utf8");
   const seedSource = await readFile(path.join(workspaceRoot, "src", "data", "seed.ts"), "utf8");
@@ -45,8 +47,23 @@ async function readSourceChecks() {
     ),
     assertCheck(
       "source.llm",
+      !llmClient.includes("MAIN_GEMINI_RESPONSE_SCHEMA") &&
+        !llmClient.includes("geminiResponseSchema: MAIN_GEMINI_RESPONSE_SCHEMA") &&
+        llmClient.includes("Return JSON only. The JSON schema is:"),
+      "Main Gemini calls avoid responseSchema and rely on prompt-level JSON sidecar instructions."
+    ),
+    assertCheck(
+      "source.llm",
       llmClient.includes("createDisplayFallbackText") && !llmClient.includes("stripLikelyJsonFence(rawContent).trim() || input.fallback"),
       "LLM parse fallback cannot expose raw sidecar JSON."
+    ),
+    assertCheck(
+      "source.llm",
+      llmClient.includes("looksLikeInternalPromptLeak") &&
+        llmClient.includes("Use this before older retrieved memories") &&
+        llmClient.includes("SYSTEM INSTRUCTION:") &&
+        llmClient.includes("Memory/context evidence:"),
+      "LLM parse fallback blocks echoed internal prompt/context text."
     ),
     assertCheck(
       "source.llm",
@@ -69,7 +86,9 @@ async function readSourceChecks() {
       "source.llm",
       llmClient.includes("requestProviderTextWithRecovery") &&
         llmClient.includes("createRecoveryRuntimeInstruction") &&
-        llmClient.includes("BLOCK_NONE"),
+        llmClient.includes("BLOCK_NONE") &&
+        llmClient.includes("streamed?.trim()") &&
+        llmClient.includes("LLM recovery response did not include content"),
       "LLM provider safety/empty responses have a structured recovery path."
     ),
     assertCheck(
@@ -114,45 +133,104 @@ async function readSourceChecks() {
       "Local Context Packs carry a first-class immediate continuity evidence item."
     ),
     assertCheck(
+      "source.fallback",
+      simulationEngine.includes("createFallbackMemoryHint") &&
+        simulationEngine.includes("looksLikeInternalFallbackEvidence") &&
+        simulationEngine.includes("최근 대화 연속성 단서는 Context Pack에 보존되어 있다."),
+      "Local LLM fallback summarizes memory evidence without exposing internal continuity anchors."
+    ),
+    assertCheck(
       "source.image",
       imageOrchestrator.includes("parseNovelAiWeightedTag") && !imageOrchestrator.includes("shouldBlockImagePromptForState"),
-      "Image prompt planner preserves NAI weights without app-level content blocking."
+      "Image prompt composer preserves NAI weights without app-level content blocking."
     ),
     assertCheck(
       "source.image",
       simulationEngine.includes("sidecar.imageCues") &&
-        simulationEngine.includes("planImageCueDraftsWithLlm") &&
-        simulationEngine.includes("dedicated_image_planner") &&
-        llmClient.includes("generateImageCuePlans"),
-      "Image cue planning uses a dedicated lightweight planner after the simulation LLM response."
+        !simulationEngine.includes("planImageCueDraftsWithLlm") &&
+        !simulationEngine.includes("dedicated_image_planner") &&
+        !/export\s+async\s+function\s+generateImageCuePlans/u.test(llmClient),
+      "Image cue planning uses the main simulation LLM sidecar directly without a dedicated planner."
     ),
     assertCheck(
       "source.image",
       llmClient.includes("NovelAI/Danbooru tag conversion rules") &&
-        llmClient.includes("resolveImageCuePlannerModel") &&
-        llmClient.includes("Registered visual profiles and outfit mappings") &&
+        llmClient.includes("Image cue ownership: this main response owns final image_cues") &&
+        llmClient.includes("Image cue authoring reference") &&
         imageOrchestrator.includes("getNovelAiPositiveTagRank"),
-      "Image tag generation has a dedicated NAI tag contract, outfit mapping context, lightweight planner model selection, and final tag ordering."
+      "Main simulation LLM has the NAI tag contract, outfit/profile context, and final tag ordering."
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("Image planning separation") &&
-        llmClient.includes("For image_cues in this main response, use [] by default") &&
-        llmClient.includes("dedicated image planner will combine these states"),
-      "Main simulation LLM is instructed to focus on simulation and leave final image cues/tags to the dedicated planner."
+      llmClient.includes("No later tag planner will fix, expand, or infer tags") &&
+        llmClient.includes("emit [] only for quiet text-only turns") &&
+        llmClient.includes("DynamicChat will not run a later tag planner") &&
+        !llmClient.includes("requestMainLlmImageCueRepairText") &&
+        !llmClient.includes("image cue self-repair"),
+      "Main simulation LLM is instructed to create final image cues and tags itself without a later repair request."
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("Image prompt user rules are binding") && llmClient.includes("Candidate cue hints") && llmClient.includes("anchor_text"),
-      "Dedicated image planner reads user image rules and can emit multiple anchored cues."
+      llmClient.includes("createCurrentTurnImagePolicyBlock") &&
+        llmClient.includes("basis: image prompt user rules") &&
+        llmClient.includes("basis: image generation cadence") &&
+        llmClient.includes("Do not wait for a separate image request from the user"),
+      "Main LLM image cue decisions are driven by generation cadence and image prompt user rules."
+    ),
+    assertCheck(
+      "source.image",
+      llmClient.includes("Image prompt user rules are binding") && llmClient.includes("anchor_text") && llmClient.includes("placement"),
+      "Main image cue output reads user image rules and can emit anchored cues."
+    ),
+    assertCheck(
+      "source.image",
+      llmClient.includes("Image tag keyword presets (no roster identity tags)") &&
+        llmClient.includes("createImageSceneTagPresetBlock") &&
+        llmClient.includes("collectImageSceneTagPresetNodes") &&
+        llmClient.includes("IMAGE_SCENE_PRESET_PROMPT_MAX_DEPTH") &&
+        llmClient.includes("creator_note") &&
+        llmClient.includes("inherited_creator_notes") &&
+        appSource.includes("scene-tag-preset-panel") &&
+        appSource.includes("scene-tag-preset-collapsed-summary") &&
+        appSource.includes("scene-tag-preset-drag-handle") &&
+        appSource.includes("moveImageScenePresetNodes") &&
+        appSource.includes("SceneTagPresetNodeEditor") &&
+        seedSource.includes("ImageSceneTagPreset"),
+      "Creator scene tag keyword presets are hierarchical, collapsible, draggable, editable, and available with notes to the main LLM image cue prompt."
     ),
     assertCheck(
       "source.image",
       llmClient.includes("background tags alone are a failure") &&
         llmClient.includes("emphasize a body part") &&
-        llmClient.includes("characters array is what activates that character's prompt") &&
+        llmClient.includes("characters is metadata for traces/reuse only") &&
         llmClient.includes("acting exercise, intimidation, abduction, fear"),
-      "Dedicated image planner has strict NAI cue rules for action/body focus, character scoping, and abstract tag rejection."
+      "Main image cue prompt has strict NAI cue rules for action/body focus, character scoping, and abstract tag rejection."
+    ),
+    assertCheck(
+      "source.image",
+      imageOrchestrator.includes("characterPrompts: promptPlan.characterPrompts") &&
+        imageOrchestrator.includes("promptLayers: promptPlan.layers") &&
+        novelAiClient.includes("resolveNovelAiCharacterPrompts") &&
+        !imageOrchestrator.includes("visualProfile.negativePrompt"),
+      "Local image composition separates base prompt tags from explicit per-character NovelAI V4 captions."
+    ),
+    assertCheck(
+      "source.image",
+      llmClient.includes("short hair plus long hair") &&
+        llmClient.includes("2girls/3girls") &&
+        llmClient.includes("emotion/voice stack") &&
+        llmClient.includes("Character metadata rule") &&
+        llmClient.includes("Character identity lock") &&
+        llmClient.includes("required_identity_tags"),
+      "Main image cue prompt guards subject counts, contradictory appearance tags, emotion stacks, and character metadata."
+    ),
+    assertCheck(
+      "source.image",
+      sceneCast.includes("collectRecentImageCharacterIds") &&
+        sceneCast.includes("shouldUseImageCastContinuity") &&
+        llmClient.includes("preserve the previous visible image cast") &&
+        llmClient.includes("latest image/assistant beat"),
+      "Image cue character scoping preserves recent visible cast for pronoun-only continuations."
     ),
     assertCheck(
       "source.image",

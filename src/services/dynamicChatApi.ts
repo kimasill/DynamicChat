@@ -30,6 +30,7 @@ export const dynamicChatApiEndpoints = {
   createChatTurn: (simulationId: string) => `/simulations/${encodeURIComponent(simulationId)}/chat/turns`,
   resetSession: (simulationId: string) => `/simulations/${encodeURIComponent(simulationId)}/sessions/reset`,
   createImageJob: (simulationId: string) => `/simulations/${encodeURIComponent(simulationId)}/image-jobs`,
+  persistAssets: (simulationId: string) => `/simulations/${encodeURIComponent(simulationId)}/assets`,
   listAssets: (simulationId: string, assetIds: string[] = []) => {
     const uniqueAssetIds = Array.from(new Set(assetIds.filter(Boolean)));
     const query = uniqueAssetIds.length > 0 ? `?ids=${uniqueAssetIds.map(encodeURIComponent).join(",")}` : "";
@@ -55,28 +56,43 @@ export interface DynamicChatApiClient {
   createChatTurn(simulationId: string, userText: string, manualImage: boolean): Promise<TurnResult>;
   resetSession(simulationId: string): Promise<AppState>;
   createImageJob(simulationId: string, turnId: string): Promise<ImageGenerationJob>;
+  persistImageAssets(simulationId: string, assets: ImageAsset[]): Promise<ImageAsset[]>;
   listAssets(simulationId: string, assetIds?: string[]): Promise<ImageAsset[]>;
   cancelImageJob(jobId: string): Promise<ImageGenerationJob>;
   getImageJob(jobId: string): Promise<ImageGenerationJob | undefined>;
+}
+
+export interface SaveStateOptions {
+  includeImagePayloads?: boolean;
+  skipServer?: boolean;
 }
 
 export function loadState(): AppState | undefined {
   return loadLocalState();
 }
 
-export function saveState(state: AppState): void {
+export function saveState(state: AppState, options: SaveStateOptions = {}): void {
   const redactedState = redactBrowserCachedSecrets(state);
+  const localCacheState = createBrowserCacheState(redactedState, true);
   try {
-    saveLocalState(createBrowserCacheState(redactedState));
+    saveLocalState(localCacheState);
   } catch (error) {
     console.warn("DynamicChat local cache skipped large image payloads.", error);
     try {
-      saveLocalState(createBrowserCacheState(redactedState, true));
+      saveLocalState(createBrowserCacheState(localCacheState, true));
     } catch {
-      clearLocalState();
+      console.warn("DynamicChat local cache write failed; keeping the previous saved snapshot.");
     }
   }
-  void createDynamicChatApiClient().saveSimulationState(redactedState).catch(() => undefined);
+
+  if (options.skipServer) {
+    return;
+  }
+
+  const serverState = options.includeImagePayloads ? redactedState : localCacheState;
+  window.setTimeout(() => {
+    void createDynamicChatApiClient().saveSimulationState(serverState).catch(() => undefined);
+  }, 0);
 }
 
 export function clearState(): void {
@@ -218,6 +234,18 @@ export function createDynamicChatApiClient(baseUrl = readConfiguredApiBaseUrl() 
       return request<ImageGenerationJob>(baseUrl, dynamicChatApiEndpoints.createImageJob(simulationId), {
         method: "POST",
         body: { turnId },
+        headers: createSimulationScopeHeaders(simulationId)
+      });
+    },
+
+    async persistImageAssets(simulationId, assets) {
+      if (!baseUrl || assets.length === 0) {
+        return assets;
+      }
+
+      return request<ImageAsset[]>(baseUrl, dynamicChatApiEndpoints.persistAssets(simulationId), {
+        method: "POST",
+        body: { assets },
         headers: createSimulationScopeHeaders(simulationId)
       });
     },

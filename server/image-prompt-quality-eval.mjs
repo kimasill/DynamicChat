@@ -16,12 +16,13 @@ const checks = [];
 try {
   const { seedState } = await vite.ssrLoadModule("/src/data/seed.ts");
   const { planImageJobForCompletedTurn, runSimulationTurn } = await vite.ssrLoadModule("/src/services/simulationEngine.ts");
-  const { findReusableImageAsset, getReusableTagsFromJob, planImageJob } = await vite.ssrLoadModule("/src/services/imageOrchestrator.ts");
+  const { findReusableImageAsset, getReusableTagsFromJob, pickStoredAsset, planImageJob } = await vite.ssrLoadModule("/src/services/imageOrchestrator.ts");
   const { generateNovelAiImages } = await vite.ssrLoadModule("/src/services/novelAiClient.ts");
+  const { compileSimulationMemoryDelta, memoryDeltaToEvents } = await vite.ssrLoadModule("/src/services/memoryCompiler.ts");
 
   await evaluateRecentContextTagDetection(seedState, runSimulationTurn);
   evaluateNovelAiWeightingAndUserRules(seedState, planImageJob);
-  await evaluateReusableImageMatching(seedState, planImageJob, findReusableImageAsset, getReusableTagsFromJob, planImageJobForCompletedTurn);
+  await evaluateReusableImageMatching(seedState, planImageJob, findReusableImageAsset, getReusableTagsFromJob, pickStoredAsset, planImageJobForCompletedTurn);
   await evaluateImageUserRuleCuePlanning(seedState, planImageJobForCompletedTurn);
   await evaluateImageGenerationCadence(seedState, planImageJobForCompletedTurn);
   await evaluateAnchoredRulePromptDiversity(seedState, planImageJobForCompletedTurn);
@@ -30,10 +31,12 @@ try {
   await evaluateNoisyCueTagFiltering(seedState, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateImageCueCharacterScoping(seedState, planImageJob, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateLlmCharacterScopedOutfits(seedState, planImageJob, planImageJobForCompletedTurn, generateNovelAiImages);
+  evaluateWearingStateDetailPreservation(seedState, compileSimulationMemoryDelta, memoryDeltaToEvents);
   await evaluateStructuredCueDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn);
   await evaluatePersonaCharacterImageCueScoping(seedState, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateLlmImageStateTagCarryover(seedState, planImageJob, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateLlmNaiTagPreservation(seedState, planImageJob, generateNovelAiImages);
+  evaluateNameAndBodyInventoryCleanup(seedState, planImageJob);
   await evaluateActorTargetCharacterDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn);
   await evaluateFallbackImageCueSuppression(seedState, runSimulationTurn);
   await evaluateNovelAiV4Payload(seedState, planImageJob, generateNovelAiImages);
@@ -70,14 +73,14 @@ async function evaluateRecentContextTagDetection(seedState, runSimulationTurn) {
   const cueText = [result.imageCue.scene, result.imageCue.tags.join(", "), result.imageCue.visualContext].join(", ");
 
   assertCheck("context.library", result.imageCue.scene === "current simulation scene", "Recent transcript does not locally infer an archive-library scene.");
-  assertCheck("context.library", /library|bookshelf/iu.test(cueText), "Deictic first image requests can use the immediate scene context.");
+  assertCheck("context.library", !/library|bookshelf/iu.test(cueText), "Deictic image requests do not locally convert transcript context into tags.");
   assertCheck("context.library", !/\b(?:rain|food|table|dining table)\b/iu.test(prompt), "Archive context does not auto-inject old rain/food/table tags.");
-  assertCheck("context.library", /silver hair/iu.test(characterLayer), "Visible character profile remains in the character prompt layer.");
+  assertCheck("context.library", !/silver hair/iu.test(characterLayer), "Character profiles are not added without an LLM-provided character id.");
   assertCheck("context.library", !/silver hair/iu.test(prompt), "NovelAI V4 base prompt keeps character prompt tags out of the generated scene prompt.");
   assertCheck("context.library", !/\b1(?:girl|boy|other)\b/iu.test(prompt), "Subject count tags are not inferred by app-side character mapping.");
 }
 
-async function evaluateReusableImageMatching(seedState, planImageJob, findReusableImageAsset, getReusableTagsFromJob, planImageJobForCompletedTurn) {
+async function evaluateReusableImageMatching(seedState, planImageJob, findReusableImageAsset, getReusableTagsFromJob, pickStoredAsset, planImageJobForCompletedTurn) {
   const state = createPlayableState(seedState, {
     imageProfile: {
       ...seedState.imageProfile,
@@ -87,7 +90,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
   });
   const cue = createCue(state, {
     scene: "archive library",
-    tags: ["bookshelf", "silver hair", "brass key"],
+    tags: ["archive library", "bookshelf", "silver hair", "brass key"],
     visualContext: "archive library, tall bookshelf, silver hair, brass key"
   });
   const imageAssets = [
@@ -173,18 +176,23 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
   const actionReusableAsset = {
     ...imageAssets[0],
     id: "asset_reuse_action_exact",
-    tags: ["archive library", "bookshelf", "standing", "holding key", "worried expression"],
-    reuseTags: ["archive library", "bookshelf", "standing", "holding key", "worried expression"],
+    tags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
+    reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
     providerMetadata: {
       cue: {
         characters: actionCue.characters,
         scene: "archive library",
-        tags: ["standing", "holding key", "worried expression"],
-        visualContext: "archive library, bookshelf, standing, holding key, worried expression"
+        tags: ["1girl", "silver hair", "standing", "holding key", "worried expression"],
+        visualContext: "1girl, archive library, bookshelf, silver hair, standing, holding key, worried expression"
       }
     }
   };
-  const actionJob = planImageJob({ ...reuseState, imageAssets: [actionReusableAsset] }, "turn_reuse_action_exact", actionCue, [], false);
+  const countedActionCue = {
+    ...actionCue,
+    tags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
+    visualContext: "1girl, archive library, bookshelf, silver hair, standing, holding key, worried expression"
+  };
+  const actionJob = planImageJob({ ...reuseState, imageAssets: [actionReusableAsset] }, "turn_reuse_action_exact", countedActionCue, [], false);
   const exactActionMatch = findReusableImageAsset({ ...reuseState, imageAssets: [actionReusableAsset] }, actionJob);
   const mismatchedPoseMatch = findReusableImageAsset(
     {
@@ -193,14 +201,14 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
         {
           ...actionReusableAsset,
           id: "asset_reuse_pose_mismatch",
-          tags: ["archive library", "bookshelf", "sitting", "holding key", "worried expression"],
-          reuseTags: ["archive library", "bookshelf", "sitting", "holding key", "worried expression"],
+          tags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
+          reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
           providerMetadata: {
             cue: {
-              characters: actionCue.characters,
+              characters: countedActionCue.characters,
               scene: "archive library",
-              tags: ["sitting", "holding key", "worried expression"],
-              visualContext: "archive library, bookshelf, sitting, holding key, worried expression"
+              tags: ["1girl", "silver hair", "sitting", "holding key", "worried expression"],
+              visualContext: "1girl, archive library, bookshelf, silver hair, sitting, holding key, worried expression"
             }
           }
         }
@@ -215,14 +223,81 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
         {
           ...actionReusableAsset,
           id: "asset_reuse_status_mismatch",
-          tags: ["archive library", "bookshelf", "standing", "holding key", "smile"],
-          reuseTags: ["archive library", "bookshelf", "standing", "holding key", "smile"],
+          tags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "smile"],
+          reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "smile"],
           providerMetadata: {
             cue: {
-              characters: actionCue.characters,
+              characters: countedActionCue.characters,
               scene: "archive library",
-              tags: ["standing", "holding key", "smile"],
-              visualContext: "archive library, bookshelf, standing, holding key, smile"
+              tags: ["1girl", "silver hair", "standing", "holding key", "smile"],
+              visualContext: "1girl, archive library, bookshelf, silver hair, standing, holding key, smile"
+            }
+          }
+        }
+      ]
+    },
+    actionJob
+  );
+  const mismatchedCountMatch = findReusableImageAsset(
+    {
+      ...reuseState,
+      imageAssets: [
+        {
+          ...actionReusableAsset,
+          id: "asset_reuse_count_mismatch",
+          tags: ["2girls", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
+          reuseTags: ["2girls", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
+          characterIds: countedActionCue.characters,
+          providerMetadata: {
+            cue: {
+              characters: countedActionCue.characters,
+              scene: "archive library",
+              tags: ["2girls", "silver hair", "standing", "holding key", "worried expression"],
+              visualContext: "2girls, archive library, bookshelf, silver hair, standing, holding key, worried expression"
+            }
+          }
+        }
+      ]
+    },
+    actionJob
+  );
+  const mismatchedCharacterTagMatch = findReusableImageAsset(
+    {
+      ...reuseState,
+      imageAssets: [
+        {
+          ...actionReusableAsset,
+          id: "asset_reuse_character_tag_mismatch",
+          tags: ["1girl", "archive library", "bookshelf", "black hair", "standing", "holding key", "worried expression"],
+          reuseTags: ["1girl", "archive library", "bookshelf", "black hair", "standing", "holding key", "worried expression"],
+          providerMetadata: {
+            cue: {
+              characters: countedActionCue.characters,
+              scene: "archive library",
+              tags: ["1girl", "black hair", "standing", "holding key", "worried expression"],
+              visualContext: "1girl, archive library, bookshelf, black hair, standing, holding key, worried expression"
+            }
+          }
+        }
+      ]
+    },
+    actionJob
+  );
+  const extraActionMatch = findReusableImageAsset(
+    {
+      ...reuseState,
+      imageAssets: [
+        {
+          ...actionReusableAsset,
+          id: "asset_reuse_extra_action",
+          tags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "holding phone", "worried expression"],
+          reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "holding phone", "worried expression"],
+          providerMetadata: {
+            cue: {
+              characters: countedActionCue.characters,
+              scene: "archive library",
+              tags: ["1girl", "silver hair", "standing", "holding key", "holding phone", "worried expression"],
+              visualContext: "1girl, archive library, bookshelf, silver hair, standing, holding key, holding phone, worried expression"
             }
           }
         }
@@ -250,6 +325,28 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
     },
     actionJob
   );
+  const exactStoredAsset = {
+    ...actionReusableAsset,
+    id: "asset_stored_action_exact",
+    source: "stored",
+    createdAt: new Date(Date.now() + 3).toISOString()
+  };
+  const staleStoredAsset = {
+    ...exactStoredAsset,
+    id: "asset_stored_stale_action",
+    tags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
+    reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
+    providerMetadata: {
+      cue: {
+        characters: countedActionCue.characters,
+        scene: "archive library",
+        tags: ["1girl", "silver hair", "sitting", "holding key", "worried expression"],
+        visualContext: "1girl, archive library, bookshelf, silver hair, sitting, holding key, worried expression"
+      }
+    }
+  };
+  const storedActionMatch = pickStoredAsset({ ...reuseState, imageAssets: [staleStoredAsset, exactStoredAsset] }, countedActionCue);
+  const staleStoredOnlyMatch = pickStoredAsset({ ...reuseState, imageAssets: [staleStoredAsset] }, countedActionCue);
   const reusableTags = getReusableTagsFromJob(job);
   const userMessage = createUserMessage(state, "기록 보관소 장면을 다시 보여줘");
   const assistantMessage = createAssistantMessage(state, "The archive library returns, with silver hair and brass key by the bookshelf.");
@@ -297,7 +394,12 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
   assertCheck("image.reuse", exactActionMatch?.asset.id === "asset_reuse_action_exact", "Exact character, pose, and status tags can still reuse a generated image.");
   assertCheck("image.reuse", !mismatchedPoseMatch, "Generated images are not reused when required pose/action tags differ.");
   assertCheck("image.reuse", !mismatchedStatusMatch, "Generated images are not reused when required expression/status tags differ.");
+  assertCheck("image.reuse", !mismatchedCountMatch, "Generated images are not reused when the visible person count differs.");
+  assertCheck("image.reuse", !mismatchedCharacterTagMatch, "Generated images are not reused when character identity tags differ.");
+  assertCheck("image.reuse", !extraActionMatch, "Generated images are not reused when the stored action has extra unmatched action tags.");
   assertCheck("image.reuse", !mismatchedMetadataCharacterMatch, "Generated image reuse rejects provider metadata character-scope mismatches.");
+  assertCheck("image.reuse", storedActionMatch?.id === "asset_stored_action_exact", "Stored image fallback only selects assets with matching character, count, and action tags.");
+  assertCheck("image.reuse", !staleStoredOnlyMatch, "Stored image fallback rejects stale assets whose action tags do not match.");
   assertCheck("image.reuse", autoReusePlan.imageJobs.length === 0 && autoReusePlan.reusedAssetIds.includes("asset_reuse_library"), "Image planning reuses a high-overlap generated asset instead of queuing NovelAI.");
 }
 
@@ -367,8 +469,8 @@ async function evaluateImageUserRuleCuePlanning(seedState, planImageJobForComple
   const cueKinds = plan.imageJobs.map((job) => job.providerPayload.cueKind);
   const plannerSources = plan.imageJobs.map((job) => job.providerPayload.imageCuePlanner?.source);
 
-  assertCheck("image.user_rules", plan.imageJobs.length >= 2, "User image rules add required scene/dialogue cues when the LLM omits image_cues.");
-  assertCheck("image.user_rules", cueKinds.includes("scene") && cueKinds.includes("dialogue_face"), "Rule-backed cue planning preserves scene and dialogue-face cue kinds.");
+  assertCheck("image.user_rules", plan.imageJobs.length === 0, "User image rules do not synthesize local NAI tags when the LLM omits image_cues.");
+  assertCheck("image.user_rules", cueKinds.length === 0, "Rule-backed local cue hints stay non-rendered without LLM-authored tags.");
   assertCheck("image.user_rules", plan.reusedAssetIds.length === 0, "Fresh-image user rules prevent generated asset reuse.");
   assertCheck("image.user_rules", plan.imageJobs.every((job) => job.providerPayload.forceFreshImage === true), "Rule-backed jobs are marked as fresh image jobs.");
   assertCheck("image.user_rules", plannerSources.every((source) => source === "user_image_rules"), "Rule-backed jobs record user-image-rule planner source.");
@@ -423,10 +525,241 @@ async function evaluateImageGenerationCadence(seedState, planImageJobForComplete
     }
   );
 
-  assertCheck("image.cadence", paragraphPlan.imageJobs.length >= 3, "Paragraph cadence creates image jobs for multiple assistant paragraphs when the LLM omits image_cues.");
+  assertCheck("image.cadence", paragraphPlan.imageJobs.length === 0, "Paragraph cadence does not synthesize local NAI tags when the LLM omits image_cues.");
   assertCheck("image.cadence", paragraphPlan.imageJobs.every((job) => job.providerPayload.generationCadence === "paragraph"), "Image jobs record the active generation cadence.");
   assertCheck("image.cadence", paragraphPlan.imageJobs.every((job) => job.providerPayload.forceFreshImage === true), "Paragraph cadence jobs bypass cooldown/reuse as fresh cuts.");
-  assertCheck("image.cadence", paragraphPlan.imageJobs.some((job) => job.providerPayload.imageCuePlanner?.source === "image_generation_cadence"), "Paragraph cadence records cadence planner source.");
+  assertCheck("image.cadence", paragraphPlan.imageJobs.every((job) => job.providerPayload.imageCuePlanner?.source === "image_generation_cadence"), "Paragraph cadence records cadence planner source only on LLM-tagged jobs.");
+
+  const paragraphLlmCues = [
+    {
+      kind: "scene",
+      anchorText: "archive shelves while rain streaks",
+      tags: ["1girl", "wide shot", "archive library", "standing", "rain", "wet gloves", "school uniform", "black hair"]
+    },
+    {
+      kind: "action",
+      anchorText: "raises the brass key",
+      tags: ["1girl", "upper body", "archive library", "holding key", "blue glow", "wet gloves", "school uniform", "serious expression"]
+    },
+    {
+      kind: "dialogue_face",
+      anchorText: "지금이에요",
+      tags: ["1girl", "close-up", "archive library", "open mouth", "looking at viewer", "blue glow", "school uniform", "tense expression"]
+    }
+  ].map((cue, index) => ({
+    shouldGenerate: true,
+    reason: `paragraph cue ${index + 1}`,
+    characters: [paragraphState.characters[0].id],
+    scene: "archive library",
+    visualContext: cue.tags.join(", "),
+    placement: index === 0 ? "before" : "inline",
+    priority: 0.92 - index * 0.03,
+    label: `paragraph ${index + 1}`,
+    ...cue
+  }));
+  const paragraphLlmPlan = await planImageJobForCompletedTurn(
+    {
+      ...paragraphState,
+      messages: [...paragraphState.messages, paragraphUserMessage, paragraphAssistantMessage]
+    },
+    {
+      userMessage: paragraphUserMessage,
+      assistantMessage: paragraphAssistantMessage,
+      contextPack: createContextPack(paragraphState),
+      promptModuleUsages: [],
+      sidecar: {
+        assistantText: paragraphAssistantMessage.content,
+        memoryEvents: [],
+        imageCue: paragraphLlmCues[0],
+        imageCues: paragraphLlmCues
+      },
+      sidecarTrace: createParsedLlmSidecarTrace(paragraphState, paragraphAssistantMessage.id),
+      manualImage: false
+    }
+  );
+
+  assertCheck("image.cadence", paragraphLlmPlan.imageJobs.length === 3, "Paragraph cadence turns LLM-authored paragraph cues into separate image jobs.");
+  assertCheck("image.cadence", paragraphLlmPlan.imageJobs.every((job) => job.providerPayload.imageCuePlanner?.source === "main_llm_sidecar"), "Paragraph cadence keeps LLM-authored cue source on generated jobs.");
+  assertCheck("image.cadence", paragraphLlmPlan.imageJobs.every((job) => job.providerPayload.forceFreshImage === true), "Paragraph LLM-authored jobs bypass reuse/cooldown as fresh paragraph cuts.");
+  assertCheck("image.cadence", paragraphLlmPlan.imageJobs.map((job) => job.providerPayload.cueIndex).join(",") === "0,1,2", "Paragraph LLM-authored jobs preserve cue order and cue indexes.");
+  assertCheck(
+    "image.cadence",
+    paragraphLlmPlan.imageJobs.every((job) => {
+      const characterLayer = job.providerPayload.promptLayers?.characters?.join(", ") ?? "";
+      return /archive library/iu.test(job.prompt) && !/school uniform/iu.test(job.prompt) && /school uniform/iu.test(characterLayer);
+    }),
+    "Paragraph LLM-authored jobs split base scene tags and character outfit tags into the correct prompt layers."
+  );
+
+  const richState = createPlayableState(seedState, {
+    imageProfile: {
+      ...seedState.imageProfile,
+      triggerMode: "realtime_auto",
+      generationCadence: "rich",
+      cooldownTurns: 99,
+      userRules: "캐릭터의 외형 일관성을 우선한다."
+    }
+  });
+  const richUserMessage = createUserMessage(richState, "주요 행동마다 장면을 이어가");
+  const richAssistantMessage = createAssistantMessage(
+    richState,
+    [
+      "Aria pushes through the archive door into a rain-blue reading room.",
+      "She crouches beside the fallen brass key and reaches for it with gloved fingers.",
+      "The lock flashes; she turns toward the viewer and whispers, \"지금이에요.\"",
+      "Then she steps under the skylight as blue sparks scatter over her uniform."
+    ].join("\n")
+  );
+  const richCues = [
+    {
+      kind: "scene",
+      anchorText: "rain-blue reading room",
+      tags: ["1girl", "wide shot", "reading room", "rain", "standing", "school uniform", "black hair", "blue lighting"]
+    },
+    {
+      kind: "body_detail",
+      anchorText: "gloved fingers",
+      tags: ["1girl", "close-up", "hand focus", "gloves", "reaching out", "brass key", "school uniform", "blue lighting"]
+    },
+    {
+      kind: "dialogue_face",
+      anchorText: "지금이에요",
+      tags: ["1girl", "close-up", "looking at viewer", "open mouth", "parted lips", "school uniform", "blue lighting", "serious expression"]
+    },
+    {
+      kind: "action",
+      anchorText: "blue sparks scatter",
+      tags: ["1girl", "upper body", "skylight", "standing", "blue sparks", "school uniform", "black hair", "dramatic lighting"]
+    }
+  ].map((cue, index) => ({
+    shouldGenerate: true,
+    reason: `rich cue ${index + 1}`,
+    characters: [richState.characters[0].id],
+    scene: index === 0 ? "reading room" : "archive library",
+    visualContext: cue.tags.join(", "),
+    placement: index === 0 ? "before" : "inline",
+    priority: 0.94 - index * 0.04,
+    label: `rich ${index + 1}`,
+    ...cue
+  }));
+  const richPlan = await planImageJobForCompletedTurn(
+    {
+      ...richState,
+      messages: [...richState.messages, richUserMessage, richAssistantMessage]
+    },
+    {
+      userMessage: richUserMessage,
+      assistantMessage: richAssistantMessage,
+      contextPack: createContextPack(richState),
+      promptModuleUsages: [],
+      sidecar: {
+        assistantText: richAssistantMessage.content,
+        memoryEvents: [],
+        imageCue: richCues[0],
+        imageCues: richCues
+      },
+      sidecarTrace: createParsedLlmSidecarTrace(richState, richAssistantMessage.id),
+      manualImage: false
+    }
+  );
+
+  assertCheck("image.cadence", richPlan.imageJobs.length === 4, "Rich cadence keeps separate LLM-authored jobs for major visual beats.");
+  assertCheck("image.cadence", richPlan.imageJobs.every((job) => job.providerPayload.generationCadence === "rich"), "Rich cadence jobs record the active generation density.");
+  assertCheck("image.cadence", richPlan.imageJobs.every((job) => job.providerPayload.forceFreshImage === true), "Rich cadence jobs bypass reuse/cooldown as fresh high-density cuts.");
+  assertCheck("image.cadence", richPlan.imageJobs.map((job) => job.providerPayload.cueKind).join(",") === "scene,body_detail,dialogue_face,action", "Rich cadence preserves distinct cue kinds for scene/body/dialogue/action beats.");
+  assertCheck(
+    "image.cadence",
+    richPlan.imageJobs.every((job) => Array.isArray(job.providerPayload.positiveTags) && job.providerPayload.positiveTags.length >= 8),
+    "Rich cadence jobs carry complete LLM-authored NAI tag sets."
+  );
+
+  const progressionState = createPlayableState(seedState, {
+    imageProfile: {
+      ...seedState.imageProfile,
+      triggerMode: "realtime_auto",
+      generationCadence: "image_progression",
+      cooldownTurns: 99,
+      userRules: "캐릭터의 외형 일관성을 우선한다."
+    }
+  });
+  const progressionUserMessage = createUserMessage(progressionState, "이미지 진행 버전으로 이어가");
+  const progressionAssistantMessage = createAssistantMessage(progressionState, "이미지 진행 10컷.");
+  const progressionNoCuePlan = await planImageJobForCompletedTurn(
+    {
+      ...progressionState,
+      messages: [...progressionState.messages, progressionUserMessage, progressionAssistantMessage]
+    },
+    {
+      userMessage: progressionUserMessage,
+      assistantMessage: progressionAssistantMessage,
+      contextPack: createContextPack(progressionState),
+      promptModuleUsages: [],
+      sidecar: {
+        assistantText: progressionAssistantMessage.content,
+        memoryEvents: [],
+        imageCue: noImageCue,
+        imageCues: []
+      },
+      sidecarTrace: createParsedLlmSidecarTrace(progressionState, progressionAssistantMessage.id),
+      manualImage: false
+    }
+  );
+  const progressionKinds = ["scene", "action", "dialogue_face", "body_detail", "interaction"];
+  const progressionFrames = ["wide shot", "medium shot", "upper body", "close-up", "over-the-shoulder", "pov"];
+  const progressionCues = Array.from({ length: 12 }, (_, index) => {
+    const kind = progressionKinds[index % progressionKinds.length];
+    const frame = progressionFrames[index % progressionFrames.length];
+    const action = index % 4 === 0 ? "standing" : index % 4 === 1 ? "holding key" : index % 4 === 2 ? "reaching out" : "looking at viewer";
+    const expression = index % 3 === 0 ? "serious expression" : index % 3 === 1 ? "open mouth" : "determined expression";
+    const tags = ["1girl", frame, "archive library", action, "blue glow", "school uniform", "black hair", expression];
+    return {
+      shouldGenerate: true,
+      reason: `progression cue ${index + 1}`,
+      characters: [progressionState.characters[0].id],
+      tags,
+      scene: "archive progression",
+      visualContext: tags.join(", "),
+      kind,
+      placement: index === 0 ? "before" : "inline",
+      anchorText: `progression beat ${index + 1}`,
+      priority: 0.95 - index * 0.01,
+      label: `progression ${index + 1}`
+    };
+  });
+  const progressionPlan = await planImageJobForCompletedTurn(
+    {
+      ...progressionState,
+      messages: [...progressionState.messages, progressionUserMessage, progressionAssistantMessage]
+    },
+    {
+      userMessage: progressionUserMessage,
+      assistantMessage: progressionAssistantMessage,
+      contextPack: createContextPack(progressionState),
+      promptModuleUsages: [],
+      sidecar: {
+        assistantText: progressionAssistantMessage.content,
+        memoryEvents: [],
+        imageCue: progressionCues[0],
+        imageCues: progressionCues
+      },
+      sidecarTrace: createParsedLlmSidecarTrace(progressionState, progressionAssistantMessage.id),
+      manualImage: false
+    }
+  );
+
+  assertCheck("image.cadence", progressionNoCuePlan.imageJobs.length === 0, "Image progression mode does not synthesize local NAI tags when the LLM omits image_cues.");
+  assertCheck("image.cadence", progressionPlan.imageJobs.length === 10, "Image progression mode turns 10 LLM-authored cue groups into 10 image jobs.");
+  assertCheck("image.cadence", progressionPlan.imageJobs.every((job) => job.providerPayload.generationCadence === "image_progression"), "Image progression jobs record the active generation cadence.");
+  assertCheck("image.cadence", progressionPlan.imageJobs.every((job) => job.providerPayload.forceFreshImage === true), "Image progression jobs bypass cooldown/reuse as fresh cuts.");
+  assertCheck("image.cadence", progressionPlan.imageJobs.map((job) => job.providerPayload.cueIndex).join(",") === Array.from({ length: 10 }, (_, index) => index).join(","), "Image progression jobs preserve all cue indexes in order.");
+  assertCheck(
+    "image.cadence",
+    progressionPlan.imageJobs.every((job) => {
+      const characterLayer = job.providerPayload.promptLayers?.characters?.join(", ") ?? "";
+      return /archive library/iu.test(job.prompt) && !/school uniform/iu.test(job.prompt) && /school uniform/iu.test(characterLayer);
+    }),
+    "Image progression jobs split each LLM-authored tag group into base and character prompt layers."
+  );
 
   const sparseState = createPlayableState(seedState, {
     imageProfile: {
@@ -536,14 +869,14 @@ async function evaluateAnchoredRulePromptDiversity(seedState, planImageJobForCom
   const dialoguePrompt = String(byKind.get("dialogue_face")?.prompt ?? "");
   const dialogueAnchor = String(byKind.get("dialogue_face")?.providerPayload.anchorText ?? "");
 
-  assertCheck("image.anchored_rules", jobs.length >= 4, "Rule and paragraph planning creates multiple anchored image jobs.");
-  assertCheck("image.anchored_rules", new Set(prompts).size > 1, "Anchored image jobs do not reuse one identical prompt for every cut.");
-  assertCheck("image.anchored_rules", /stage|stage lights/iu.test(actionPrompt) && /arm up|hand up|microphone/iu.test(actionPrompt), "Action cue prompt keeps the stage action and prop tags.");
+  assertCheck("image.anchored_rules", jobs.length === 0, "Rule and paragraph planning does not create local-tagged image jobs without LLM cues.");
+  assertCheck("image.anchored_rules", new Set(prompts).size <= 1, "No local prompt variants are fabricated for anchored hints.");
+  assertCheck("image.anchored_rules", !/stage|stage lights|arm up|hand up|microphone/iu.test(actionPrompt), "Action cue prompt is not locally synthesized from assistant prose.");
   assertCheck("image.anchored_rules", !/\bstreet\b/iu.test(actionPrompt), "Stage action cue does not inherit later street tags from the same assistant turn.");
-  assertCheck("image.anchored_rules", /close-up|body focus/iu.test(bodyPrompt) && /hands|wrist grab/iu.test(bodyPrompt), "Body-detail cue uses close framing and body/contact tags.");
-  assertCheck("image.anchored_rules", /close-up|face focus/iu.test(dialoguePrompt) && /open mouth/iu.test(dialoguePrompt), "Dialogue-face cue uses face and speech-expression tags.");
-  assertCheck("image.anchored_rules", byKind.get("dialogue_face")?.providerPayload.cuePlacement === "before", "Dialogue-face cue is placed before its anchor text.");
-  assertCheck("image.anchored_rules", /시작할게요|속삭/iu.test(dialogueAnchor), "Dialogue-face cue anchors to the dialogue line, not a random paragraph.");
+  assertCheck("image.anchored_rules", !/close-up|body focus|hands|wrist grab/iu.test(bodyPrompt), "Body-detail tags are not locally synthesized.");
+  assertCheck("image.anchored_rules", !/close-up|face focus|open mouth/iu.test(dialoguePrompt), "Dialogue-face tags are not locally synthesized.");
+  assertCheck("image.anchored_rules", !byKind.get("dialogue_face"), "Dialogue-face cue is not rendered without LLM tags.");
+  assertCheck("image.anchored_rules", !dialogueAnchor, "Dialogue-face anchor is not emitted on a suppressed local hint.");
 }
 
 function evaluateNovelAiWeightingAndUserRules(seedState, planImageJob) {
@@ -581,8 +914,8 @@ function evaluateNovelAiWeightingAndUserRules(seedState, planImageJob) {
     "turn_weighted_controls",
     createCue(weightedControlState, {
       scene: "stage",
-      tags: ["eye focus"],
-      visualContext: "eye focus"
+      tags: ["spotlight"],
+      visualContext: "spotlight"
     }),
     [],
     true
@@ -596,20 +929,20 @@ function evaluateNovelAiWeightingAndUserRules(seedState, planImageJob) {
   const artistLayerIndex = weightedPrompt.indexOf("2::artist:eriol_s2 ::");
   const qualityLayerIndex = weightedPrompt.indexOf("masterpiece");
   const styleLayerIndex = weightedPrompt.indexOf("cinematic anime illustration");
-  const eyeFocusIndex = weightedPrompt.indexOf("eye focus");
+  const spotlightIndex = weightedPrompt.indexOf("spotlight");
 
   assertCheck("nai.weighting", job.prompt.includes("1.5::rain, night ::"), "Numeric emphasis with comma remains intact.");
   assertCheck("nai.weighting", job.prompt.includes("-1::hat ::"), "Negative numeric emphasis stays in the prompt for targeted NAI removal.");
   assertCheck("nai.weighting", job.prompt.includes("::artist:bm94199 ::"), "Artist emphasis tag preserves the user-provided closing-space syntax.");
   assertCheck("nai.weighting", artistIndex >= 0 && firstSceneIndex >= 0 && artistIndex < firstSceneIndex, "Artist prompt stays before generated scene/action tags.");
-  assertCheck("nai.weighting", variantPrompts.length === 3 && new Set(variantPrompts).size === 3, "Counted image jobs receive distinct prompt variants instead of repeating the same prompt.");
+  assertCheck("nai.weighting", variantPrompts.length === 3 && new Set(variantPrompts).size === 1, "Counted image jobs do not fabricate local prompt variants.");
   assertCheck("nai.weighting", variantPrompts.every((prompt) => /stage/iu.test(prompt) && /standing|holding microphone/iu.test(prompt)), "Prompt variants preserve the core scene and action tags.");
   assertCheck(
     "nai.weighting",
     artistLayerIndex >= 0 &&
       qualityLayerIndex > artistLayerIndex &&
       styleLayerIndex > qualityLayerIndex &&
-      eyeFocusIndex > styleLayerIndex,
+      spotlightIndex > styleLayerIndex,
     "Positive prompt layers are ordered as artist, quality, style, generated tags."
   );
   assertCheck("nai.weighting", /2::artist:eriol_s2 ::.*-4\.0::artist collaboration ::.*0\.6::jeneral::.*-2\.0:: upscaled ::.*-2\.0::simple illustration ::/isu.test(weightedPrompt), "Artist prompt preserves the user's exact weighted tag order.");
@@ -946,12 +1279,12 @@ async function evaluateImageCueCharacterScoping(seedState, planImageJob, planIma
     true
   );
 
-  assertCheck("context.characters", plan.imageCue.characters.length === 0, "Solo outsider context drops copied full-roster image cue characters.");
+  assertCheck("context.characters", plan.imageCue.characters.join(",") === "char_a,char_b,char_c", "LLM-provided character ids are preserved without local target rewriting.");
   assertCheck("context.characters", !/\b(?:ari|beni|ciel)\b/iu.test(plan.imageCue.tags.join(", ")), "Roster character names are not carried as image cue tags.");
   assertCheck("context.characters", !/\b3girls\b|red hair|blue hair|blonde hair/iu.test(job?.prompt ?? ""), "Solo outsider prompt does not include the configured three-girl roster.");
-  assertCheck("context.characters", !/red hair|blue hair|blonde hair|\b(?:ari|beni|ciel)\b/iu.test(directJob.prompt), "Final image job planning strips copied roster character prompts and roster-name tags even when a raw cue bypasses simulation planning.");
+  assertCheck("context.characters", !/\b(?:ari|beni|ciel)\b/iu.test(directJob.prompt), "Final image job planning still strips roster-name tags from raw cue tags.");
   assertCheck("context.characters", !directJob.providerPayload.positiveTags?.some?.((tag) => /^(?:ari|beni|ciel)$/iu.test(String(tag))), "Roster names are removed from final positive tag layers.");
-  assertCheck("context.characters", Array.isArray(directJob.providerPayload.cue?.characters) && directJob.providerPayload.cue.characters.length === 0, "Final image job payload stores the scoped empty character list.");
+  assertCheck("context.characters", Array.isArray(directJob.providerPayload.cue?.characters) && directJob.providerPayload.cue.characters.length === 3, "Final image job payload preserves LLM-provided character ids.");
 
   if (job) {
     const payloadResult = await generateNovelAiImages({
@@ -968,7 +1301,7 @@ async function evaluateImageCueCharacterScoping(seedState, planImageJob, planIma
       count: 1
     });
     const charCaptions = payloadResult.payload.parameters?.v4_prompt?.caption?.char_captions ?? [];
-    assertCheck("context.characters", charCaptions.length === 0, "Solo outsider V4 payload does not write character captions for absent roster characters.");
+    assertCheck("context.characters", charCaptions.length === 0, "Solo outsider V4 payload does not create local captions from LLM-provided character ids.");
   }
 }
 
@@ -1079,7 +1412,7 @@ async function evaluateLlmCharacterScopedOutfits(seedState, planImageJob, planIm
   const layerText = plan.imageJob?.providerPayload.promptLayers?.characters?.join(", ") ?? "";
 
   assertCheck("context.llm_characters", plan.imageCue.characters.join(",") === "char_a,char_b", "Parsed LLM image cue keeps the exact visible character ids even when the prose omits names.");
-  assertCheck("context.llm_characters", /red hair/iu.test(layerText) && /blue hair/iu.test(layerText), "Selected LLM character ids pull their configured visual profile tags.");
+  assertCheck("context.llm_characters", !/red hair|blue hair/iu.test(layerText), "Selected LLM character ids do not pull configured visual profile tags locally.");
   assertCheck("context.llm_characters", !/blonde hair/iu.test(layerText), "Unselected roster character tags are not added locally.");
 
   if (plan.imageJob) {
@@ -1098,8 +1431,8 @@ async function evaluateLlmCharacterScopedOutfits(seedState, planImageJob, planIm
     });
     const charCaptions = payloadResult.payload.parameters?.v4_prompt?.caption?.char_captions ?? [];
     const captionText = charCaptions.map((caption) => caption?.char_caption ?? "").join("\n");
-    assertCheck("context.llm_characters", charCaptions.length === 2, "NovelAI V4 creates captions only for the LLM-selected visible characters.");
-    assertCheck("context.llm_characters", /red hair/iu.test(captionText) && /blue hair/iu.test(captionText) && !/blonde hair/iu.test(captionText), "V4 captions use configured tags for selected characters only.");
+    assertCheck("context.llm_characters", charCaptions.length === 0, "NovelAI V4 does not create local captions from LLM-selected visible characters.");
+    assertCheck("context.llm_characters", !/red hair|blue hair|blonde hair/iu.test(captionText), "V4 captions do not inject configured character tags.");
   }
 
   const outfitState = {
@@ -1117,13 +1450,8 @@ async function evaluateLlmCharacterScopedOutfits(seedState, planImageJob, planIm
   });
   const outfitJob = planImageJob(outfitState, "turn_llm_outfit_tags", outfitCue, [], true);
   const characterTags = outfitJob.providerPayload.promptLayers?.characters ?? [];
-  const redHairIndex = characterTags.findIndex((tag) => /red hair/iu.test(String(tag)));
-  const ariOutfitIndex = characterTags.findIndex((tag) => /black performance jacket/iu.test(String(tag)));
-  const blueHairIndex = characterTags.findIndex((tag) => /blue hair/iu.test(String(tag)));
-  const beniOutfitIndex = characterTags.findIndex((tag) => /white ribbon dress/iu.test(String(tag)));
-
-  assertCheck("context.llm_outfit", redHairIndex >= 0 && ariOutfitIndex > redHairIndex, "Ari's LLM Wearing tags are appended after Ari's configured character prompt tags.");
-  assertCheck("context.llm_outfit", blueHairIndex >= 0 && beniOutfitIndex > blueHairIndex, "Beni's LLM Wearing tags are appended after Beni's configured character prompt tags.");
+  assertCheck("context.llm_outfit", !characterTags.some((tag) => /red hair|black performance jacket/iu.test(String(tag))), "Ari character layer no longer injects configured or Wearing memory tags locally.");
+  assertCheck("context.llm_outfit", !characterTags.some((tag) => /blue hair|white ribbon dress/iu.test(String(tag))), "Beni character layer no longer injects configured or Wearing memory tags locally.");
   assertCheck("context.llm_outfit", !characterTags.some((tag) => /gray casual cardigan|blonde hair/iu.test(String(tag))), "Outfit application does not pull tags for an unselected roster character.");
 
   const outfitPayload = await generateNovelAiImages({
@@ -1134,8 +1462,105 @@ async function evaluateLlmCharacterScopedOutfits(seedState, planImageJob, planIm
     count: 1
   });
   const captions = outfitPayload.payload.parameters?.v4_prompt?.caption?.char_captions ?? [];
-  assertCheck("context.llm_outfit", /red hair.*black performance jacket/isu.test(captions[0]?.char_caption ?? ""), "Ari V4 caption keeps configured tags before LLM outfit tags.");
-  assertCheck("context.llm_outfit", /blue hair.*white ribbon dress/isu.test(captions[1]?.char_caption ?? ""), "Beni V4 caption keeps configured tags before LLM outfit tags.");
+  assertCheck("context.llm_outfit", captions.length === 0 || !/red hair|black performance jacket/isu.test(captions[0]?.char_caption ?? ""), "Ari V4 caption is not locally created from configured or Wearing tags.");
+  assertCheck("context.llm_outfit", captions.length === 0 || !/blue hair|white ribbon dress/isu.test(captions[1]?.char_caption ?? ""), "Beni V4 caption is not locally created from configured or Wearing tags.");
+}
+
+function evaluateWearingStateDetailPreservation(seedState, compileSimulationMemoryDelta, memoryDeltaToEvents) {
+  const state = createPlayableState(seedState, {
+    characters: [
+      {
+        id: "char_uniform",
+        simulationId: seedState.simulation.id,
+        name: "Mira",
+        role: "officer",
+        summary: "uniformed protagonist",
+        relationship: "player-facing cast",
+        currentMood: "tense"
+      }
+    ],
+    visualProfiles: [
+      {
+        id: "visual_uniform",
+        simulationId: seedState.simulation.id,
+        characterId: "char_uniform",
+        displayName: "Mira",
+        positivePrompt: "black hair, gray eyes, girl",
+        negativePrompt: "",
+        defaultOutfitPrompt: "police uniform, navy short dress, mini skirt",
+        outfitPrompts: {
+          school: "school uniform, dark grey pencil skirt, tight fit, necktie"
+        },
+        expressionPrompts: {},
+        referenceImageAssetIds: [],
+        defaultSafetyLevel: "safe"
+      }
+    ],
+    memoryEvents: [
+      createStateMemoryEvent(seedState, "char_uniform", "Wearing", "police uniform, navy short dress, mini skirt")
+    ]
+  });
+
+  const damagedDelta = compileSimulationMemoryDelta({
+    state,
+    userText: "계속",
+    assistantText: "미라의 유니폼 자락이 찢어진 채로 장면이 이어진다.",
+    sourceTurnId: "turn_eval_wearing_damage",
+    sidecar: {
+      assistantText: "미라의 유니폼 자락이 찢어진 채로 장면이 이어진다.",
+      imageCue: createCue(state, { shouldGenerate: false, tags: [], characters: [] }),
+      imageCues: [],
+      memoryEvents: [
+        {
+          memoryKind: "state",
+          stateType: "Wearing",
+          stateValue: "torn uniform",
+          content: "Mira's uniform is torn.",
+          importance: 0.86,
+          confidence: 0.9,
+          tags: ["outfit"],
+          actorId: "char_uniform",
+          actorName: "Mira"
+        }
+      ]
+    }
+  });
+  const damagedValue = memoryDeltaToEvents(state, damagedDelta)[0]?.metadata?.value ?? "";
+  assertCheck("memory.wearing", /police uniform/iu.test(String(damagedValue)), "Damaged Wearing state preserves the registered/previous base uniform.");
+  assertCheck("memory.wearing", /navy short dress/iu.test(String(damagedValue)) && /mini skirt/iu.test(String(damagedValue)), "Damaged Wearing state keeps garment detail tags.");
+  assertCheck("memory.wearing", /torn uniform/iu.test(String(damagedValue)), "Damaged Wearing state appends the new condition tag.");
+
+  const keywordState = {
+    ...state,
+    memoryEvents: []
+  };
+  const keywordDelta = compileSimulationMemoryDelta({
+    state: keywordState,
+    userText: "교복으로 바뀐다",
+    assistantText: "미라는 교복 차림으로 복도에 선다.",
+    sourceTurnId: "turn_eval_wearing_keyword",
+    sidecar: {
+      assistantText: "미라는 교복 차림으로 복도에 선다.",
+      imageCue: createCue(keywordState, { shouldGenerate: false, tags: [], characters: [] }),
+      imageCues: [],
+      memoryEvents: [
+        {
+          memoryKind: "state",
+          stateType: "Wearing",
+          stateValue: "school",
+          content: "Mira is wearing the school outfit.",
+          importance: 0.86,
+          confidence: 0.9,
+          tags: ["outfit"],
+          actorId: "char_uniform",
+          actorName: "Mira"
+        }
+      ]
+    }
+  });
+  const keywordValue = memoryDeltaToEvents(keywordState, keywordDelta)[0]?.metadata?.value ?? "";
+  assertCheck("memory.wearing", /school uniform/iu.test(String(keywordValue)), "Wearing keyword labels expand to mapped outfit prompts.");
+  assertCheck("memory.wearing", /dark grey pencil skirt/iu.test(String(keywordValue)) && /necktie/iu.test(String(keywordValue)), "Wearing keyword expansion keeps mapped detail tags.");
 }
 
 async function evaluateActorTargetCharacterDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn) {
@@ -1238,14 +1663,17 @@ async function evaluateActorTargetCharacterDisambiguation(seedState, planImageJo
     [],
     true
   );
+  const jobCharacterLayer = job?.providerPayload.promptLayers?.characters?.join(", ") ?? "";
+  const directJobCharacterLayer = directJob.providerPayload.promptLayers?.characters?.join(", ") ?? "";
 
-  assertCheck("context.actor_target", plan.imageCue.characters.length === 0, "Unnamed external actor drops wrongly selected roster character from planned image cue.");
+  assertCheck("context.actor_target", plan.imageCue.characters.join(",") === "char_minsel", "Unnamed external actor cue preserves the LLM-provided character id without local target rewriting.");
   assertCheck("context.actor_target", !/\b(?:light blonde hair|twin tails|twintails)\b/iu.test(job?.prompt ?? ""), "Wrong target character visual tags are not applied to the unnamed male actor.");
   assertCheck("context.actor_target", !/\b1boy\b/iu.test(job?.prompt ?? ""), "Unnamed Korean male actor cue does not infer 1boy locally.");
   assertCheck("context.actor_target", !/\bmale student\b/iu.test(job?.prompt ?? ""), "Unnamed Korean male actor cue does not infer gender/subject tags locally.");
-  assertCheck("context.actor_target", /\b(?:evil smile|leering)\b/iu.test(job?.prompt ?? ""), "Expression tags stay attached to the external actor cue.");
+  assertCheck("context.actor_target", /\b(?:evil smile|leering)\b/iu.test(jobCharacterLayer), "Expression tags stay attached to the external actor character prompt.");
   assertCheck("context.actor_target", !/\b(?:light blonde hair|twin tails|twintails)\b/iu.test(directJob.prompt), "Direct image job planning also strips wrong target character visuals for external actors.");
-  assertCheck("context.actor_target", Array.isArray(directJob.providerPayload.cue?.characters) && directJob.providerPayload.cue.characters.length === 0, "Direct image job payload stores no roster character for unnamed external actors.");
+  assertCheck("context.actor_target", /\b(?:evil smile|leering)\b/iu.test(directJobCharacterLayer), "Direct image job planning keeps external actor expression tags in the character layer.");
+  assertCheck("context.actor_target", Array.isArray(directJob.providerPayload.cue?.characters) && directJob.providerPayload.cue.characters.join(",") === "char_minsel", "Direct image job payload preserves LLM-provided character ids.");
 }
 
 async function evaluateStructuredCueDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn) {
@@ -1329,9 +1757,9 @@ async function evaluateStructuredCueDisambiguation(seedState, planImageJob, plan
     shouldGenerate: true,
     reason: "LLM copied broad roster and generic production tags",
     characters: ["char_a", "char_b", "char_c"],
-    tags: ["filming set", "getting up", "props", "microphone", "speaking"],
+    tags: ["filming set", "getting up", "props", "acting scene", "audition", "director", "student", "academy", "microphone", "camera", "speaking"],
     scene: "filming set",
-    visualContext: "Ari speaking, filming set, props",
+    visualContext: "Ari speaking, acting scene, audition, director, student, academy, microphone, camera",
     anchorText: "Ari grips the microphone and speaks."
   };
   const plan = await planImageJobForCompletedTurn(
@@ -1365,9 +1793,9 @@ async function evaluateStructuredCueDisambiguation(seedState, planImageJob, plan
     plan.imageJob?.providerPayload.promptVariants?.map((variant) => variant.prompt).join(", ") ?? ""
   ].join(", ");
 
-  assertCheck("context.structured_cue", plan.imageCue.characters.join(",") === "char_a", "Focused LLM cue keeps only the speaking/action-subject roster character.");
-  assertCheck("context.structured_cue", !/\b(?:filming set|getting up|props?)\b/iu.test(finalPromptText), "LLM-provided placeholder cue tags are removed before the NAI prompt.");
-  assertCheck("context.structured_cue", /microphone|open mouth/iu.test(combinedPrompt), "Concrete object/action tags remain after NAI tag normalization.");
+  assertCheck("context.structured_cue", plan.imageCue.characters.join(",") === "char_a,char_b,char_c", "LLM-provided character ids are not locally narrowed.");
+  assertCheck("context.structured_cue", /\b(?:getting up|props?)\b/iu.test(finalPromptText), "LLM-provided placeholder cue tags are passed through without local cleanup.");
+  assertCheck("context.structured_cue", /microphone|camera|open mouth/iu.test(combinedPrompt), "Concrete object/action tags remain after NAI tag normalization.");
 
   const outsiderCue = createCue(state, {
     characters: ["char_a"],
@@ -1376,8 +1804,8 @@ async function evaluateStructuredCueDisambiguation(seedState, planImageJob, plan
     visualContext: "teacher speaking to viewer"
   });
   const outsiderJob = planImageJob(state, "turn_teacher_outsider", outsiderCue, [], true);
-  assertCheck("context.structured_cue", outsiderJob.providerPayload.cue?.characters?.length === 0, "Non-roster speaker/action-subject drops wrongly selected roster character.");
-  assertCheck("context.structured_cue", !/red hair/iu.test(outsiderJob.prompt), "Non-roster speaker cue does not include a selected character visual prompt.");
+  assertCheck("context.structured_cue", outsiderJob.providerPayload.cue?.characters?.join(",") === "char_a", "Non-roster speaker cue preserves the LLM-provided character id.");
+  assertCheck("context.structured_cue", !/red hair/iu.test(outsiderJob.providerPayload.promptLayers?.characters?.join(", ") ?? ""), "Selected character visual prompt is not locally applied when a character id is present.");
 
   const outfitState = {
     ...state,
@@ -1391,7 +1819,7 @@ async function evaluateStructuredCueDisambiguation(seedState, planImageJob, plan
   });
   const outfitJob = planImageJob(outfitState, "turn_current_outfit_mapping", outfitCue, [], true);
   const characterLayer = outfitJob.providerPayload.promptLayers?.characters?.join(", ") ?? "";
-  assertCheck("context.structured_cue", /registered navy uniform/iu.test(characterLayer), "Current Wearing memory is resolved through the character's registered outfit mapping.");
+  assertCheck("context.structured_cue", !/registered navy uniform|red casual cardigan/iu.test(characterLayer), "Current/default outfit tags are not locally resolved into the character layer.");
 }
 
 async function evaluateLlmNaiTagPreservation(seedState, planImageJob, generateNovelAiImages) {
@@ -1444,14 +1872,15 @@ async function evaluateLlmNaiTagPreservation(seedState, planImageJob, generateNo
   const prompt = job.prompt;
 
   assertCheck("context.nai_tags", /\b1girl\b/iu.test(prompt), "LLM-provided subject count tag is preserved in the NAI prompt.");
-  assertCheck("context.nai_tags", /\bstanding\b/iu.test(prompt) && /\bchair\b/iu.test(prompt) && !/standing up from chair/iu.test(prompt), "Natural action phrases are decomposed into NAI tags.");
+  assertCheck("context.nai_tags", /standing up from chair/iu.test(prompt), "Natural action phrases are passed through without local decomposition.");
   assertCheck("context.nai_tags", /looking at viewer/iu.test(prompt), "Concrete gaze/POV tag is preserved.");
   assertCheck("context.nai_tags", /holding notebook/iu.test(prompt), "Held-item/action tag is preserved.");
   assertCheck("context.nai_tags", /dutch angle/iu.test(prompt), "Positive image user-rule tag is included.");
   assertCheck("context.nai_tags", /watermark/iu.test(job.negativePrompt), "Negative image user-rule tag is included in Undesired Content.");
-  assertCheck("context.nai_tags", !/facial expression|visible emotional reaction|situation specific clothing|street/iu.test(prompt), "Abstract cue tags and contradictory scene tags are filtered from the NAI prompt.");
+  assertCheck("context.nai_tags", /street/iu.test(prompt), "Contradictory LLM cue scene tags are not locally filtered.");
   const characterLayer = job.providerPayload.promptLayers?.characters?.join(", ") ?? "";
-  assertCheck("context.nai_tags", /school uniform/iu.test(characterLayer) && /dark grey pencil skirt/iu.test(characterLayer) && /tight fit/iu.test(characterLayer) && /necktie/iu.test(characterLayer), "Registered outfit keyword mappings are expanded beyond the generic clothing tag.");
+  assertCheck("context.nai_tags", /school uniform/iu.test(characterLayer) && /worried expression|facial expression/iu.test(characterLayer), "Character outfit and expression tags are kept in the character prompt layer.");
+  assertCheck("context.nai_tags", !/pink hair|dark grey pencil skirt|necktie/iu.test(characterLayer), "Registered visual and outfit keyword mappings are not locally expanded.");
 
   const payloadResult = await generateNovelAiImages({
     state,
@@ -1462,8 +1891,85 @@ async function evaluateLlmNaiTagPreservation(seedState, planImageJob, generateNo
   });
   const baseCaption = payloadResult.payload.parameters?.v4_prompt?.caption?.base_caption ?? "";
   const charCaption = payloadResult.payload.parameters?.v4_prompt?.caption?.char_captions?.[0]?.char_caption ?? "";
-  assertCheck("context.nai_tags", /1girl.*looking at viewer.*classroom.*standing/isu.test(baseCaption), "NovelAI V4 base caption keeps ordered subject/gaze/environment/action tags from the LLM cue.");
-  assertCheck("context.nai_tags", /pink hair.*school uniform.*dark grey pencil skirt.*tight fit.*necktie/isu.test(charCaption), "NovelAI V4 character caption keeps identity plus full registered outfit mapping.");
+  assertCheck(
+    "context.nai_tags",
+    /1girl/iu.test(baseCaption) && /looking at viewer/iu.test(baseCaption) && /classroom/iu.test(baseCaption) && /standing up from chair/iu.test(baseCaption),
+    "NovelAI V4 base caption keeps base LLM cue tags without local decomposition."
+  );
+  assertCheck("context.nai_tags", /school uniform|worried expression/iu.test(charCaption), "NovelAI V4 character caption receives LLM character-related tags.");
+  assertCheck("context.nai_tags", !/pink hair|dark grey pencil skirt|necktie/isu.test(charCaption), "NovelAI V4 character caption does not inject configured identity or outfit tags locally.");
+}
+
+function evaluateNameAndBodyInventoryCleanup(seedState, planImageJob) {
+  const state = createPlayableState(seedState, {
+    userPersona: {
+      ...seedState.userPersona,
+      enabled: true,
+      source: "custom",
+      name: "Yang Woojeong",
+      role: "POV owner",
+      updatedAt: new Date().toISOString()
+    },
+    imageProfile: {
+      ...seedState.imageProfile,
+      artistPrompt: "",
+      qualityPrompt: "",
+      stylePrompt: "",
+      userRules: ""
+    }
+  });
+  const noisyCue = {
+    shouldGenerate: true,
+    reason: "LLM over-expanded visible subject tags",
+    characters: [],
+    tags: [
+      "1girl",
+      "yang woojeong s pov",
+      "close up",
+      "looking at viewer",
+      "upper body",
+      "indoors",
+      "holding head",
+      "open mouth",
+      "mouth",
+      "chest",
+      "disheveled hair",
+      "red eyes",
+      "sweat",
+      "sweat drop",
+      "blush",
+      "grimacing",
+      "bangs",
+      "forehead",
+      "eyebrows",
+      "nose",
+      "lips",
+      "chin",
+      "neck",
+      "shoulders",
+      "collarbone",
+      "skin",
+      "face",
+      "head",
+      "human",
+      "person",
+      "female",
+      "woman"
+    ],
+    scene: "indoors",
+    visualContext: "1girl, Yang Woojeong's POV, close up, holding head, open mouth, forehead, eyebrows, nose, lips, chin, neck, shoulders, collarbone, skin, face, head, human, person, female, woman"
+  };
+  const job = planImageJob(state, "turn_name_body_inventory_cleanup", noisyCue, [], true);
+  const prompt = job.prompt;
+  const characterLayer = job.providerPayload.promptLayers?.characters?.join(", ") ?? "";
+  const promptTags = new Set(`${prompt}, ${characterLayer}`.split(",").map((tag) => tag.trim().toLowerCase()));
+  const anatomyTags = ["forehead", "eyebrows", "nose", "lips", "chin", "neck", "shoulders", "collarbone", "skin", "face", "head", "mouth", "chest"];
+
+  assertCheck("context.tag_cleanup", /\b1girl\b/iu.test(prompt) && /yang woojeong s pov/iu.test(prompt), "LLM subject and POV tags pass through without local rewriting.");
+  assertCheck("context.tag_cleanup", /\byang\b|\bwoojeong\b/iu.test(prompt), "Persona names in LLM tags are not locally removed.");
+  assertCheck("context.tag_cleanup", /\b(?:human|person|female|woman)\b/iu.test(prompt), "Generic human/person labels in LLM tags are not locally removed.");
+  assertCheck("context.tag_cleanup", anatomyTags.every((tag) => promptTags.has(tag)), "Bulk anatomy inventory is preserved across base and character prompt layers.");
+  assertCheck("context.tag_cleanup", /holding head|open mouth|disheveled hair|red eyes|sweat|blush/iu.test(`${prompt}, ${characterLayer}`), "Salient pose/expression/appearance tags remain after pass-through.");
 }
 
 async function evaluatePersonaCharacterImageCueScoping(seedState, planImageJobForCompletedTurn, generateNovelAiImages) {
@@ -1556,7 +2062,7 @@ async function evaluatePersonaCharacterImageCueScoping(seedState, planImageJobFo
     }
   );
 
-  assertCheck("context.persona_actor", plan.imageCue.characters.join(",") === "char_player", "User-controlled character persona is selected when the user action is the visible image actor.");
+  assertCheck("context.persona_actor", plan.imageCue.characters.length === 0, "User-controlled character persona is not locally inferred when image_cues.characters is empty.");
   assertCheck("context.persona_actor", !plan.imageCue.characters.includes("char_other"), "Persona action cue does not pull unrelated roster characters.");
 
   if (plan.imageJob) {
@@ -1568,7 +2074,7 @@ async function evaluatePersonaCharacterImageCueScoping(seedState, planImageJobFo
       count: 1
     });
     const charCaption = payloadResult.payload.parameters?.v4_prompt?.caption?.char_captions?.[0]?.char_caption ?? "";
-    assertCheck("context.persona_actor", /red hair/iu.test(charCaption) && !/silver hair/iu.test(charCaption), "NovelAI V4 character caption uses the controlled persona character prompt only.");
+    assertCheck("context.persona_actor", !/red hair|silver hair|black hoodie|white cardigan/iu.test(charCaption), "NovelAI V4 character caption does not inject roster visuals without an LLM-provided character id.");
   }
 }
 
@@ -1650,14 +2156,14 @@ async function evaluateLlmImageStateTagCarryover(seedState, planImageJob, planIm
     }
   );
 
-  assertCheck("context.image_state", plan.imageJob, "LLM-owned image state tags can rescue a sparse generated image cue.");
-  assertCheck("context.image_state", plan.imageCue.characters.join(",") === "char_player_state", "Sparse persona cue still resolves the controlled character as actor.");
-  assertCheck("context.image_state", /standing up from chair|holding notebook/iu.test(plan.imageCue.visualContext ?? ""), "Current character image state tags enter the planned cue visual context.");
+  assertCheck("context.image_state", !plan.imageJob, "Sparse generated image cues are suppressed instead of being rescued by local image state tags.");
+  assertCheck("context.image_state", plan.imageCue.characters.length === 0, "Sparse persona cue does not locally resolve the controlled character as actor.");
+  assertCheck("context.image_state", !/standing up from chair|holding notebook/iu.test(plan.imageCue.visualContext ?? ""), "Current character image state tags do not enter the planned cue visual context.");
 
   if (plan.imageJob) {
     const characterLayer = plan.imageJob.providerPayload.promptLayers?.characters?.join(", ") ?? "";
-    assertCheck("context.image_state", /\bstanding\b|leaning forward|holding notebook/iu.test(characterLayer), "Current character image state tags enter the character prompt layer.");
-    assertCheck("context.image_state", /classroom|low angle shot/iu.test(plan.imageJob.prompt), "Current scene image state tags enter the base prompt.");
+    assertCheck("context.image_state", !/\bstanding\b|leaning forward|holding notebook/iu.test(characterLayer), "Current character image state tags do not enter the character prompt layer.");
+    assertCheck("context.image_state", !/classroom|low angle shot/iu.test(plan.imageJob.prompt), "Current scene image state tags do not enter the base prompt.");
 
     const payloadResult = await generateNovelAiImages({
       state,
@@ -1669,8 +2175,8 @@ async function evaluateLlmImageStateTagCarryover(seedState, planImageJob, planIm
     const charCaption = payloadResult.payload.parameters?.v4_prompt?.caption?.char_captions?.[0]?.char_caption ?? "";
     assertCheck(
       "context.image_state",
-      /red hair/iu.test(charCaption) && /\bstanding\b/iu.test(charCaption) && /leaning forward|holding notebook/iu.test(charCaption),
-      "NovelAI V4 character caption includes LLM-owned current image state tags."
+      !/\bstanding\b|leaning forward|holding notebook/iu.test(charCaption),
+      "NovelAI V4 character caption does not include local current image state tags."
     );
   }
 
@@ -1809,19 +2315,19 @@ async function evaluateNovelAiV4Payload(seedState, planImageJob, generateNovelAi
   const negativeCharCaptions = v4Negative.caption?.char_captions ?? [];
 
   assertCheck("nai.v4", !/\b1(?:girl|boy|other)\b/iu.test(job.prompt), "Mixed-character prompt does not infer subject count tags locally.");
-  assertCheck("nai.v4", charCaptions.length === 2, "V4 payload includes one character caption per visible character.");
-  assertCheck("nai.v4", negativeCharCaptions.length === 2, "V4 payload includes character-specific negative captions.");
-  assertCheck("nai.v4", parameters.use_coords === true && v4Prompt.use_coords === true, "V4 multi-character payload enables coordinate nudges.");
-  assertCheck("nai.v4", /girl, red hair/iu.test(charCaptions[0]?.char_caption ?? ""), "First character caption keeps character-specific visual tags.");
-  assertCheck("nai.v4", /boy, blue hair/iu.test(charCaptions[1]?.char_caption ?? ""), "Second character caption keeps character-specific visual tags.");
-  assertCheck("nai.v4", /red academy blazer, pleated skirt/iu.test(charCaptions[0]?.char_caption ?? ""), "Korean school outfit mapping is applied to V4 character captions.");
-  assertCheck("nai.v4", /navy academy blazer, pressed slacks/iu.test(charCaptions[1]?.char_caption ?? ""), "English school outfit mapping is applied to V4 character captions.");
+  assertCheck("nai.v4", charCaptions.length === 2, "V4 payload creates one character caption per visible character when LLM tags contain character-related details.");
+  assertCheck("nai.v4", negativeCharCaptions.length === 0, "V4 payload does not create character-specific negative captions from visible character ids.");
+  assertCheck("nai.v4", parameters.use_coords === true && v4Prompt.use_coords === true, "V4 multi-character payload enables coordinate nudges when character captions are present.");
+  assertCheck("nai.v4", charCaptions.every((caption) => /tense expression|school uniform/iu.test(caption?.char_caption ?? "")), "V4 character captions receive LLM-authored character tags.");
+  assertCheck("nai.v4", !/girl, red hair/iu.test(charCaptions[0]?.char_caption ?? ""), "First character caption does not inject character-specific visual tags.");
+  assertCheck("nai.v4", !/boy, blue hair/iu.test(charCaptions[1]?.char_caption ?? ""), "Second character caption does not inject character-specific visual tags.");
+  assertCheck("nai.v4", !/red academy blazer, pleated skirt/iu.test(charCaptions[0]?.char_caption ?? ""), "Korean school outfit mapping is not applied locally to V4 character captions.");
+  assertCheck("nai.v4", !/navy academy blazer, pressed slacks/iu.test(charCaptions[1]?.char_caption ?? ""), "English school outfit mapping is not applied locally to V4 character captions.");
   assertCheck(
     "nai.v4",
     Array.isArray(job.providerPayload.promptLayers?.characters) &&
-      job.providerPayload.promptLayers.characters.some((tag) => /red academy blazer/iu.test(String(tag))) &&
-        job.providerPayload.promptLayers.characters.some((tag) => /navy academy blazer/iu.test(String(tag))),
-    "Character outfit mappings are recorded in prompt layers."
+      !job.providerPayload.promptLayers.characters.some((tag) => /red academy blazer|navy academy blazer/iu.test(String(tag))),
+    "Character outfit mappings are not locally recorded in prompt layers."
   );
 }
 

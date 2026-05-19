@@ -1,6 +1,17 @@
 import { createId } from "../lib/id";
 import type { AppState, AssistantMemoryEventDraft, AssistantSidecar, ContextEvidence, MemoryEvent } from "../types";
-import { inferCurrentSceneCharacterIds } from "./sceneCast";
+import { characterIsReferencedInText, inferCurrentSceneCharacterIds } from "./sceneCast";
+import {
+  canonicalizeStateType,
+  classifyImageStateTags,
+  formatImageStateTypeLabel,
+  isImageStateType,
+  readStateMemoryKind,
+  readStateMemoryOwnerId,
+  readStateMemoryStateType,
+  readStateMemoryValue,
+  splitImageStateTagValue
+} from "./stateMemory";
 
 export type SimulationMemoryKind =
   | "event"
@@ -43,6 +54,21 @@ export interface MemoryDelta {
 }
 
 const MAX_DELTA_RECORDS = 8;
+const IMAGE_CUE_CHARACTER_STATE_TYPES = new Set<string>([
+  "Wearing",
+  "OutfitTags",
+  "StatusTags",
+  "ExpressionTags",
+  "PoseTags",
+  "ActionTags",
+  "InteractionTags",
+  "InteractionPhaseTags",
+  "HeldItemTags",
+  "PhysicalStateTags",
+  "BodyStateTags",
+  "PhysicalCondition",
+  "Emotion"
+]);
 const IMPORTANT_EVENT_PATTERN = /기억|약속|관계|갈등|위험|비밀|장소|목표|상태|변화|단서|목격|알게|잃어|얻었|이동|도착|떠났|부상|아프|통증|고백|거짓말|계약|돈|채무|훈련|성장/u;
 const OPEN_THREAD_PATTERN = /아직|모른|모름|확정되지|가능성|의심|수상|비밀|원인|해결되지|떡밥|추측/u;
 const OBSERVATION_PATTERN = /목격|봤다|보았다|보는|본다|들었다|듣고|눈치챘|알아차렸/u;
@@ -113,6 +139,7 @@ export function compileSimulationMemoryDelta(input: {
   const warnings: string[] = [];
 
   records.push(...recordsFromSidecar(input.state, input.sidecar.memoryEvents, input.assistantText));
+  records.push(...recordsFromImageCueDrafts(input.state, input.sidecar.imageCues.length > 0 ? input.sidecar.imageCues : [input.sidecar.imageCue], records));
   records.push(...extractStateRecords(input.state, input.userText, input.assistantText));
   records.push(...extractObservationAndBeliefRecords(input.state, input.userText, input.assistantText));
 
@@ -221,14 +248,19 @@ export function createStructuredContextSummary(
   const records = state.memoryEvents
     .map((event) => toReadableMemoryRecord(state, event))
     .filter((record): record is ReadableMemoryRecord => Boolean(record));
+  const currentSceneRecords = records.filter((record) =>
+    recordIsRelevantToCurrentSceneCast(state, record, activeCharacterIds)
+  );
   const currentStates = latestByKey(
-    records.filter((record) => record.kind === "state"),
+    currentSceneRecords.filter((record) => record.kind === "state"),
     (record) => `${record.ownerId ?? record.actorId ?? "world"}:${record.stateType ?? "State"}`
   ).slice(0, maxStates);
-  const observations = records.filter((record) => record.kind === "observation").slice(-6);
-  const beliefs = records.filter((record) => record.kind === "belief").slice(-6);
-  const events = records.filter((record) => record.kind === "event" || record.kind === "relationship" || record.kind === "goal").slice(-maxEvents);
-  const openThreads = records.filter((record) => record.kind === "open_thread").slice(-5);
+  const observations = currentSceneRecords.filter((record) => record.kind === "observation").slice(-6);
+  const beliefs = currentSceneRecords.filter((record) => record.kind === "belief").slice(-6);
+  const events = currentSceneRecords
+    .filter((record) => record.kind === "event" || record.kind === "relationship" || record.kind === "goal")
+    .slice(-maxEvents);
+  const openThreads = currentSceneRecords.filter((record) => record.kind === "open_thread").slice(-5);
   const latestScene = [...records].reverse().find((record) => record.sceneId || record.simTime);
 
   return [
@@ -239,6 +271,7 @@ export function createStructuredContextSummary(
     `- Scene: ${latestScene?.sceneId ?? state.simulation.activeSessionId}`,
     `- Active Characters: ${activeCharacterNames || "none explicit in recent transcript/current action"}`,
     "- Cast Rule: registered roster, relationship map entries, and stored status values are reference data; they do not make a character present unless the current scene evidence says so.",
+    "- Off-stage character states are omitted from this current-turn summary until that character is active in the recent transcript or current action.",
     "",
     "## Canonical World State",
     ...formatRecordLines(state, currentStates, "현재 상태 없음"),
@@ -285,9 +318,18 @@ function recordsFromSidecar(state: AppState, drafts: AssistantMemoryEventDraft[]
   return drafts
     .filter((draft) => !looksLikeRawAssistantOutput(draft.content, assistantText))
     .map((draft) => {
-      const actor = resolveCharacter(state, draft.actorId, draft.actorName);
+      const mentionedCharacters = findMentionedCharacters(state, draft.content);
+      const actor = resolveCharacter(state, draft.actorId, draft.actorName) ?? mentionedCharacters[0];
+      const target = resolveCharacter(state, draft.targetId) ?? mentionedCharacters.find((character) => character.id !== actor?.id);
       const inferred = inferRecordKind(draft);
-      const stateValue = draft.stateValue ?? inferStateValue(draft.content, draft.stateType);
+      const stateType = canonicalizeStateType(draft.stateType ?? inferred.stateType);
+      const ownerId = inferred.kind === "state" ? actor?.id ?? draft.actorId : undefined;
+      const targetId = target?.id ?? draft.targetId;
+      const stateValue = normalizeStateRecordValue(state, {
+        ownerId,
+        stateType,
+        value: draft.stateValue ?? inferStateValue(draft.content, stateType)
+      });
       return createRecord({
         state,
         kind: inferred.kind,
@@ -297,10 +339,10 @@ function recordsFromSidecar(state: AppState, drafts: AssistantMemoryEventDraft[]
         confidence: draft.confidence ?? 0.78,
         actorId: actor?.id ?? draft.actorId,
         actorName: actor?.name ?? draft.actorName,
-        ownerId: draft.memoryKind === "state" ? actor?.id ?? draft.actorId : undefined,
-        targetId: draft.targetId,
-        observers: draft.observers,
-        stateType: draft.stateType ?? inferred.stateType,
+        ownerId,
+        targetId,
+        observers: normalizeObserverIds(state, draft.observers, actor?.id, inferred.kind),
+        stateType,
         value: stateValue,
         eventType: draft.eventType ?? inferred.eventType,
         tags: draft.tags,
@@ -309,16 +351,270 @@ function recordsFromSidecar(state: AppState, drafts: AssistantMemoryEventDraft[]
     });
 }
 
-function extractStateRecords(state: AppState, userText: string, assistantText: string): MemoryDeltaRecord[] {
-  const text = `${userText}\n${assistantText}`;
-  const actors = findMentionedCharacters(state, text);
-  const owner = actors[0] ?? state.characters[0];
-  if (!owner) {
+function recordsFromImageCueDrafts(
+  state: AppState,
+  drafts: AssistantSidecar["imageCues"],
+  existingRecords: MemoryDeltaRecord[]
+): MemoryDeltaRecord[] {
+  if (!state.relationshipMap.enabled) {
     return [];
   }
 
+  const existingStateKeys = new Set(
+    existingRecords
+      .filter((record) => record.kind === "state" && record.stateType)
+      .map((record) => `${record.ownerId ?? record.actorId ?? "scene"}:${canonicalizeStateType(record.stateType)}`)
+  );
+  const records: MemoryDeltaRecord[] = [];
+
+  for (const draft of drafts) {
+    if (draft.tags.length === 0 || (draft.shouldGenerate === false && !draft.visualContext?.trim())) {
+      continue;
+    }
+
+    const characters = draft.characters
+      .map((characterId) => resolveCharacter(state, characterId))
+      .filter((character): character is AppState["characters"][number] => Boolean(character));
+    if (characters.length === 0) {
+      continue;
+    }
+
+    const groups = classifyImageStateTags(draft.tags);
+    for (const character of characters) {
+      for (const [rawStateType, tags] of Object.entries(groups)) {
+        const stateType = canonicalizeStateType(rawStateType);
+        if (!isImageStateType(stateType) || !IMAGE_CUE_CHARACTER_STATE_TYPES.has(stateType) || tags.length === 0) {
+          continue;
+        }
+
+        const stateKey = `${character.id}:${stateType}`;
+        if (existingStateKeys.has(stateKey)) {
+          continue;
+        }
+
+        existingStateKeys.add(stateKey);
+        const value = normalizeStateRecordValue(state, {
+          ownerId: character.id,
+          stateType,
+          value: tags.join(", ")
+        }) ?? tags.join(", ");
+        records.push(
+          createRecord({
+            state,
+            kind: "state",
+            layer: "episodic",
+            content: `${character.name} ${formatImageStateTypeLabel(stateType)}: ${value}`,
+            importance: stateType === "Wearing" ? 0.66 : 0.58,
+            confidence: 0.62,
+            actorId: character.id,
+            actorName: character.name,
+            ownerId: character.id,
+            stateType,
+            value,
+            tags: ["image-cue-state", stateType],
+            importanceReasons: ["image_cue_tags_returned", "relationship_status_sync"]
+          })
+        );
+      }
+    }
+  }
+
+  return records.slice(0, 6);
+}
+
+function normalizeStateRecordValue(
+  state: AppState,
+  input: { ownerId?: string; stateType?: string; value?: string }
+): string | undefined {
+  if (!input.value?.trim()) {
+    return undefined;
+  }
+
+  const stateType = canonicalizeStateType(input.stateType);
+  if (stateType !== "Wearing" && stateType !== "OutfitTags") {
+    return input.value.trim();
+  }
+
+  return preserveWearingStateDetails(state, input.ownerId, input.value);
+}
+
+function preserveWearingStateDetails(state: AppState, ownerId: string | undefined, value: string): string {
+  const incomingTags = expandOutfitKeywordTags(state, ownerId, splitImageStateTagValue(value), value);
+  if (incomingTags.length === 0) {
+    return value.trim();
+  }
+
+  const baseTags = findStableOutfitBaseTags(state, ownerId);
+  const shouldPreserveBase = shouldPreserveOutfitBase(value, incomingTags, baseTags);
+  const tags = shouldPreserveBase ? uniquePromptTags([...baseTags, ...incomingTags]) : incomingTags;
+  return limitStateTagValue(tags).join(", ");
+}
+
+function expandOutfitKeywordTags(state: AppState, ownerId: string | undefined, tags: string[], rawValue: string): string[] {
+  const visualProfile = ownerId ? state.visualProfiles.find((profile) => profile.characterId === ownerId) : undefined;
+  const matchingMappings = Object.entries(visualProfile?.outfitPrompts ?? {})
+    .map(([key, prompt]) => [key.trim(), prompt.trim()] as const)
+    .filter(([key, prompt]) => key && prompt && doesOutfitValueMentionKeyword(rawValue, tags, key));
+
+  if (matchingMappings.length === 0) {
+    return uniquePromptTags(tags);
+  }
+
+  const mappingTags = matchingMappings.flatMap(([, prompt]) => splitImageStateTagValue(prompt));
+  const mappingKeys = matchingMappings.map(([key]) => key);
+  const retainedTags = tags.filter((tag) => {
+    if (mappingKeys.some((key) => doesOutfitTagMatchKeyword(tag, key))) {
+      return isOutfitConditionTag(tag);
+    }
+    return true;
+  });
+
+  return uniquePromptTags([...mappingTags, ...retainedTags]);
+}
+
+function doesOutfitValueMentionKeyword(rawValue: string, tags: string[], keyword: string): boolean {
+  return doesOutfitTagMatchKeyword(rawValue, keyword) || tags.some((tag) => doesOutfitTagMatchKeyword(tag, keyword));
+}
+
+function doesOutfitTagMatchKeyword(value: string, keyword: string): boolean {
+  const normalizedValue = value.toLowerCase().replace(/[._-]+/gu, " ");
+  const normalizedKeyword = keyword.toLowerCase().replace(/[._-]+/gu, " ").trim();
+  if (!normalizedKeyword) {
+    return false;
+  }
+
+  if (/^[a-z0-9 ]+$/iu.test(normalizedKeyword)) {
+    return new RegExp(`(?:^|\\b)${escapeRegExp(normalizedKeyword)}(?:\\b|$)`, "iu").test(normalizedValue);
+  }
+
+  return normalizedValue.includes(normalizedKeyword);
+}
+
+function findStableOutfitBaseTags(state: AppState, ownerId: string | undefined): string[] {
+  if (!ownerId) {
+    return [];
+  }
+
+  const previousValue = state.memoryEvents
+    .slice()
+    .reverse()
+    .find((event) => {
+      const stateType = readStateMemoryStateType(event);
+      return (
+        readStateMemoryKind(event) === "state" &&
+        readStateMemoryOwnerId(event) === ownerId &&
+        (stateType === "Wearing" || stateType === "OutfitTags")
+      );
+    });
+  const previousTags = previousValue ? splitImageStateTagValue(readStateMemoryValue(previousValue)) : [];
+  if (previousTags.length > 0) {
+    return previousTags;
+  }
+
+  const visualProfile = state.visualProfiles.find((profile) => profile.characterId === ownerId);
+  return splitImageStateTagValue(visualProfile?.defaultOutfitPrompt);
+}
+
+function shouldPreserveOutfitBase(rawValue: string, incomingTags: string[], baseTags: string[]): boolean {
+  if (incomingTags.length === 0 || baseTags.length === 0) {
+    return false;
+  }
+
+  if (incomingTags.some((tag) => isSameOrBroaderOutfitTag(tag, baseTags))) {
+    return true;
+  }
+
+  if (!isOutfitConditionTag(rawValue) && !incomingTags.some(isOutfitConditionTag)) {
+    return false;
+  }
+
+  return !hasExplicitDifferentOutfitIdentity(incomingTags, baseTags);
+}
+
+function isSameOrBroaderOutfitTag(tag: string, baseTags: string[]): boolean {
+  const normalizedTag = normalizeOutfitComparisonText(tag);
+  if (!isGenericOutfitTag(normalizedTag)) {
+    return baseTags.some((baseTag) => {
+      const normalizedBase = normalizeOutfitComparisonText(baseTag);
+      return normalizedBase === normalizedTag || normalizedBase.includes(normalizedTag) || normalizedTag.includes(normalizedBase);
+    });
+  }
+
+  return baseTags.some((baseTag) => normalizeOutfitComparisonText(baseTag).includes(normalizedTag));
+}
+
+function hasExplicitDifferentOutfitIdentity(incomingTags: string[], baseTags: string[]): boolean {
+  const baseText = normalizeOutfitComparisonText(baseTags.join(" "));
+  const incomingIdentityWords = uniquePromptTags(
+    incomingTags.flatMap((tag) => normalizeOutfitComparisonText(tag).match(OUTFIT_IDENTITY_WORD_PATTERN) ?? [])
+  );
+  return incomingIdentityWords.length > 0 && incomingIdentityWords.some((word) => !baseText.includes(word));
+}
+
+function isOutfitConditionTag(value: string): boolean {
+  return OUTFIT_CONDITION_PATTERN.test(value);
+}
+
+function isGenericOutfitTag(value: string): boolean {
+  const withoutCondition = normalizeOutfitComparisonText(value).replace(OUTFIT_CONDITION_WORD_PATTERN, " ").replace(/\s+/gu, " ").trim();
+  return /^(?:uniform|dress|short dress|skirt|mini skirt|shirt|blouse|jacket|cardigan|coat|hoodie|pants|shorts|suit|clothes|outfit|shoes|boots|socks|hat|cap|gloves|mask)$/iu.test(
+    withoutCondition
+  );
+}
+
+function normalizeOutfitComparisonText(value: string): string {
+  return value.toLowerCase().replace(/[{}[\]"'`]/gu, "").replace(/[._-]+/gu, " ").replace(/\s+/gu, " ").trim();
+}
+
+function limitStateTagValue(tags: string[]): string[] {
+  const limited: string[] = [];
+  for (const tag of tags) {
+    const next = [...limited, tag];
+    if (next.length > 12 || next.join(", ").length > 220) {
+      break;
+    }
+    limited.push(tag);
+  }
+  return limited.length > 0 ? limited : tags.slice(0, 1);
+}
+
+function uniquePromptTags(values: string[]): string[] {
+  const seen = new Set<string>();
+  const tags: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim().replace(/\s+/gu, " ");
+    const key = normalizeOutfitComparisonText(normalized);
+    if (!normalized || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    tags.push(normalized);
+  }
+  return tags;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+const OUTFIT_CONDITION_PATTERN =
+  /\b(?:torn|ripped|damaged|shredded|frayed|ragged|cut|slashed|wet|soaked|drenched|dirty|muddy|stained|bloodstained|dusty|wrinkled|disheveled|loose|open|unbuttoned|unfastened|burnt|scorched|clothes lifted|shirt open|panties aside)\b/iu;
+const OUTFIT_CONDITION_WORD_PATTERN =
+  /\b(?:torn|ripped|damaged|shredded|frayed|ragged|cut|slashed|wet|soaked|drenched|dirty|muddy|stained|bloodstained|dusty|wrinkled|disheveled|loose|open|unbuttoned|unfastened|burnt|scorched)\b/giu;
+const OUTFIT_IDENTITY_WORD_PATTERN =
+  /\b(?:academy|business|casual|doctor|gothic|gym|hanbok|idol|kimono|lab|lolita|maid|military|nurse|office|police|rain|sailor|school|sports|stage|track|training|wedding)\b/giu;
+
+function extractStateRecords(state: AppState, userText: string, assistantText: string): MemoryDeltaRecord[] {
+  const text = `${userText}\n${assistantText}`;
+  const actors = findMentionedCharacters(state, text);
+  const owner = selectPrimaryActorForMemory(state, actors);
+
   return STATE_PATTERNS.flatMap((definition) => {
     if (!definition.pattern.test(text)) {
+      return [];
+    }
+
+    if (!owner && definition.type !== "Location") {
       return [];
     }
 
@@ -332,15 +628,15 @@ function extractStateRecords(state: AppState, userText: string, assistantText: s
         state,
         kind: definition.type === "Goal" ? "goal" : "state",
         layer: "episodic",
-        content: `${owner.name} ${definition.label}: ${value}`,
+        content: `${owner?.name ?? "장면"} ${definition.label}: ${value}`,
         importance: definition.importance,
         confidence: 0.72,
-        actorId: owner.id,
-        actorName: owner.name,
-        ownerId: owner.id,
+        actorId: owner?.id,
+        actorName: owner?.name,
+        ownerId: owner?.id,
         stateType: definition.type,
         value,
-        tags: ["current-state", definition.type],
+        tags: [owner ? "current-state" : "scene-state", definition.type],
         importanceReasons: ["state_changed", "future_consistency_relevant"]
       })
     ];
@@ -351,6 +647,7 @@ function extractObservationAndBeliefRecords(state: AppState, userText: string, a
   const text = `${userText}\n${assistantText}`;
   const actors = findMentionedCharacters(state, text);
   const observer = actors[0];
+  const target = actors.find((character) => character.id !== observer?.id);
   const records: MemoryDeltaRecord[] = [];
 
   if (observer && OBSERVATION_PATTERN.test(text)) {
@@ -364,6 +661,7 @@ function extractObservationAndBeliefRecords(state: AppState, userText: string, a
         confidence: 0.78,
         actorId: observer.id,
         actorName: observer.name,
+        targetId: target?.id,
         observers: [observer.id],
         eventType: "Observed",
         tags: ["observation", "perspective"],
@@ -384,6 +682,7 @@ function extractObservationAndBeliefRecords(state: AppState, userText: string, a
         actorId: observer.id,
         actorName: observer.name,
         ownerId: observer.id,
+        targetId: target?.id,
         eventType: "BeliefUpdated",
         tags: ["belief", "perspective"],
         importanceReasons: ["character_knowledge_changed"]
@@ -490,13 +789,18 @@ function inferRecordKind(draft: AssistantMemoryEventDraft): {
   stateType?: string;
   eventType?: string;
 } {
+  const canonicalStateType = canonicalizeStateType(draft.stateType);
   if (draft.memoryKind) {
     return {
       kind: draft.memoryKind,
       layer: draft.memoryKind === "summary" ? "semantic" : "episodic",
-      stateType: draft.stateType,
+      stateType: canonicalStateType,
       eventType: draft.eventType
     };
+  }
+
+  if (canonicalStateType) {
+    return { kind: "state", layer: "episodic", stateType: canonicalStateType };
   }
 
   const text = `${draft.tags.join(" ")} ${draft.content}`.toLowerCase();
@@ -560,8 +864,33 @@ function extractDurableSentence(text: string, pattern: RegExp): string {
 }
 
 function findMentionedCharacters(state: AppState, text: string): AppState["characters"] {
-  const normalized = text.toLowerCase();
-  return state.characters.filter((character) => normalized.includes(character.name.toLowerCase()) || normalized.includes(character.id.toLowerCase()));
+  return state.characters.filter((character) => characterIsReferencedInText(character, text));
+}
+
+function selectPrimaryActorForMemory(
+  state: AppState,
+  actors: AppState["characters"]
+): AppState["characters"][number] | undefined {
+  if (actors.length > 0) {
+    return actors[0];
+  }
+
+  return state.characters.length === 1 ? state.characters[0] : undefined;
+}
+
+function normalizeObserverIds(
+  state: AppState,
+  observerIds: string[] | undefined,
+  fallbackActorId: string | undefined,
+  kind: SimulationMemoryKind
+): string[] | undefined {
+  const knownCharacterIds = new Set(state.characters.map((character) => character.id));
+  const ids = [
+    ...(observerIds ?? []),
+    kind === "observation" && fallbackActorId ? fallbackActorId : undefined
+  ].filter((id): id is string => Boolean(id && knownCharacterIds.has(id)));
+
+  return ids.length > 0 ? [...new Set(ids)] : undefined;
 }
 
 function resolveCharacter(state: AppState, id?: string, name?: string) {
@@ -631,6 +960,7 @@ interface ReadableMemoryRecord {
   content: string;
   actorId?: string;
   ownerId?: string;
+  targetId?: string;
   actorName?: string;
   stateType?: string;
   value?: string;
@@ -641,20 +971,46 @@ interface ReadableMemoryRecord {
 
 function toReadableMemoryRecord(state: AppState, event: MemoryEvent): ReadableMemoryRecord | undefined {
   const metadata = event.metadata ?? {};
-  const kind = readMemoryKind(metadata) ?? inferKindFromTags(event.tags);
+  const runtimeKind = readStateMemoryKind(event);
+  const kind = readMemoryKind(metadata) ?? (isMemoryKind(runtimeKind) ? runtimeKind : inferKindFromTags(event.tags));
   const actor = resolveCharacter(state, event.actorId, event.actorName);
   return {
     kind,
     content: event.content,
     actorId: event.actorId,
-    ownerId: readString(metadata.owner_id) ?? event.actorId,
+    ownerId: readStateMemoryOwnerId(event) ?? event.actorId,
+    targetId: readString(event.metadata?.target_id),
     actorName: actor?.name ?? event.actorName,
-    stateType: readString(metadata.state_type),
-    value: readString(metadata.value),
+    stateType: readStateMemoryStateType(event),
+    value: readStateMemoryValue(event),
     simTime: readString(metadata.sim_time),
     sceneId: readString(metadata.scene_id),
     importance: event.importance
   };
+}
+
+function recordIsRelevantToCurrentSceneCast(
+  state: AppState,
+  record: ReadableMemoryRecord,
+  activeCharacterIds: ReadonlySet<string>
+): boolean {
+  const characterIds = getRecordCharacterIds(state, record);
+  if (characterIds.length === 0) {
+    return true;
+  }
+
+  if (state.characters.length === 1 && characterIds.includes(state.characters[0].id)) {
+    return true;
+  }
+
+  return characterIds.some((characterId) => activeCharacterIds.has(characterId));
+}
+
+function getRecordCharacterIds(state: AppState, record: ReadableMemoryRecord): string[] {
+  const knownCharacterIds = new Set(state.characters.map((character) => character.id));
+  return [...new Set([record.ownerId, record.actorId, record.targetId].filter((id): id is string => Boolean(id)))].filter((id) =>
+    knownCharacterIds.has(id)
+  );
 }
 
 function formatRecordLines(state: AppState, records: ReadableMemoryRecord[], fallback: string): string[] {

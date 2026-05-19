@@ -18,7 +18,7 @@ export type ImageSafetyLevel = "safe" | "sensitive" | "suggestive" | "explicit";
 
 export type ImageTriggerMode = "stored_only" | "realtime_auto" | "realtime_confirm" | "manual";
 
-export type ImageGenerationCadence = "sparse" | "balanced" | "rich" | "paragraph";
+export type ImageGenerationCadence = "sparse" | "balanced" | "rich" | "paragraph" | "image_progression";
 
 export type ImageJobStatus = "queued" | "planning" | "generating" | "completed" | "failed" | "canceled";
 
@@ -173,6 +173,21 @@ export interface CharacterVisualProfile {
   expressionPrompts: Record<string, string>;
   referenceImageAssetIds: Id[];
   defaultSafetyLevel: ImageSafetyLevel;
+}
+
+export interface ImageSceneTagPresetNode {
+  id: Id;
+  keyword: string;
+  tags: string[];
+  note: string;
+  enabled: boolean;
+  priority: number;
+  updatedAt: string;
+  children: ImageSceneTagPresetNode[];
+}
+
+export interface ImageSceneTagPreset extends ImageSceneTagPresetNode {
+  simulationId: Id;
 }
 
 export interface ImageGenerationProfile {
@@ -347,6 +362,8 @@ export interface AssistantImageCueDraft {
   reason: string;
   characters: Id[];
   tags: string[];
+  baseTags?: string[];
+  characterPrompts?: ImageCueCharacterPrompt[];
   scene: string;
   suppressionReason?: string;
   visualContext?: string;
@@ -440,9 +457,21 @@ export interface ImageCue {
   reason: string;
   characters: Id[];
   tags: string[];
+  baseTags?: string[];
+  characterPrompts?: ImageCueCharacterPrompt[];
   scene: string;
   suppressionReason?: string;
   visualContext?: string;
+}
+
+export interface ImageCueCharacterPrompt {
+  characterId?: Id;
+  prompt: string;
+  negativePrompt?: string;
+  center?: {
+    x: number;
+    y: number;
+  };
 }
 
 export interface ImageAsset {
@@ -558,6 +587,7 @@ export interface AppState {
   modules: PromptModule[];
   characters: Character[];
   visualProfiles: CharacterVisualProfile[];
+  imageScenePresets: ImageSceneTagPreset[];
   imageProfile: ImageGenerationProfile;
   userPersona: UserPersona;
   messages: ChatMessage[];

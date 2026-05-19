@@ -5,6 +5,8 @@ import type {
   ContentRating,
   EvaluationScenario,
   ImageGenerationProfile,
+  ImageSceneTagPreset,
+  ImageSceneTagPresetNode,
   LlmApiSettings,
   NeuralMapSettings,
   NovelAiApiSettings,
@@ -24,6 +26,62 @@ const now = "2026-05-03T00:00:00.000Z";
 const defaultOutfitPrompt = "";
 const defaultOutfitPrompts: Record<string, string> = {};
 const defaultExpressionPrompts: Record<string, string> = {};
+const defaultImageScenePresets: ImageSceneTagPreset[] = [
+  {
+    id: "scene_preset_archive",
+    simulationId: "sim_nocturne",
+    keyword: "archive library",
+    tags: ["archive library", "bookshelf", "old books", "wooden table", "paper stack", "warm lamplight", "dust particles"],
+    note: "기록 보관소, 사서, 단서 조사 장면용. 캐릭터 외형 태그는 포함하지 않는다.",
+    enabled: true,
+    priority: 84,
+    updatedAt: now,
+    children: [
+      {
+        id: "scene_preset_archive_research_table",
+        keyword: "research table",
+        tags: ["wooden table", "paper stack", "open book", "ink bottle", "warm lamplight"],
+        note: "책상 위 단서 조사 클로즈업/중경 장면.",
+        enabled: true,
+        priority: 80,
+        updatedAt: now,
+        children: []
+      },
+      {
+        id: "scene_preset_archive_bookshelf",
+        keyword: "dusty bookshelf",
+        tags: ["bookshelf", "old books", "ladder", "dust particles", "narrow aisle"],
+        note: "서가 사이 이동/수색 장면.",
+        enabled: true,
+        priority: 76,
+        updatedAt: now,
+        children: []
+      }
+    ]
+  },
+  {
+    id: "scene_preset_rain_city",
+    simulationId: "sim_nocturne",
+    keyword: "rain city",
+    tags: ["rain", "wet street", "city lights", "night", "reflection", "mist", "street lamp"],
+    note: "비 오는 도시 외부 장면용. 인물 태그 없이 배경/조명/날씨만 둔다.",
+    enabled: true,
+    priority: 72,
+    updatedAt: now,
+    children: [
+      {
+        id: "scene_preset_rain_city_alley",
+        keyword: "alley",
+        tags: ["narrow alley", "wet pavement", "neon sign", "mist", "backlight"],
+        note: "비 오는 골목/추적 장면.",
+        enabled: true,
+        priority: 70,
+        updatedAt: now,
+        children: []
+      }
+    ]
+  }
+];
 const defaultUserPersona: UserPersona = {
   enabled: false,
   source: "custom",
@@ -39,12 +97,12 @@ const defaultUserPersona: UserPersona = {
 const defaultRelationshipMapSettings: RelationshipMapSettings = {
   enabled: true,
   statusPrompt:
-    "관계도/상태창은 별도 장문 출력이 아니라 memory_events로 갱신한다. 인물의 현재 위치, 감정, 체력/컨디션, 착용/소지품, 목표, 관계 변화가 생기면 memory_kind='state' 또는 'relationship'으로 짧고 안정적인 델타를 남긴다. 의상 변화나 장면상 의상이 새로 확정되면 state_type='Wearing'에 NovelAI-style English outfit tags를 저장하고, 표정/컨디션/행동처럼 이미지와 반응 일관성에 필요한 캐릭터별 상태 태그는 state_type='StatusTags'에 저장한다. 자세, 현재 행동, 상호작용, 전체 상황/단계, 소지품, 카메라/조명/장면 구도가 이미지 일관성에 중요하면 state_type='PoseTags', 'ActionTags', 'InteractionTags', 'InteractionPhaseTags', 'HeldItemTags', 'SceneTags', 'ScenePhaseTags', 'CompositionTags', 'CameraTags', 'LightingTags'에 comma-separated English NAI tags로 저장한다. 너무 세세한 부위별 태그를 매번 쌓기보다 현재 상황을 복원할 수 있는 3-8개의 compact phase/state tags를 우선한다. 이미 Structured simulation memory에 있는 동일 상태는 반복하지 말고, 바뀐 값만 저장한다. actor_id와 target_id는 알 수 있을 때 반드시 사용한다.",
+    "관계도/상태창은 별도 장문 출력이 아니라 memory_events로 갱신한다. 인물의 현재 위치, 감정, 체력/컨디션, 착용/소지품, 목표, 관계 변화가 생기면 memory_kind='state' 또는 'relationship'으로 짧고 안정적인 델타를 남긴다. 의상 변화나 장면상 의상이 새로 확정되면 state_type='Wearing'에 NovelAI-style English outfit tags를 저장하고, 표정/컨디션/행동처럼 이미지와 반응 일관성에 필요한 캐릭터별 상태 태그는 state_type='StatusTags'에 저장한다. 기존 의상이 찢어짐/젖음/오염/헐거워짐처럼 변형될 때는 police uniform, navy short dress, mini skirt 같은 베이스 의상 태그를 유지하고 torn uniform 같은 상태 태그를 덧붙인다. 자세, 현재 행동, 상호작용, 전체 상황/단계, 소지품, 카메라/조명/장면 구도가 이미지 일관성에 중요하면 state_type='PoseTags', 'ActionTags', 'InteractionTags', 'InteractionPhaseTags', 'HeldItemTags', 'SceneTags', 'ScenePhaseTags', 'CompositionTags', 'CameraTags', 'LightingTags'에 comma-separated English NAI tags로 저장한다. 너무 세세한 부위별 태그를 매번 쌓기보다 현재 상황을 복원할 수 있는 3-8개의 compact phase/state tags를 우선한다. 이미 Structured simulation memory에 있는 동일 상태는 반복하지 말고, 바뀐 값만 저장한다. actor_id와 target_id는 알 수 있을 때 반드시 사용한다.",
   parameters: [
     {
       id: "rel_param_outfit_tags",
       title: "의상 태그",
-      rule: "현재 장면에서 확정된 캐릭터별 의상을 NovelAI-style English tags로 짧게 저장합니다. 예: school uniform, navy cardigan.",
+      rule: "현재 장면에서 확정된 캐릭터별 의상을 NovelAI-style English tags로 짧게 저장합니다. 의상이 손상/오염/노출 상태로 변형되면 기존 베이스 의상 태그를 지우지 말고 상태 태그를 덧붙입니다. 예: police uniform, navy short dress, mini skirt, torn uniform.",
       enabled: true,
       priority: 98
     },
@@ -148,6 +206,7 @@ export const seedState: AppState = {
       updatedAt: now
     },
   ],
+  imageScenePresets: defaultImageScenePresets,
   characters: [
     {
       id: "char_aria",
@@ -561,6 +620,74 @@ export const sunnyLineSeedState: AppState = {
       tokenPolicy: "always",
       version: 1,
       updatedAt: now
+    }
+  ],
+  imageScenePresets: [
+    {
+      id: "sunny_scene_preset_dorm_kitchen",
+      simulationId: sunnyLineSimulationId,
+      keyword: "dorm kitchen",
+      tags: ["dormitory kitchen", "morning", "fluorescent light", "small table", "rice cooker", "messy counter", "slice of life"],
+      note: "오피스텔 주방/아침 생활 장면. 인물 외형과 복장 태그는 제외.",
+      enabled: true,
+      priority: 86,
+      updatedAt: now,
+      children: [
+        {
+          id: "sunny_scene_preset_dorm_kitchen_breakfast",
+          keyword: "breakfast table",
+          tags: ["small table", "breakfast", "rice bowl", "steam", "messy counter", "morning light"],
+          note: "아침 식사/생활감 중심.",
+          enabled: true,
+          priority: 82,
+          updatedAt: now,
+          children: []
+        }
+      ]
+    },
+    {
+      id: "sunny_scene_preset_practice_room",
+      simulationId: sunnyLineSimulationId,
+      keyword: "practice room",
+      tags: ["dance studio", "mirror wall", "wooden floor", "speaker", "water bottle", "overhead light", "practice room"],
+      note: "댄스/보컬 연습 장면의 공간, 소품, 조명 중심.",
+      enabled: true,
+      priority: 82,
+      updatedAt: now,
+      children: [
+        {
+          id: "sunny_scene_preset_practice_room_mirror",
+          keyword: "mirror practice",
+          tags: ["mirror wall", "wooden floor", "speaker", "water bottle", "overhead light"],
+          note: "거울 앞 연습/피드백 장면.",
+          enabled: true,
+          priority: 80,
+          updatedAt: now,
+          children: []
+        }
+      ]
+    },
+    {
+      id: "sunny_scene_preset_small_stage",
+      simulationId: sunnyLineSimulationId,
+      keyword: "small stage",
+      tags: ["small stage", "stage lights", "microphone stand", "curtain", "audience seats", "spotlight", "backstage"],
+      note: "작은 공연장/무대 준비 장면. 캐릭터 태그는 이후 cue에서 별도 결합.",
+      enabled: true,
+      priority: 76,
+      updatedAt: now,
+      children: [
+        {
+          id: "sunny_scene_preset_small_stage_backstage",
+          keyword: "backstage",
+          tags: ["backstage", "curtain", "makeup table", "costume rack", "dim light"],
+          note: "무대 직전 대기/준비 장면.",
+          enabled: true,
+          priority: 74,
+          updatedAt: now,
+          children: []
+        }
+      ]
     }
   ],
   characters: [
@@ -981,6 +1108,7 @@ export function hydrateState(candidate: AppState | undefined): AppState {
     modules: candidate.modules?.length ? candidate.modules : seedState.modules,
     characters: candidate.characters?.length ? candidate.characters : seedState.characters,
     visualProfiles: normalizeVisualProfiles(candidate.visualProfiles),
+    imageScenePresets: normalizeImageScenePresets(candidate.imageScenePresets, simulation.id),
     messages,
     memoryEvents,
     contextPacks,
@@ -1225,6 +1353,59 @@ function normalizeVisualProfiles(profiles: AppState["visualProfiles"] | undefine
   }));
 }
 
+function normalizeImageScenePresets(presets: AppState["imageScenePresets"] | undefined, simulationId: string): AppState["imageScenePresets"] {
+  const source = presets?.length ? presets : simulationId === seedState.simulation.id ? defaultImageScenePresets : [];
+  return source
+    .map((preset, index) => {
+      const normalized = normalizeImageScenePresetNode(preset, index, "scene_preset");
+      return normalized
+        ? {
+            ...normalized,
+            simulationId
+          }
+        : undefined;
+    })
+    .filter((preset): preset is ImageSceneTagPreset => Boolean(preset));
+}
+
+function normalizeImageScenePresetNodes(children: unknown, path: string): ImageSceneTagPresetNode[] {
+  if (!Array.isArray(children)) {
+    return [];
+  }
+
+  return children
+    .map((child, index) => normalizeImageScenePresetNode(child, index, path))
+    .filter((preset): preset is ImageSceneTagPresetNode => Boolean(preset));
+}
+
+function normalizeImageScenePresetNode(candidate: unknown, index: number, path: string): ImageSceneTagPresetNode | undefined {
+  if (!candidate || typeof candidate !== "object") {
+    return undefined;
+  }
+
+  const preset = candidate as Partial<ImageSceneTagPresetNode>;
+  const keyword = typeof preset.keyword === "string" ? preset.keyword.trim() : "";
+  const tags = Array.isArray(preset.tags)
+    ? preset.tags.map((tag) => String(tag).trim()).filter(Boolean)
+    : [];
+  const note = typeof preset.note === "string" ? preset.note.trim() : "";
+  const children = normalizeImageScenePresetNodes(preset.children, `${path}_${index + 1}`);
+  if (!keyword && tags.length === 0 && !note && children.length === 0) {
+    return undefined;
+  }
+
+  return {
+    id: typeof preset.id === "string" && preset.id.trim() ? preset.id : `${path}_${index + 1}`,
+    keyword: keyword || `scene-${index + 1}`,
+    tags,
+    note,
+    enabled: preset.enabled !== false,
+    priority: Number.isFinite(preset.priority) ? Math.min(120, Math.max(0, Number(preset.priority))) : 70,
+    updatedAt: preset.updatedAt ?? now,
+    children
+  };
+}
+
 function normalizeImageJobs(jobs: AppState["imageJobs"] | undefined): AppState["imageJobs"] {
   return (jobs ?? []).map((job) => ({
     ...job,
@@ -1284,6 +1465,7 @@ export interface SimulationDraft {
   expressionPrompts?: Record<string, string>;
   realtimeImageEnabled: boolean;
   characters: SimulationCharacterDraft[];
+  imageScenePresets: ImageSceneTagPreset[];
   modules: PromptModule[];
   imageProfile: ImageGenerationProfile;
   neuralMap: NeuralMapSettings;
@@ -1326,6 +1508,40 @@ function createDefaultEvaluationScenarios(simulationId: string): EvaluationScena
       createdAt
     }
   ];
+}
+
+function normalizeDraftImageScenePresetNodes(
+  nodes: ImageSceneTagPresetNode[] | undefined,
+  updatedAt: string,
+  seenIds = new Set<string>(),
+  path = "child"
+): ImageSceneTagPresetNode[] {
+  return (nodes ?? []).map((node, index) => ({
+    ...node,
+    id: reserveImageScenePresetId(
+      node.id && !node.id.startsWith("draft_") ? node.id : undefined,
+      `scene_preset_child_${path}_${index + 1}`,
+      seenIds
+    ),
+    keyword: node.keyword.trim() || `scene-${index + 1}`,
+    tags: node.tags.map((tag) => tag.trim()).filter(Boolean),
+    note: node.note.trim(),
+    enabled: node.enabled,
+    priority: Math.min(120, Math.max(0, Number(node.priority) || 70)),
+    updatedAt,
+    children: normalizeDraftImageScenePresetNodes(node.children, updatedAt, seenIds, `${path}_${index + 1}`)
+  }));
+}
+
+function reserveImageScenePresetId(candidateId: string | undefined, fallbackPrefix: string, seenIds: Set<string>): string {
+  let id = candidateId?.trim() || `${fallbackPrefix}_${Date.now().toString(36)}`;
+  let suffix = 1;
+  while (seenIds.has(id)) {
+    id = `${fallbackPrefix}_${Date.now().toString(36)}_${suffix}`;
+    suffix += 1;
+  }
+  seenIds.add(id);
+  return id;
 }
 
 export function createStateFromDraft(draft: SimulationDraft): AppState {
@@ -1472,6 +1688,23 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
     simulationId,
     safetyLevel: draft.contentRating === "adult_19" ? "explicit" : draft.imageProfile.safetyLevel
   };
+  const scenePresetSeenIds = new Set<string>();
+  const imageScenePresets: ImageSceneTagPreset[] = (draft.imageScenePresets ?? []).map((preset, index) => ({
+    ...preset,
+    id: reserveImageScenePresetId(
+      preset.id && !preset.id.startsWith("draft_") ? preset.id : undefined,
+      `scene_preset_${index + 1}`,
+      scenePresetSeenIds
+    ),
+    simulationId,
+    keyword: preset.keyword.trim() || `scene-${index + 1}`,
+    tags: preset.tags.map((tag) => tag.trim()).filter(Boolean),
+    note: preset.note.trim(),
+    enabled: preset.enabled,
+    priority: Math.min(120, Math.max(0, Number(preset.priority) || 70)),
+    updatedAt: createdAt,
+    children: normalizeDraftImageScenePresetNodes(preset.children, createdAt, scenePresetSeenIds, `${index + 1}`)
+  }));
 
   return hydrateState({
     ...seedState,
@@ -1482,6 +1715,7 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
     modules,
     characters,
     visualProfiles,
+    imageScenePresets,
     imageProfile,
     userPersona: {
       ...defaultUserPersona,

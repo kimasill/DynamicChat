@@ -3,6 +3,9 @@ import type { AppState, Character, ChatMessage, Id } from "../types";
 interface SceneCastState {
   characters: Character[];
   messages: ChatMessage[];
+  imageAssets?: AppState["imageAssets"];
+  imageJobs?: AppState["imageJobs"];
+  turnTraces?: AppState["turnTraces"];
   userPersona?: AppState["userPersona"];
 }
 
@@ -19,19 +22,27 @@ export function inferCurrentSceneCharacterIds(
   options: InferSceneCastOptions = {}
 ): Id[] {
   const recentMessageLimit = options.recentMessageLimit ?? DEFAULT_RECENT_MESSAGE_LIMIT;
+  const recentMessages = state.messages.slice(-recentMessageLimit);
   const text = [
-    currentText,
-    ...state.messages.slice(-recentMessageLimit).map((message) => message.content)
+    sanitizeSceneCastEvidenceText(currentText),
+    ...recentMessages.map((message) => sanitizeSceneCastEvidenceText(message.content))
   ].join("\n");
+  const currentTextMentionedIds = state.characters
+    .filter((character) => characterIsReferencedInText(character, sanitizeSceneCastEvidenceText(currentText)))
+    .map((character) => character.id);
   const mentionedIds = state.characters
     .filter((character) => characterIsReferencedInText(character, text))
     .map((character) => character.id);
   const personaCharacterId =
     options.includePersonaCharacter === false ? undefined : resolvePersonaCharacterId(state);
+  const imageContinuityIds = shouldUseImageCastContinuity(currentText, currentTextMentionedIds)
+    ? collectRecentImageCharacterIds(state, recentMessages)
+    : [];
 
   return uniqueStrings([
     ...(personaCharacterId ? [personaCharacterId] : []),
-    ...mentionedIds
+    ...mentionedIds,
+    ...imageContinuityIds
   ]);
 }
 
@@ -72,6 +83,59 @@ function resolvePersonaCharacterId(state: SceneCastState): Id | undefined {
     : undefined;
 }
 
+function collectRecentImageCharacterIds(state: SceneCastState, recentMessages: ChatMessage[]): Id[] {
+  const validCharacterIds = new Set(state.characters.map((character) => character.id));
+  const recentMessageIds = new Set(recentMessages.map((message) => message.id));
+  const recentImageAssetIds = new Set(recentMessages.flatMap((message) => message.imageAssetIds ?? []));
+  const characterIds: Id[] = [];
+
+  for (const trace of state.turnTraces ?? []) {
+    if (recentMessageIds.has(trace.userMessageId) || recentMessageIds.has(trace.assistantMessageId)) {
+      characterIds.push(...trace.imageCue.characters);
+      trace.imageAssetIds.forEach((assetId) => recentImageAssetIds.add(assetId));
+    }
+  }
+
+  for (const job of state.imageJobs ?? []) {
+    if (!recentMessageIds.has(job.turnId)) {
+      continue;
+    }
+
+    characterIds.push(...readImageJobCueCharacterIds(job.providerPayload));
+    job.assetIds.forEach((assetId) => recentImageAssetIds.add(assetId));
+  }
+
+  for (const asset of state.imageAssets ?? []) {
+    if (recentImageAssetIds.has(asset.id)) {
+      characterIds.push(...asset.characterIds);
+    }
+  }
+
+  return uniqueStrings(characterIds.filter((characterId) => validCharacterIds.has(characterId)));
+}
+
+function readImageJobCueCharacterIds(payload: Record<string, unknown> | undefined): Id[] {
+  const cue = payload?.cue;
+  if (!cue || typeof cue !== "object" || Array.isArray(cue)) {
+    return [];
+  }
+
+  const characters = (cue as Record<string, unknown>).characters;
+  return Array.isArray(characters)
+    ? characters.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+    : [];
+}
+
+function shouldUseImageCastContinuity(currentText: string, currentTextMentionedIds: Id[]): boolean {
+  if (currentTextMentionedIds.length === 0) {
+    return true;
+  }
+
+  return !/(?:장면\s*전환|다음\s*날|다음날|며칠\s*뒤|몇\s*시간\s*뒤|한편|다른\s*곳|새(?:로운)?\s*장면|scene\s*change|cut\s*to|meanwhile)/iu.test(
+    currentText
+  );
+}
+
 function containsSceneCastTerm(text: string, term: string): boolean {
   const normalizedText = text.toLowerCase();
   const normalizedTerm = term.trim().toLowerCase();
@@ -85,11 +149,39 @@ function containsSceneCastTerm(text: string, term: string): boolean {
     );
   }
 
+  if (/^[\u3131-\uD79D]$/u.test(normalizedTerm)) {
+    return new RegExp(
+      `(^|[^\\p{L}\\p{N}_-])${escapeRegExp(normalizedTerm)}(?:은|는|이|가|을|를|와|과|도|만|에|로|의)?($|[^\\p{L}\\p{N}_-])`,
+      "iu"
+    ).test(normalizedText);
+  }
+
   return normalizedText.includes(normalizedTerm);
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function sanitizeSceneCastEvidenceText(text: string): string {
+  return text
+    .replace(/```(?:status|stats?|relationship|relationships|memory|neuralmap|context|hud|choice)\b[\s\S]*?```/giu, "\n")
+    .split(/\r?\n/u)
+    .filter((line) => !looksLikeReferenceOnlySceneCastLine(line))
+    .join("\n");
+}
+
+function looksLikeReferenceOnlySceneCastLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  return (
+    /^::(?:status|memory|choice)\[/iu.test(trimmed) ||
+    /^(?:[-*]\s*)?(?:관계도|관계\/상태|상태창|상태\s*요약|캐릭터\s*상태|NeuralMap|Relationship(?:\s+Map)?|Status(?:\s+Window)?|HUD)\s*[:：-]/iu.test(trimmed) ||
+    /^\|.*(?:관계|상태|캐릭터|인물|Relationship|Status|Character).*\|$/iu.test(trimmed)
+  );
 }
 
 function uniqueStrings(values: string[]): string[] {

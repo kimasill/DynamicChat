@@ -1,6 +1,8 @@
 node_modules/
 dist/
-.dynamicchat-data/
 .external/
 .env
 .env.*
+
+# Local runtime data — simulations, sessions, generated images, API secrets, backups
+.dynamicchat-data/

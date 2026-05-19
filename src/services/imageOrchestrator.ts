@@ -1,9 +1,9 @@
 import { createId } from "../lib/id";
 import type {
   AppState,
-  CharacterVisualProfile,
   ImageAsset,
   ImageCue,
+  ImageCueCharacterPrompt,
   ImageGenerationProfile,
   ImageGenerationJob,
   PromptModule
@@ -14,10 +14,6 @@ import {
   createImageUserRulesForContentRating,
   isAdultContentMode
 } from "./contentRating";
-import {
-  createCurrentCharacterImageStatePrompt,
-  createCurrentSceneImageStateTags
-} from "./imageStateTags";
 
 interface ImagePolicyResult {
   allowed: boolean;
@@ -41,6 +37,7 @@ interface ImagePromptPlan {
   positiveTags: string[];
   negativeTags: string[];
   layers: ImagePromptLayers;
+  characterPrompts: ImageCueCharacterPrompt[];
   userRuleInstructions: string[];
 }
 
@@ -127,7 +124,7 @@ export function planImageJob(
   manual = false,
   options: { count?: number } = {}
 ): ImageGenerationJob {
-  const scopedCue = normalizeImageCueCharacterScope(state, cue);
+  const scopedCue = cue;
   const promptPlan = createImagePromptPlan(state, scopedCue);
   const imageUserRules = createImageUserRulesForContentRating(state);
   const prompt = promptPlan.prompt;
@@ -163,6 +160,7 @@ export function planImageJob(
     userRuleInstructions: promptPlan.userRuleInstructions,
     promptFormat: "novelai-tags",
     promptLayers: promptPlan.layers,
+    characterPrompts: promptPlan.characterPrompts,
     positiveTags: promptPlan.positiveTags,
     negativeTags: promptPlan.negativeTags,
     reuseTags,
@@ -173,6 +171,8 @@ export function planImageJob(
       cue: {
         scene: variant.cue.scene,
         tags: variant.cue.tags,
+        baseTags: variant.cue.baseTags,
+        characterPrompts: variant.cue.characterPrompts,
         visualContext: variant.cue.visualContext,
         characters: variant.cue.characters
       }
@@ -182,6 +182,8 @@ export function planImageJob(
       shouldGenerate: scopedCue.shouldGenerate,
       scene: scopedCue.scene,
       tags: scopedCue.tags,
+      baseTags: scopedCue.baseTags,
+      characterPrompts: promptPlan.characterPrompts,
       characters: scopedCue.characters,
       visualContext: scopedCue.visualContext,
       suppressionReason: scopedCue.suppressionReason
@@ -210,7 +212,7 @@ export function planImageJob(
 
 function resolveImageGenerationCooldownTurns(profile: ImageGenerationProfile): number {
   const baseCooldown = Number.isFinite(profile.cooldownTurns) ? Math.max(0, Math.round(profile.cooldownTurns)) : 0;
-  if (profile.generationCadence === "rich" || profile.generationCadence === "paragraph") {
+  if (profile.generationCadence === "rich" || profile.generationCadence === "paragraph" || profile.generationCadence === "image_progression") {
     return 0;
   }
   if (profile.generationCadence === "sparse") {
@@ -246,6 +248,7 @@ function createImagePromptVariants(state: AppState, promptPlan: ImagePromptPlan,
     const variantCue: ImageCue = {
       ...cue,
       tags: uniqueStrings([...cue.tags, ...variant.tags]),
+      baseTags: cue.baseTags ? uniqueStrings([...cue.baseTags, ...variant.tags]) : undefined,
       visualContext: uniqueStrings([cue.visualContext, variant.visualContext].filter((item): item is string => Boolean(item))).join(", ")
     };
 
@@ -259,114 +262,13 @@ function createImagePromptVariants(state: AppState, promptPlan: ImagePromptPlan,
 }
 
 function createContextVariantLayers(cue: ImageCue): Array<{ label: string; visualContext: string; tags: string[] }> {
-  const cueText = createCueText(cue);
-  const variants: Array<{ label: string; visualContext: string; tags: string[] }> = [
+  return [
     {
       label: "llm-cue",
       visualContext: cue.visualContext ?? "",
       tags: []
     }
   ];
-
-  if (hasFaceVariantSignal(cueText)) {
-    variants.push({
-      label: "expression-closeup",
-      visualContext: "close-up, face focus",
-      tags: ["close-up", "face focus"]
-    });
-  }
-
-  if (hasBodyDetailVariantSignal(cueText)) {
-    const bodyFocusTags = selectBodyDetailVariantTags(cueText);
-    variants.push({
-      label: "body-action-detail",
-      visualContext: bodyFocusTags.join(", "),
-      tags: bodyFocusTags
-    });
-  }
-
-  if (hasActionVariantSignal(cueText) || cue.characters.length > 0) {
-    variants.push({
-      label: "character-action",
-      visualContext: "cowboy shot",
-      tags: ["cowboy shot"]
-    });
-  }
-
-  if (hasEnvironmentVariantSignal(cueText)) {
-    variants.push({
-      label: "establishing-view",
-      visualContext: "wide shot",
-      tags: ["wide shot"]
-    });
-  }
-
-  if (hasActionVariantSignal(cueText)) {
-    variants.push({
-      label: "side-action",
-      visualContext: "from side",
-      tags: ["from side"]
-    });
-  }
-
-  variants.push({
-    label: "upper-body",
-    visualContext: "upper body",
-    tags: ["upper body"]
-  });
-
-  const seen = new Set<string>();
-  return variants.filter((variant) => {
-    const key = variant.tags.join(",");
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
-}
-
-function hasFaceVariantSignal(text: string): boolean {
-  return /\b(?:face|face focus|expression|open mouth|closed mouth|speaking|talking|dialogue|smile|evil smile|crying|tears?|tearing|blush|sweat|worried|tense|nervous|surprised|angry|sad|leering)\b/iu.test(
-    text
-  );
-}
-
-function hasBodyDetailVariantSignal(text: string): boolean {
-  return /\b(?:hand|hands|arm|wrist|chest|breast|thigh|leg|feet|foot|body focus|grabbing|holding|touching|hand on|wrist grab)\b/iu.test(
-    text
-  );
-}
-
-function selectBodyDetailVariantTags(text: string): string[] {
-  if (/\b(?:hand|hands|wrist|holding|grabbing|touching|hand on|wrist grab)\b/iu.test(text)) {
-    return ["close-up", "hands"];
-  }
-  if (/\b(?:arm)\b/iu.test(text)) {
-    return ["close-up", "arm focus"];
-  }
-  if (/\b(?:chest|breast)\b/iu.test(text)) {
-    return ["close-up", "chest focus"];
-  }
-  if (/\b(?:thigh|leg)\b/iu.test(text)) {
-    return ["close-up", "thigh focus"];
-  }
-  if (/\b(?:feet|foot)\b/iu.test(text)) {
-    return ["close-up", "feet focus"];
-  }
-  return ["close-up", "body focus"];
-}
-
-function hasActionVariantSignal(text: string): boolean {
-  return /\b(?:standing|sitting|lying|kneeling|crouching|walking|running|leaning|bending|reaching|holding|grabbing|touching|hugging|kissing|fighting|dancing|pointing|arm up|hand up|wrist grab)\b/iu.test(
-    text
-  );
-}
-
-function hasEnvironmentVariantSignal(text: string): boolean {
-  return /\b(?:classroom|indoors|outdoors|stage|stage lights|practice room|dance studio|library|archive|bookshelf|hallway|street|room|bedroom|apartment|kitchen|cafe|restaurant|hospital|laboratory|forest|beach|battlefield|rain|snow|night|daylight)\b/iu.test(
-    text
-  );
 }
 
 function readPromptVariants(job: ImageGenerationJob, fallbackCue: ImageCue, count: number): ImagePromptVariant[] {
@@ -392,6 +294,10 @@ function readPromptVariants(job: ImageGenerationJob, fallbackCue: ImageCue, coun
           ...fallbackCue,
           scene: typeof cueValue.scene === "string" ? cueValue.scene : fallbackCue.scene,
           tags: Array.isArray(cueValue.tags) ? cueValue.tags.filter((tag): tag is string => typeof tag === "string") : fallbackCue.tags,
+          baseTags: Array.isArray(cueValue.baseTags) ? cueValue.baseTags.filter((tag): tag is string => typeof tag === "string") : fallbackCue.baseTags,
+          characterPrompts: Array.isArray(cueValue.characterPrompts)
+            ? cueValue.characterPrompts.filter((prompt): prompt is ImageCueCharacterPrompt => isImageCueCharacterPrompt(prompt))
+            : fallbackCue.characterPrompts,
           characters: Array.isArray(cueValue.characters) ? cueValue.characters.filter((character): character is string => typeof character === "string") : fallbackCue.characters,
           visualContext: typeof cueValue.visualContext === "string" ? cueValue.visualContext : fallbackCue.visualContext
         }
@@ -407,7 +313,7 @@ export async function executeImageJob(
   state: AppState,
   job: ImageGenerationJob,
   options: {
-    onProgress?: (progress: ImageJobProgressResult) => void;
+    onProgress?: (progress: ImageJobProgressResult) => void | Promise<void>;
   } = {}
 ): Promise<ImageJobExecutionResult> {
   const policy = job.providerPayload.policy as ImagePolicyResult | undefined;
@@ -447,6 +353,7 @@ export async function executeImageJob(
           cue: variant.cue,
           count: 1
         });
+        assertNovelAiResultHasImages(result.dataUrls, variant.label);
         dataUrls.push(...result.dataUrls.slice(0, 1));
         variantResults.push({
           label: variant.label,
@@ -481,7 +388,7 @@ export async function executeImageJob(
           partialProviderPayload
         );
         progressiveAssets.push(partialAsset);
-        options.onProgress?.({
+        await options.onProgress?.({
           job: {
             ...job,
             status: "generating",
@@ -522,6 +429,7 @@ export async function executeImageJob(
           cue: variant.cue,
           count: 1
         });
+        assertNovelAiResultHasImages(result.dataUrls, `${variant.label}-${requestIndex + 1}`);
         dataUrls.push(...result.dataUrls.slice(0, 1));
         variantResults.push({
           label: `${variant.label}-${requestIndex + 1}`,
@@ -556,7 +464,7 @@ export async function executeImageJob(
           partialProviderPayload
         );
         progressiveAssets.push(partialAsset);
-        options.onProgress?.({
+        await options.onProgress?.({
           job: {
             ...job,
             status: "generating",
@@ -593,6 +501,7 @@ export async function executeImageJob(
         cue,
         count: 1
       });
+      assertNovelAiResultHasImages(result.dataUrls);
       dataUrls = result.dataUrls;
       providerPayload = {
         ...job.providerPayload,
@@ -653,6 +562,12 @@ export async function executeImageJob(
   };
 }
 
+function assertNovelAiResultHasImages(dataUrls: string[], label = "main"): void {
+  if (dataUrls.length === 0) {
+    throw new Error(`NovelAI response contained no image files for ${label}.`);
+  }
+}
+
 async function waitForSequentialNovelAiSlot(state: AppState, requestIndex: number): Promise<void> {
   if (requestIndex <= 0) {
     return;
@@ -672,16 +587,19 @@ function delay(ms: number): Promise<void> {
 }
 
 export function pickStoredAsset(state: AppState, cue: ImageCue): ImageAsset | undefined {
-  const characterMatches = state.imageAssets.filter((asset) => hasReusableCharacterScopeMatch(cue, asset));
-  if (characterMatches.length > 0) {
-    return characterMatches[characterMatches.length - 1];
-  }
+  const targetTags = createReusableTagsFromCue(cue);
+  const candidates = state.imageAssets
+    .filter((asset) => asset.simulationId === state.simulation.id && asset.source === "stored" && asset.feedback?.rating !== "rejected")
+    .map((asset) => scoreStoredImageAsset(asset, cue, targetTags))
+    .filter((match): match is ImageReuseMatch => Boolean(match))
+    .sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return new Date(b.asset.createdAt).getTime() - new Date(a.asset.createdAt).getTime();
+    });
 
-  if (cue.characters.length > 0) {
-    return undefined;
-  }
-
-  return state.imageAssets.find((asset) => cue.tags.some((tag) => asset.tags.includes(tag))) ?? state.imageAssets[0];
+  return candidates[0]?.asset;
 }
 
 export function findReusableImageAsset(
@@ -755,12 +673,11 @@ function scoreReusableImageAsset(asset: ImageAsset, cue: ImageCue, targetTags: s
     return undefined;
   }
 
-  if (!hasReusableCharacterScopeMatch(cue, asset)) {
-    return undefined;
-  }
-
   const targetScene = resolveReusableScene(cue.scene, targetTags);
   const assetScene = resolveReusableScene(readAssetCueScene(asset), assetTags);
+  if (!hasStrictReusableSemanticMatch(asset, cue, targetTags, assetTags)) {
+    return undefined;
+  }
   if (targetScene && assetScene && targetScene !== assetScene) {
     return undefined;
   }
@@ -813,6 +730,60 @@ function scoreReusableImageAsset(asset: ImageAsset, cue: ImageCue, targetTags: s
   };
 }
 
+function scoreStoredImageAsset(asset: ImageAsset, cue: ImageCue, targetTags: string[]): ImageReuseMatch | undefined {
+  const assetTags = getReusableTagsFromAsset(asset);
+  if (assetTags.length === 0) {
+    return undefined;
+  }
+  if (!hasStrictReusableSemanticMatch(asset, cue, targetTags, assetTags)) {
+    return undefined;
+  }
+
+  const targetScene = resolveReusableScene(cue.scene, targetTags);
+  const assetScene = resolveReusableScene(readAssetCueScene(asset), assetTags);
+  if (targetScene && assetScene && targetScene !== assetScene) {
+    return undefined;
+  }
+
+  const assetTagSet = new Set(assetTags);
+  const sharedTags = targetTags.filter((tag) => assetTagSet.has(tag));
+  const sceneMatched = Boolean(targetScene && (assetScene === targetScene || assetTagSet.has(targetScene)));
+  const characterMatched = cue.characters.length > 0 && asset.characterIds.length > 0;
+  if (sharedTags.length === 0 && !sceneMatched && !characterMatched) {
+    return undefined;
+  }
+
+  const denominator = Math.max(1, Math.min(targetTags.length || assetTags.length, assetTags.length));
+  const score = Math.min(
+    1,
+    sharedTags.length / denominator +
+      (sceneMatched ? 0.18 : 0) +
+      (characterMatched ? 0.12 : 0) +
+      (asset.representative ? 0.03 : 0)
+  );
+
+  return {
+    asset,
+    score,
+    sharedTags,
+    targetTags
+  };
+}
+
+function hasStrictReusableSemanticMatch(
+  asset: ImageAsset,
+  cue: ImageCue,
+  targetTags: string[],
+  assetTags: string[]
+): boolean {
+  return (
+    hasReusableCharacterScopeMatch(cue, asset) &&
+    hasReusableSubjectCountMatch(cue, asset, targetTags, assetTags) &&
+    hasReusableCharacterTagMatch(targetTags, assetTags) &&
+    hasReusableActionTagMatch(targetTags, assetTags)
+  );
+}
+
 function hasReusableCharacterScopeMatch(cue: ImageCue, asset: ImageAsset): boolean {
   const targetCharacters = uniqueStrings(cue.characters);
   const assetCharacters = uniqueStrings(asset.characterIds);
@@ -851,6 +822,178 @@ function hasRequiredReusableVisualStateMatch(targetTags: string[], assetTags: st
 
   const assetTagSet = new Set(assetTags);
   return requiredTags.every((tag) => assetTagSet.has(tag));
+}
+
+interface ReusableSubjectCountSignature {
+  total?: number;
+  girls?: number;
+  boys?: number;
+  others?: number;
+  conflict: boolean;
+}
+
+function hasReusableSubjectCountMatch(cue: ImageCue, asset: ImageAsset, targetTags: string[], assetTags: string[]): boolean {
+  const targetSignature = createReusableSubjectCountSignature(targetTags, cue.characters.length);
+  const assetSignature = createReusableSubjectCountSignature(assetTags, asset.characterIds.length);
+  if (targetSignature.conflict || assetSignature.conflict) {
+    return false;
+  }
+
+  const targetHasSubject =
+    targetSignature.total !== undefined || cue.characters.length > 0 || targetTags.some(isHumanSubjectReusableTag);
+  const assetHasSubject =
+    assetSignature.total !== undefined || asset.characterIds.length > 0 || assetTags.some(isHumanSubjectReusableTag);
+  if (!targetHasSubject && !assetHasSubject) {
+    return true;
+  }
+  if (targetSignature.total === undefined || assetSignature.total === undefined) {
+    return false;
+  }
+  if (targetSignature.total !== assetSignature.total) {
+    return false;
+  }
+
+  const targetGenderedCount = (targetSignature.girls ?? 0) + (targetSignature.boys ?? 0) + (targetSignature.others ?? 0);
+  const assetGenderedCount = (assetSignature.girls ?? 0) + (assetSignature.boys ?? 0) + (assetSignature.others ?? 0);
+  if (targetGenderedCount > 0 && assetGenderedCount > 0) {
+    return (
+      (targetSignature.girls ?? 0) === (assetSignature.girls ?? 0) &&
+      (targetSignature.boys ?? 0) === (assetSignature.boys ?? 0) &&
+      (targetSignature.others ?? 0) === (assetSignature.others ?? 0)
+    );
+  }
+
+  return true;
+}
+
+function createReusableSubjectCountSignature(tags: string[], characterCount: number): ReusableSubjectCountSignature {
+  let girls = 0;
+  let boys = 0;
+  let others = 0;
+  let totalFromTags: number | undefined;
+
+  for (const tag of tags) {
+    const normalized = stripNovelAiTagWeight(tag).replace(/\s+/gu, " ").trim();
+    if (/^(?:no humans?|empty scene|background only)$/iu.test(normalized)) {
+      totalFromTags = mergeReusableSubjectTotal(totalFromTags, 0);
+      continue;
+    }
+
+    const counted = normalized.match(/^(\d+)\s*(girls?|boys?|others?|people|persons?|humans?|characters?)$/iu);
+    if (counted) {
+      const count = Number(counted[1]);
+      const kind = counted[2].toLowerCase();
+      if (/^girls?$/u.test(kind)) {
+        girls += count;
+      } else if (/^boys?$/u.test(kind)) {
+        boys += count;
+      } else if (/^others?$/u.test(kind)) {
+        others += count;
+      }
+      totalFromTags = mergeReusableSubjectTotal(totalFromTags, count, true);
+      continue;
+    }
+
+    const namedCount = readNamedReusableSubjectCount(normalized);
+    if (namedCount !== undefined) {
+      totalFromTags = mergeReusableSubjectTotal(totalFromTags, namedCount);
+    }
+  }
+
+  const genderedTotal = girls + boys + others;
+  const resolvedTagTotal = genderedTotal > 0 ? genderedTotal : totalFromTags;
+  const total = resolvedTagTotal ?? (characterCount > 0 ? characterCount : undefined);
+  const conflict =
+    (resolvedTagTotal !== undefined && characterCount > 0 && resolvedTagTotal !== characterCount) ||
+    (totalFromTags !== undefined && genderedTotal > 0 && totalFromTags !== genderedTotal);
+
+  return {
+    total,
+    girls: girls > 0 ? girls : undefined,
+    boys: boys > 0 ? boys : undefined,
+    others: others > 0 ? others : undefined,
+    conflict
+  };
+}
+
+function mergeReusableSubjectTotal(current: number | undefined, next: number, additive = false): number {
+  if (current === undefined) {
+    return next;
+  }
+
+  return additive ? current + next : current;
+}
+
+function readNamedReusableSubjectCount(tag: string): number | undefined {
+  if (/^(?:solo|single person|single character)$/iu.test(tag)) {
+    return 1;
+  }
+  if (/^(?:duo|pair|couple|two people|two characters)$/iu.test(tag)) {
+    return 2;
+  }
+  if (/^(?:trio|three people|three characters)$/iu.test(tag)) {
+    return 3;
+  }
+
+  return undefined;
+}
+
+function hasReusableCharacterTagMatch(targetTags: string[], assetTags: string[]): boolean {
+  const targetCharacterTags = targetTags.filter(isCharacterIdentityReusableTag);
+  if (targetCharacterTags.length === 0) {
+    return true;
+  }
+
+  const assetTagSet = new Set(assetTags);
+  return targetCharacterTags.every((tag) => assetTagSet.has(tag));
+}
+
+function hasReusableActionTagMatch(targetTags: string[], assetTags: string[]): boolean {
+  const targetActionTags = targetTags.filter(isActionReusableTag);
+  const assetActionTags = assetTags.filter(isActionReusableTag);
+  if (targetActionTags.length === 0) {
+    return assetActionTags.length === 0;
+  }
+  if (assetActionTags.length === 0) {
+    return false;
+  }
+
+  return hasSameReusableTagSet(targetActionTags, assetActionTags);
+}
+
+function hasSameReusableTagSet(left: string[], right: string[]): boolean {
+  const uniqueLeft = uniqueStrings(left);
+  const uniqueRight = uniqueStrings(right);
+  if (uniqueLeft.length !== uniqueRight.length) {
+    return false;
+  }
+
+  const rightSet = new Set(uniqueRight);
+  return uniqueLeft.every((tag) => rightSet.has(tag));
+}
+
+function isHumanSubjectReusableTag(tag: string): boolean {
+  return (
+    /^(?:solo|duo|pair|couple|trio|group|crowd|multiple girls?|multiple boys?|multiple people|no humans?|empty scene|background only|\d+\s*(?:girls?|boys?|others?|people|persons?|humans?|characters?))$/iu.test(
+      tag
+    ) ||
+    isCharacterIdentityReusableTag(tag) ||
+    isClothingStateReusableTag(tag) ||
+    isExpressionOrConditionReusableTag(tag) ||
+    isActionReusableTag(tag)
+  );
+}
+
+function isCharacterIdentityReusableTag(tag: string): boolean {
+  return /\b(?:hair|eyes?|twintails|twin tails|ponytail|braid|drill hair|bob cut|bangs|ahoge|glasses|freckles|scar|beauty mark|mole|horns?|tail|animal ears?|cat ears?|fox ears?|elf ears?|wings?|halo|skin|complexion|tattoo|makeup|fangs?)\b/iu.test(
+    tag
+  );
+}
+
+function isActionReusableTag(tag: string): boolean {
+  return isPoseOrActionReusableTag(tag) || /\b(?:holding|grabbing|touching|hugging|kissing|pointing|wrist grab|hand on|hands on|holding hands|holding notebook|holding key|holding phone|holding microphone|holding book|holding weapon|reaching out|taking|pushing|pulling|opening|closing|writing|reading|eating|drinking|playing instrument|singing|microphone|book|phone|weapon|sword|gun)\b/iu.test(
+    tag
+  );
 }
 
 function getReusableTagsFromAsset(asset: ImageAsset): string[] {
@@ -940,26 +1083,19 @@ function isCameraStateReusableTag(tag: string): boolean {
 }
 
 function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan {
-  const scopedCue = normalizeImageCueCharacterScope(state, cue);
+  const scopedCue = cue;
   const profile = state.imageProfile;
   const imageUserRules = createImageUserRulesForContentRating(state);
-  const visualProfiles = getVisualProfiles(state, scopedCue);
-  const usesNovelAiV4CharacterCaptions = state.novelAi.modelPreset !== "NAID3";
   const imageProfileModules = getImagePromptProfileModules(state);
-  const visualPrompts = visualProfiles.map((visualProfile) => {
-    const expression = selectExpressionPrompt(visualProfile, scopedCue);
-    const outfit = selectOutfitPrompt(state, visualProfile, scopedCue);
-    const currentImageState = createCurrentCharacterImageStatePrompt(state, visualProfile.characterId);
-    return [visualProfile.positivePrompt, outfit, expression, currentImageState].filter(Boolean).join(", ");
-  });
   const qualityTags = splitPromptField(profile.qualityPrompt);
   const styleTags = splitPromptField(profile.stylePrompt);
   const artistTags = splitPromptField(profile.artistPrompt);
   const rawImageProfileTags = splitPromptTagGroups(imageProfileModules.map((module) => module.body));
-  const characterTags = splitPromptTagGroups(visualPrompts);
-  const contextTags = uniqueStrings([...createContextTags(scopedCue), ...createCurrentSceneImageStateTags(state)]);
+  const characterPrompts = createCueCharacterPrompts(state, scopedCue);
+  const contextTags = createContextTags(state, scopedCue, characterPrompts.length > 0);
+  const characterPromptTags = uniqueStrings(characterPrompts.flatMap((prompt) => promptToTags(prompt.prompt)));
   const imageProfileTags = {
-    positive: filterImageProfileTagsForCue(rawImageProfileTags.positive, contextTags),
+    positive: rawImageProfileTags.positive,
     negative: rawImageProfileTags.negative
   };
   const userRuleTags = splitUserRuleTagDirectives(imageUserRules);
@@ -969,15 +1105,14 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
     style: styleTags.positive,
     artist: artistTags.positive,
     imageProfiles: imageProfileTags.positive,
-    characters: characterTags.positive,
+    characters: characterPromptTags,
     context: contextTags,
     userRules: userRuleTags.positive
   };
   const generatedCandidates = uniqueStrings([
     ...layers.imageProfiles,
     ...layers.context,
-    ...layers.userRules,
-    ...(usesNovelAiV4CharacterCaptions ? [] : layers.characters)
+    ...layers.userRules
   ]);
   const positiveCandidates = uniqueStrings([
     ...layers.artist,
@@ -993,15 +1128,11 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
   const generatedTags = orderNovelAiPositiveTags(
     state,
     scopedCue,
-    filterRosterNameTags(
-      state,
-      uniqueStrings(
-        applyUserRulePositiveConstraints(
-          generatedCandidates
-            .filter((tag) => isSubjectTagAllowedForCue(scopedCue, tag))
-            .filter((tag) => isNovelAiWeightedTag(tag) || !shouldRouteToNegativePrompt(tag)),
-          imageUserRules
-        )
+    uniqueStrings(
+      applyUserRulePositiveConstraints(
+        generatedCandidates
+          .filter((tag) => isNovelAiWeightedTag(tag) || !shouldRouteToNegativePrompt(tag)),
+        imageUserRules
       )
     )
   );
@@ -1016,11 +1147,9 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
     ...styleTags.negative,
     ...artistTags.negative,
     ...imageProfileTags.negative,
-    ...(usesNovelAiV4CharacterCaptions ? [] : characterTags.negative),
     ...userRuleTags.negative,
     ...reroutedNegativeTags,
-    ...promptToTags(profile.negativePrompt),
-    ...(usesNovelAiV4CharacterCaptions ? [] : visualProfiles.flatMap((visualProfile) => promptToTags(visualProfile.negativePrompt)))
+    ...promptToTags(profile.negativePrompt)
   ].map(normalizeNegativePromptTag)).filter((tag) => tag && !positiveTags.includes(tag));
 
   return {
@@ -1029,6 +1158,7 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
     positiveTags,
     negativeTags,
     layers,
+    characterPrompts,
     userRuleInstructions
   };
 }
@@ -1057,471 +1187,83 @@ function splitPromptField(value: string | undefined): PromptTagSplit {
   };
 }
 
-function getVisualProfiles(state: AppState, cue: ImageCue): CharacterVisualProfile[] {
-  return state.visualProfiles.filter((profile) => cue.characters.includes(profile.characterId));
-}
-
-function normalizeImageCueCharacterScope(state: AppState, cue: ImageCue): ImageCue {
-  if (cue.characters.length === 0) {
-    return cue;
-  }
-
-  const cueText = createCueText(cue);
-  const mentionedCharacterIds = findCueMentionedCharacterIds(state, cueText);
-  if (shouldDropCharactersForExternalCue(state, cue.characters, cueText)) {
-    return { ...cue, characters: [] };
-  }
-
-  if (mentionedCharacterIds.length > 0) {
-    const mentioned = new Set(mentionedCharacterIds);
-    const characters = cue.characters.filter((characterId) => mentioned.has(characterId));
-    return characters.length === cue.characters.length ? cue : { ...cue, characters };
-  }
-
-  if (hasFullRosterSelectionWithoutGroupEvidence(state, cue.characters, cueText)) {
-    return { ...cue, characters: [] };
-  }
-
-  if (hasSoloOrExternalSubjectCue(cueText)) {
-    return { ...cue, characters: [] };
-  }
-
-  return cue;
-}
-
-function shouldDropCharactersForExternalCue(state: AppState, characterIds: string[], cueText: string): boolean {
-  if (
-    !(
-      hasUnnamedExternalActorFocus(cueText) ||
-      hasClearUnnamedOutsiderImageFocus(cueText) ||
-      hasUnregisteredSoloSubjectCue(cueText)
-    )
-  ) {
-    return false;
-  }
-
-  return !hasResolvedCharacterActorEvidence(state, uniqueStrings(characterIds), cueText);
-}
-
-function findCueMentionedCharacterIds(state: AppState, cueText: string): string[] {
-  const normalizedText = cueText.toLowerCase();
-  return uniqueStrings(
-    state.characters
-      .filter((character) => {
-        const name = character.name.toLowerCase().trim();
-        return Boolean(name && normalizedText.includes(name));
-      })
-      .map((character) => character.id)
-  );
-}
-
-function hasSoloOrExternalSubjectCue(cueText: string): boolean {
-  return /혼자|홀로|단독|1인칭|일인칭|놈|녀석|사내|남자|남성|남학생|남자애|소년|낯선\s*(?:사람|인물)|모르는\s*(?:사람|인물|남자)|다른\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독|\b(?:solo|alone|single subject|first[-\s]?person|pov|1boy|guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)\b/iu.test(cueText);
-}
-
-function hasUnregisteredSoloSubjectCue(cueText: string): boolean {
-  const normalized = cueText.replace(/\s+/gu, " ");
-  const soloSubject = "(?:혼자|홀로|단독|single subject|solo|alone)";
-  const externalSubject = "(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|낯선\\s*(?:사람|인물)|모르는\\s*(?:사람|인물|남자)|다른\\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독|1인칭|일인칭|first[-\\s]?person|pov|1boy|guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)";
-  return new RegExp(`(?:${soloSubject})[^.\\n]{0,70}(?:${externalSubject})|(?:${externalSubject})[^.\\n]{0,70}(?:${soloSubject})`, "iu").test(normalized);
-}
-
-function hasClearUnnamedOutsiderImageFocus(text: string): boolean {
-  return /무명|이름\s*없는|낯선|처음\s*보는|외부인|다른\s*(?:사람|인물)|모르는\s*(?:사람|인물|남자|남성|소년)|선생|교사|직원|스태프|경비|감독|놈|녀석|사내|1인칭|일인칭|first[-\s]?person|pov|unnamed|unknown|stranger|outsider|teacher|staff|guard|director|lone unnamed|solo unnamed/iu.test(text);
-}
-
-function hasUnnamedExternalActorFocus(text: string): boolean {
-  return hasExternalSubjectActingCue(text) || hasFirstPersonAsObjectOfExternalActor(text);
-}
-
-function hasExternalSubjectActingCue(text: string): boolean {
-  const normalized = text.replace(/\s+/gu, " ");
-  const externalSubject = "(?:그\\s*)?(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|낯선\\s*(?:사람|인물)|모르는\\s*(?:사람|인물|남자)|다른\\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독)|(?:guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)";
-  const actorVerb = "(?:웃|미소|말하|말했|말했다|지목|가리키|노려|쳐다|위협|협박|leering|leer|smil|speak|spoke|said|point|threaten)";
-  return new RegExp(`(?:${externalSubject})(?:은|는|이|가|도)?[^.\\n]{0,90}${actorVerb}`, "iu").test(normalized);
-}
-
-function hasFirstPersonAsObjectOfExternalActor(text: string): boolean {
-  const normalized = text.replace(/\s+/gu, " ");
-  const firstPersonObject = "(?:나를|날|나에게|내게|나한테|내\\s*쪽으로|toward\\s+me|at\\s+me)";
-  const externalSubject = "(?:그\\s*)?(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|낯선\\s*(?:사람|인물)|모르는\\s*(?:사람|인물|남자)|다른\\s*(?:사람|인물)|선생|교사|직원|스태프|경비|감독)|(?:guy|boy|man|male|stranger|outsider|teacher|staff|guard|director)";
-  const action = "(?:지목|가리키|노려|쳐다|위협|협박|비웃|웃|미소|말하|말했|말했다|point|stare|look|threaten|speak|spoke|said|smil|leer)";
-  return new RegExp(`${firstPersonObject}[^.\\n]{0,90}(?:${action})?[^.\\n]{0,90}(?:${externalSubject})`, "iu").test(normalized);
-}
-
-function hasFullRosterSelectionWithoutGroupEvidence(state: AppState, characterIds: string[], cueText: string): boolean {
-  if (state.characters.length < 3 || characterIds.length < state.characters.length) {
-    return false;
-  }
-
-  if (/(?:전원|모두|다 같이|함께|세\s*명|네\s*명|전체|all|everyone|together|full cast|group shot|\b3girls\b|\b3boys\b)/iu.test(cueText)) {
-    return false;
-  }
-
-  const mentionedIds = new Set(findCueMentionedCharacterIds(state, cueText));
-  return mentionedIds.size < characterIds.length;
-}
-
-function hasResolvedCharacterActorEvidence(state: AppState, characterIds: string[], text: string): boolean {
-  const actionPattern = /웃|미소|말하|말했|말했다|지목|가리키|노려|쳐다|위협|협박|leering|leer|smil|speak|spoke|said|point|threaten/iu;
-  return characterIds.some((characterId) => {
-    const character = state.characters.find((candidate) => candidate.id === characterId);
-    const name = character?.name.trim();
-    if (!name) {
-      return false;
-    }
-
-    const index = text.toLowerCase().indexOf(name.toLowerCase());
-    if (index < 0) {
-      return false;
-    }
-
-    const segment = text.slice(index, index + 120);
-    return actionPattern.test(segment) && !/(?:놈|녀석|사내|남자애|남학생|남자|남성|소년|\b(?:guy|boy|man|male)\b)/iu.test(segment.replace(name, ""));
-  });
-}
-
-function isSubjectTagAllowedForCue(cue: ImageCue, tag: string): boolean {
-  void cue;
-  void tag;
-  return true;
-}
-
 function getImagePromptProfileModules(state: AppState): PromptModule[] {
   return state.modules.filter(
     (module) => module.enabled && module.kind === "image_prompt_profile" && module.tokenPolicy !== "disabled"
   );
 }
 
-function selectOutfitPrompt(state: AppState, profile: CharacterVisualProfile, cue: ImageCue): string | undefined {
-  const currentOutfit = selectCurrentOutfitPrompt(state, profile.characterId, profile.outfitPrompts);
-  if (currentOutfit) {
-    return currentOutfit;
+function createCueCharacterPrompts(state: AppState, cue: ImageCue): ImageCueCharacterPrompt[] {
+  const explicitPrompts = (cue.characterPrompts ?? [])
+    .map((prompt, index) => normalizeCueCharacterPrompt(prompt, index))
+    .filter((prompt): prompt is ImageCueCharacterPrompt => Boolean(prompt));
+  const legacyCharacterTags = uniqueStrings(cue.tags.flatMap((tag) => promptToTags(tag)).filter(isCharacterPromptTag));
+  if (explicitPrompts.length > 0) {
+    return explicitPrompts.map((prompt, index) => ({
+      ...prompt,
+      prompt: uniqueStrings([...promptToTags(prompt.prompt), ...(index === 0 ? legacyCharacterTags : [])]).join(", ")
+    }));
   }
 
-  const mappedOutfit = selectMappedOutfitPrompt(profile.outfitPrompts, cue);
-  if (mappedOutfit) {
-    return mappedOutfit;
+  if (legacyCharacterTags.length === 0) {
+    return [];
   }
 
-  const explicitOutfit = extractExplicitOutfitPrompt(cue);
-  if (explicitOutfit) {
-    return explicitOutfit;
-  }
-
-  const dynamicOutfit = inferDynamicOutfitPrompt(cue);
-  if (dynamicOutfit) {
-    return dynamicOutfit;
-  }
-
-  return normalizeOutfitPrompt(profile.defaultOutfitPrompt);
-}
-
-function selectExpressionPrompt(_profile: CharacterVisualProfile, cue: ImageCue): string | undefined {
-  return inferDynamicExpressionPrompt(cue);
-}
-
-function selectMappedOutfitPrompt(outfitPrompts: Record<string, string> | undefined, cue: ImageCue): string | undefined {
-  const cueText = createOutfitCueText(cue);
-  const rawCueText = normalizeOutfitKeywordText([cue.scene, cue.visualContext, cue.tags.join(" ")].filter(Boolean).join(" "));
-  if (hasSchoolOutfitCue(rawCueText)) {
-    const schoolPrompt = Object.entries(outfitPrompts ?? {}).find(([key]) => isSchoolOutfitKeyword(key))?.[1];
-    const normalizedSchoolPrompt = normalizeOutfitPrompt(schoolPrompt);
-    if (normalizedSchoolPrompt) {
-      return normalizedSchoolPrompt;
-    }
-  }
-  const matches = Object.entries(outfitPrompts ?? {})
-    .map(([key, value], index) => {
-      const prompt = normalizeOutfitPrompt(value);
-      if (!prompt) {
-        return undefined;
-      }
-
-      const score = scoreOutfitKeywordMatch(key, cueText);
-      return score > 0 ? { prompt, score, index } : undefined;
-    })
-    .filter((match): match is { prompt: string; score: number; index: number } => Boolean(match))
-    .sort((a, b) => b.score - a.score || a.index - b.index)
-    .slice(0, 2)
-    .map((match) => match.prompt);
-
-  if (matches.length === 0 && hasSchoolOutfitCue(cueText)) {
-    const schoolPrompt = Object.entries(outfitPrompts ?? {}).find(([key]) => isSchoolOutfitKeyword(key))?.[1];
-    const normalizedSchoolPrompt = normalizeOutfitPrompt(schoolPrompt);
-    if (normalizedSchoolPrompt) {
-      return normalizedSchoolPrompt;
-    }
-  }
-
-  return matches.length > 0 ? uniqueStrings(matches.flatMap((prompt) => promptToTags(prompt))).slice(0, 8).join(", ") : undefined;
-}
-
-function scoreOutfitKeywordMatch(key: string, cueText: string): number {
-  const directScore = scoreTranslatedOutfitKeywordMatch(key, cueText);
-  if (directScore > 0) {
-    return directScore;
-  }
-
-  return key
-    .split(/[,;\/|]+/u)
-    .map((phrase) => phrase.trim())
-    .filter(Boolean)
-    .filter((phrase) => !/^(?:default|기본|base|fallback)$/iu.test(phrase))
-    .reduce((score, phrase) => {
-      const alias = createOutfitKeywordAliases(phrase).find((candidate) => cueText.includes(candidate));
-      return alias ? Math.max(score, 1 + Math.min(3, alias.length / 8)) : score;
-    }, 0);
-}
-
-function scoreTranslatedOutfitKeywordMatch(key: string, cueText: string): number {
-  if (isSchoolOutfitKeyword(key) && hasSchoolOutfitCue(cueText)) {
-    return 3;
-  }
-  const rules: Array<{ pattern: RegExp; cuePattern: RegExp; score: number }> = [
-    { pattern: /학교|교복/u, cuePattern: /\b(?:school|classroom)\b|school uniform/u, score: 3 },
-    { pattern: /연습|훈련|댄스/u, cuePattern: /\b(?:practice room|training|dance studio|workout)\b/u, score: 3 },
-    { pattern: /무대|공연|아이돌/u, cuePattern: /\b(?:stage|performance|idol)\b/u, score: 3 },
-    { pattern: /숙소|기숙|방|아파트|오피스텔/u, cuePattern: /\b(?:dormitory|dorm|apartment|room)\b/u, score: 2.6 },
-    { pattern: /비|폭우|우산|우비/u, cuePattern: /\b(?:rain|rainy|storm|umbrella|raincoat)\b/u, score: 2.8 },
-    { pattern: /겨울|눈|추운/u, cuePattern: /\b(?:winter|snow|cold)\b/u, score: 2.8 },
-    { pattern: /전투|싸움|갑옷/u, cuePattern: /\b(?:battle|fight|combat|armor)\b/u, score: 2.8 },
-    { pattern: /무도회|파티|정장|드레스/u, cuePattern: /\b(?:ball|party|formal|dress|suit)\b/u, score: 2.8 },
-    { pattern: /실험실|연구실/u, cuePattern: /\b(?:lab|laboratory)\b/u, score: 2.7 },
-    { pattern: /병원|진료/u, cuePattern: /\b(?:hospital|clinic)\b/u, score: 2.7 },
-    { pattern: /카페|거리|외출/u, cuePattern: /\b(?:cafe|street|outing)\b/u, score: 2.4 }
-  ];
-  return rules.find((rule) => rule.pattern.test(key) && rule.cuePattern.test(cueText))?.score ?? 0;
-}
-
-function createOutfitKeywordAliases(phrase: string): string[] {
-  const normalizedPhrase = normalizeOutfitKeywordText(phrase);
-  return normalizedPhrase ? [normalizedPhrase] : [];
-}
-
-function hasSchoolOutfitCue(value: string): boolean {
-  return /\b(?:school|classroom|student)\b|학교|교복|교실/u.test(value.normalize("NFC"));
-}
-
-function isSchoolOutfitKeyword(key: string): boolean {
-  return /\b(?:school|classroom|student)\b|학교|교복|교실/iu.test(normalizeOutfitKeywordText(key));
-}
-
-function createOutfitCueText(cue: ImageCue): string {
-  return normalizeOutfitKeywordText([cue.scene, cue.visualContext, cue.tags.join(" ")].filter(Boolean).join(" "));
-}
-
-function normalizeOutfitKeywordText(value: string): string {
-  return value
-    .normalize("NFC")
-    .toLowerCase()
-    .replace(/[._-]+/gu, " ")
-    .replace(/[^\p{L}\p{N} ]+/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-}
-
-function selectCurrentOutfitPrompt(state: AppState, characterId: string, outfitPrompts?: Record<string, string>): string | undefined {
-  const currentOutfit = state.memoryEvents
-    .slice()
-    .reverse()
-    .find((event) => {
-      const metadata = event.metadata ?? {};
-      const kind = readMetadataString(metadata, "memory_kind") ?? event.tags.find((tag) => tag.startsWith("kind:"))?.slice("kind:".length);
-      const stateType = readMetadataString(metadata, "state_type") ?? readStateTypeFromTags(event.tags);
-      const ownerId = readMetadataString(metadata, "owner_id") ?? event.actorId;
-      return (
-        kind === "state" &&
-        ownerId === characterId &&
-        Boolean(stateType && /^(?:Wearing|OutfitTags)$/iu.test(stateType))
-      );
-    });
-
-  if (!currentOutfit) {
-    return undefined;
-  }
-
-  const currentText = readMetadataString(currentOutfit.metadata, "value") ?? currentOutfit.content;
-  const mappedCurrentOutfit = selectMappedOutfitPrompt(outfitPrompts, {
-    shouldGenerate: true,
-    reason: "current character outfit",
-    characters: [characterId],
-    tags: [],
-    scene: currentText,
-    visualContext: currentText
-  });
-
-  return mappedCurrentOutfit ?? normalizeOutfitPrompt(currentText);
-}
-
-function readStateTypeFromTags(tags: string[]): string | undefined {
-  const stateTag = tags.find((tag) => tag.startsWith("state:"));
-  return stateTag?.slice("state:".length);
-}
-
-function readMetadataString(metadata: Record<string, unknown> | undefined, key: string): string | undefined {
-  const value = metadata?.[key];
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function normalizeOutfitPrompt(value: string | undefined): string | undefined {
-  const tags = promptToTags(cleanOutfitPromptText(value));
-  return tags.length > 0 ? tags.slice(0, 8).join(", ") : undefined;
-}
-
-function cleanOutfitPromptText(value: string | undefined): string | undefined {
-  const stripped = value
-    ?.replace(/^\[(?:State|Event|Observation|Belief|OpenThread|Goal)\]\s*/u, "")
-    .trim();
-  if (!stripped) {
-    return undefined;
-  }
-
-  const explicitValue = stripped.match(/(?:Wearing|OutfitTags|착용|의상\s*태그|outfit tags?)\s*[=:：]\s*(.+)$/iu)?.[1]?.trim();
-  return explicitValue || stripped;
-}
-
-function extractExplicitOutfitPrompt(cue: ImageCue): string | undefined {
-  const rawContext = [cue.visualContext, cue.scene, cue.tags.join(", ")].filter(Boolean).join(" ");
-  const match = rawContext.match(
-    /(?:wearing|dressed in|outfit|clothing|costume|attire)[:\s]+([^.;\n]{3,90})/iu
-  ) ?? rawContext.match(/(?:의상|복장|옷차림)[:：\s]+([^.\n]{2,90})/u);
-  const value = match?.[1]?.trim();
-  if (!value) {
-    return undefined;
-  }
-  const tags = promptToTags(value);
-  return tags.length > 0 ? tags.slice(0, 5).join(", ") : undefined;
-}
-
-function inferDynamicOutfitPrompt(cue: ImageCue): string | undefined {
-  const context = createCueText(cue);
-  const rules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /교복|학교|교실|\b(?:school|classroom|student)\b/iu, tags: ["school uniform"] },
-    { pattern: /연습실|댄스|훈련|\b(?:practice room|dance studio|training|workout)\b/iu, tags: ["training clothes", "sneakers"] },
-    { pattern: /무대|공연|아이돌|\b(?:stage|performance|idol)\b/iu, tags: ["idol stage outfit"] },
-    { pattern: /전투|싸움|갑옷|\b(?:battle|fight|combat|armor)\b/iu, tags: ["combat outfit"] },
-    { pattern: /비|폭우|우산|우비|\b(?:rain|rainy|storm|umbrella|raincoat)\b/iu, tags: ["raincoat"] },
-    { pattern: /겨울|눈|추운|\b(?:winter|snow|cold)\b/iu, tags: ["winter coat", "scarf"] },
-    { pattern: /무도회|파티|정장|드레스|\b(?:ball|party|formal|dress|suit)\b/iu, tags: ["formal outfit"] },
-    { pattern: /실험실|연구실|\b(?:lab|laboratory)\b/iu, tags: ["lab coat"] },
-    { pattern: /병원|진료|\b(?:hospital|clinic)\b/iu, tags: ["medical coat"] },
-    { pattern: /카페|거리|외출|\b(?:cafe|street|outing)\b/iu, tags: ["casual outfit"] },
-    { pattern: /숙소|기숙|방|아파트|오피스텔|\b(?:dorm|apartment|bedroom|room)\b/iu, tags: ["casual clothes"] },
-    { pattern: /잠옷|취침|침대|\b(?:pajamas|sleepwear|bed)\b/iu, tags: ["pajamas"] }
-  ];
-  const tags = uniqueStrings(rules.flatMap((rule) => (rule.pattern.test(context) ? rule.tags : [])));
-  return tags.length > 0 ? tags.slice(0, 6).join(", ") : undefined;
-}
-
-function inferDynamicExpressionPrompt(cue: ImageCue): string | undefined {
-  const context = createCueText(cue);
-  const rules: Array<{ pattern: RegExp; prompt: string }> = [
-    { pattern: /relieved|smile|happy|joy|안도|웃|기쁨|행복/u, prompt: "soft smile" },
-    { pattern: /tense|worried|anxious|fear|갈등|불안|걱정|긴장/u, prompt: "tense expression" },
-    { pattern: /cry|teary|tear|울|눈물/u, prompt: "teary eyes" },
-    { pattern: /angry|upset|분노|화남|짜증/u, prompt: "frustrated expression" },
-    { pattern: /surprise|shock|놀람|당황/u, prompt: "surprised expression" }
-  ];
-  return rules.find((rule) => rule.pattern.test(context))?.prompt ?? undefined;
-}
-
-function createContextTags(cue: ImageCue): string[] {
-  return uniqueStrings([
-    ...contextTextToTags(cue.scene),
-    ...cue.tags.flatMap((tag) => contextTextToTags(tag)),
-    ...contextTextToTags(cue.visualContext)
-  ]).filter((tag) => !shouldRouteToNegativePrompt(tag));
-}
-
-function filterImageProfileTagsForCue(tags: string[], contextTags: string[]): string[] {
-  const activeEnvironmentGroups = uniqueStrings(contextTags.flatMap((tag) => {
-    const group = getEnvironmentTagGroup(tag);
-    return group ? [group] : [];
+  const characterIds = cue.characters.length > 0 ? cue.characters : [undefined];
+  return characterIds.map((characterId, index) => ({
+    characterId,
+    prompt: legacyCharacterTags.join(", "),
+    center: createDefaultCharacterCenter(index, characterIds.length)
   }));
-  if (activeEnvironmentGroups.length === 0) {
-    return tags;
-  }
-
-  const activeGroups = new Set(activeEnvironmentGroups);
-  return tags.filter((tag) => {
-    const group = getEnvironmentTagGroup(tag);
-    return !group || activeGroups.has(group);
-  });
 }
 
-function getEnvironmentTagGroup(tag: string): string | undefined {
+function normalizeCueCharacterPrompt(prompt: ImageCueCharacterPrompt, index: number): ImageCueCharacterPrompt | undefined {
+  const tags = promptToTags(prompt.prompt);
+  if (tags.length === 0) {
+    return undefined;
+  }
+
+  return {
+    characterId: prompt.characterId,
+    prompt: tags.join(", "),
+    negativePrompt: prompt.negativePrompt ? promptToTags(prompt.negativePrompt).join(", ") : undefined,
+    center: prompt.center ?? createDefaultCharacterCenter(index, 1)
+  };
+}
+
+function createDefaultCharacterCenter(index: number, total: number): { x: number; y: number } {
+  return {
+    x: total <= 1 ? 0.5 : (index + 1) / (total + 1),
+    y: 0.5
+  };
+}
+
+function createContextTags(state: AppState, cue: ImageCue, hasCharacterPrompts = false): string[] {
+  void state;
+  const baseSource = cue.baseTags && cue.baseTags.length > 0 ? cue.baseTags : cue.tags;
+  return uniqueStrings(baseSource.flatMap((tag) => promptToTags(tag)))
+    .filter((tag) => !shouldRouteToNegativePrompt(tag))
+    .filter((tag) => !hasCharacterPrompts || !isCharacterPromptTag(tag));
+}
+
+function isCharacterPromptTag(tag: string): boolean {
   const normalized = stripNovelAiTagWeight(tag).replace(/[._-]+/gu, " ").trim();
-  if (/\b(?:archive library|library|bookshelf|archive)\b/iu.test(normalized)) {
-    return "library";
-  }
-  if (/\b(?:classroom|school desk|chalkboard|blackboard)\b/iu.test(normalized)) {
-    return "classroom";
-  }
-  if (/\b(?:stage|stage lights|spotlight|performance)\b/iu.test(normalized)) {
-    return "stage";
-  }
-  if (/\b(?:street|alley|road|outdoors)\b/iu.test(normalized)) {
-    return "street";
-  }
-  if (/\b(?:practice room|dance studio)\b/iu.test(normalized)) {
-    return "practice";
-  }
-  if (/\b(?:bedroom|room|dormitory|apartment)\b/iu.test(normalized)) {
-    return "room";
-  }
-  if (/\b(?:kitchen)\b/iu.test(normalized)) {
-    return "kitchen";
-  }
-  if (/\b(?:cafe|restaurant)\b/iu.test(normalized)) {
-    return "cafe";
-  }
-  if (/\b(?:hospital|clinic)\b/iu.test(normalized)) {
-    return "hospital";
-  }
-  if (/\b(?:lab|laboratory)\b/iu.test(normalized)) {
-    return "laboratory";
-  }
-  if (/\b(?:forest|woods)\b/iu.test(normalized)) {
-    return "forest";
-  }
-  if (/\b(?:beach)\b/iu.test(normalized)) {
-    return "beach";
-  }
-  if (/\b(?:battlefield)\b/iu.test(normalized)) {
-    return "battlefield";
-  }
-  return undefined;
-}
-
-function filterRosterNameTags(state: AppState, tags: string[]): string[] {
-  const rosterTagNames = new Set(
-    state.characters.flatMap((character) => [
-      normalizeRosterTag(character.id),
-      normalizeRosterTag(character.name)
-    ])
+  return (
+    isCharacterIdentityReusableTag(normalized) ||
+    isPoseCharacterPromptTag(normalized) ||
+    isBodyFocusCharacterPromptTag(normalized) ||
+    isExpressionOrConditionReusableTag(normalized) ||
+    isClothingStateReusableTag(normalized) ||
+    /\b(?:wearing|outfit|expression|face focus|body focus|eyes?|mouth|smile|crying|blush|sweat)\b/iu.test(normalized)
   );
-  return tags.filter((tag) => !containsRosterNameTag(rosterTagNames, stripNovelAiTagWeight(tag)));
 }
 
-function normalizeRosterTag(value: string): string {
-  return value.toLowerCase().replace(/[._\s]+/gu, "-").trim();
+function isPoseCharacterPromptTag(tag: string): boolean {
+  return /^(?:standing|sitting|lying|kneeling|crouching|leaning|bending|arm up|arms up|hand up|hands up|spread legs|legs apart|thighs apart|crossed arms|hands on hips|looking back)$/iu.test(tag);
 }
 
-function containsRosterNameTag(rosterTagNames: Set<string>, value: string): boolean {
-  const normalized = normalizeRosterTag(value);
-  if (rosterTagNames.has(normalized)) {
-    return true;
-  }
-
-  const parts = new Set(normalized.split(/-+/u).filter(Boolean));
-  return [...rosterTagNames].some((name) => {
-    if (!name) {
-      return false;
-    }
-    const nameParts = name.split(/-+/u).filter(Boolean);
-    return nameParts.length > 0 && nameParts.every((part) => parts.has(part));
-  });
+function isBodyFocusCharacterPromptTag(tag: string): boolean {
+  return /^(?:face focus|body focus|chest focus|breast focus|thigh focus|leg focus|feet focus|arm focus|back focus|pov hands)$/iu.test(tag);
 }
 
 function filterContextConditionedTagsForCue(tags: string[], cue: ImageCue): string[] {
@@ -1679,109 +1421,8 @@ function normalizePromptTag(value: string): string | undefined {
 }
 
 function normalizePromptTagParts(value: string): string[] {
-  const expanded = expandPromptTagAlias(value);
-  if (expanded) {
-    return expanded.flatMap((part) => {
-      const normalized = normalizePromptTag(part);
-      return normalized ? [normalized] : [];
-    });
-  }
-
   const normalized = normalizePromptTag(value);
   return normalized ? [normalized] : [];
-}
-
-function expandPromptTagAlias(value: string): string[] | undefined {
-  const normalized = value
-    .trim()
-    .replace(/[.!?。！？]+$/gu, "")
-    .replace(/[._-]+/gu, " ")
-    .replace(/[^\p{L}\p{N}: ]+/gu, " ")
-    .replace(/\s+/gu, " ")
-    .toLowerCase();
-  if (!normalized || /[\u3131-\uD79D]/u.test(normalized)) {
-    return undefined;
-  }
-
-  const expressionMatch = normalized.match(/^(worried|tense|nervous|surprised|frustrated|angry|sad|happy|confident|defiant|evil)\s+expression$/u);
-  if (expressionMatch?.[1]) {
-    return expressionMatch[1] === "happy" ? ["smile"] : [expressionMatch[1]];
-  }
-
-  const directRules: Array<{ pattern: RegExp; tags: string[] }> = [
-    { pattern: /^(?:standing up from (?:her |his |their )?(?:seat|chair)|standing up)$/u, tags: ["standing", "chair"] },
-    { pattern: /^(?:getting up|getting up from (?:a |the )?(?:seat|chair))$/u, tags: ["standing", "chair"] },
-    { pattern: /^(?:raising (?:her |his |their )?hand(?: eagerly)?|hand raised|raised hand)$/u, tags: ["arm up", "hand up"] },
-    { pattern: /^raising (?:her |his |their )?arm(?: eagerly)?$/u, tags: ["arm up"] },
-    { pattern: /^bright and confident smile$/u, tags: ["smile", "confident"] },
-    { pattern: /^confident smile$/u, tags: ["smile", "confident"] },
-    { pattern: /^classroom setting$/u, tags: ["classroom"] },
-    { pattern: /^school classroom$/u, tags: ["classroom", "indoors"] },
-    { pattern: /^(?:other students?(?: blurred)? in (?:the )?background|students? blurred in (?:the )?background)$/u, tags: ["blurred background"] },
-    { pattern: /^(?:close up face|close face|face close up|character close up)$/u, tags: ["close-up", "face focus"] },
-    { pattern: /^(?:speaking|talking)$/u, tags: ["open mouth"] },
-    { pattern: /^(?:looking forward)$/u, tags: ["looking at viewer"] },
-    { pattern: /^(?:standing pose)$/u, tags: ["standing"] }
-  ];
-  const direct = directRules.find((rule) => rule.pattern.test(normalized));
-  if (direct) {
-    return direct.tags;
-  }
-
-  if (/^(?:filming set|props?|main action|facial expression|visible emotional reaction|situation specific clothing|wide context|clear environment|context appropriate outfit|dynamic pose|current scene|current simulation scene|generated scene|simulation scene|scene)$/u.test(normalized)) {
-    return [];
-  }
-
-  return undefined;
-}
-
-function contextTextToTags(value: string | undefined): string[] {
-  if (!value) {
-    return [];
-  }
-
-  const parts = value
-    .split(/[,;\n|]+/u)
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  return uniqueStrings(
-    parts.flatMap((part) => {
-      return normalizeContextTagParts(part);
-    })
-  );
-}
-
-function normalizeContextTagParts(value: string): string[] {
-  const expanded = normalizePromptTagParts(value);
-  return uniqueStrings(
-    expanded.flatMap((part) => {
-      const normalized = normalizeContextTag(part);
-      return normalized ? [normalized] : [];
-    })
-  );
-}
-
-function normalizeContextTag(value: string): string | undefined {
-  const trimmed = value.trim();
-  if (!trimmed || /[\u3131-\uD79D]/u.test(trimmed)) {
-    return undefined;
-  }
-
-  const normalized = trimmed
-    .replace(/[._-]+/gu, " ")
-    .replace(/[^\p{L}\p{N}: ]+/gu, " ")
-    .replace(/\s+/gu, " ")
-    .trim();
-  if (!normalized) {
-    return undefined;
-  }
-  const lower = normalized.toLowerCase();
-  if (["current scene", "current simulation scene", "generated scene", "simulation scene"].includes(lower)) {
-    return undefined;
-  }
-
-  return normalized.toLowerCase();
 }
 
 function isStaleContextSceneTag(tag: string): boolean {
@@ -1855,7 +1496,7 @@ function orderNovelAiPositiveTags(state: AppState, cue: ImageCue, tags: string[]
   void state;
   void cue;
   const candidates = uniqueStrings(tags.flatMap((tag) => normalizePromptTagParts(tag)));
-  const filtered = candidates.filter((tag) => !shouldDropContradictoryPromptTag(tag, candidates));
+  const filtered = candidates;
   const datasetTags = filtered.filter(isNovelAiDatasetTag);
   const artistTags = filtered.filter(isArtistPromptTag);
   const qualityTags = filtered.filter(isNovelAiQualityOrAestheticTag);
@@ -1908,42 +1549,24 @@ function getNovelAiPositiveTagRank(tag: string): number {
   return 7;
 }
 
-function shouldDropContradictoryPromptTag(tag: string, candidates: string[]): boolean {
-  const normalized = stripNovelAiTagWeight(tag);
-  const candidateText = candidates.map(stripNovelAiTagWeight).join(", ");
-  const hasIndoorAnchor = /\b(?:classroom|indoors|school desk|chalkboard|blackboard|bedroom|room|hallway|library|archive|bookshelf|hospital|clinic|lab|laboratory|dormitory|apartment|kitchen|cafe|restaurant)\b/iu.test(candidateText);
-  const hasOutdoorAnchor = /\b(?:outdoors|street|alley|forest|beach|battlefield)\b/iu.test(candidateText);
-  if (hasIndoorAnchor && /\b(?:outdoors|street|alley|forest|beach|battlefield)\b/iu.test(normalized)) {
-    return true;
-  }
-  if (!hasIndoorAnchor && hasOutdoorAnchor && /\b(?:indoors|classroom|school desk|chalkboard|blackboard|bedroom|room|hallway|library|archive|bookshelf|hospital|clinic|lab|laboratory|dormitory|apartment|kitchen)\b/iu.test(normalized)) {
-    return true;
-  }
-  return false;
-}
-
 function stripNovelAiTagWeight(tag: string): string {
   return parseNovelAiWeightedTag(tag)?.tag.toLowerCase().trim() ?? tag.toLowerCase().trim();
-}
-
-function deriveTagsFromText(value: string | undefined): string[] {
-  void value;
-  return [];
 }
 
 function createReusableImageTags(cue: ImageCue, promptPlan: ImagePromptPlan, promptVariants: ImagePromptVariant[]): string[] {
   void promptVariants;
   return uniqueReusableTags([
     ...createReusableTagsFromCue(cue),
-    ...promptPlan.layers.context
+    ...promptPlan.layers.context,
+    ...promptPlan.layers.characters
   ]);
 }
 
 function createReusableTagsFromCue(cue: ImageCue): string[] {
   return filterContextConditionedTagsForCue(uniqueReusableTags([
     ...cue.tags,
-    ...contextTextToTags(cue.scene),
-    ...contextTextToTags(cue.visualContext)
+    ...(cue.baseTags ?? []),
+    ...(cue.characterPrompts ?? []).flatMap((prompt) => prompt.prompt.split(","))
   ]), cue);
 }
 
@@ -1955,6 +1578,7 @@ function readReusableTagsFromPromptLayers(value: unknown): string[] {
   const layers = value as Partial<ImagePromptLayers>;
   return uniqueReusableTags([
     ...readStringArray(layers.context),
+    ...readStringArray(layers.characters),
     ...readStringArray(layers.userRules)
   ]);
 }
@@ -1967,13 +1591,23 @@ function readCueReusableTags(value: unknown): string[] {
   const cue = value as Partial<ImageCue>;
   return uniqueReusableTags([
     ...readStringArray(cue.tags),
-    ...contextTextToTags(typeof cue.scene === "string" ? cue.scene : undefined),
-    ...contextTextToTags(typeof cue.visualContext === "string" ? cue.visualContext : undefined)
+    ...readStringArray(cue.baseTags),
+    ...(Array.isArray(cue.characterPrompts) ? cue.characterPrompts.flatMap((prompt) => prompt.prompt.split(",")) : [])
   ]);
 }
 
 function readStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+}
+
+function isImageCueCharacterPrompt(value: unknown): value is ImageCueCharacterPrompt {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      typeof (value as ImageCueCharacterPrompt).prompt === "string" &&
+      (value as ImageCueCharacterPrompt).prompt.trim()
+  );
 }
 
 function uniqueReusableTags(values: string[]): string[] {
@@ -2022,10 +1656,6 @@ function isGenericReusableTag(tag: string): boolean {
 
 function isArtistPromptTag(tag: string): boolean {
   return /\bartist(?::|_|\s)|\b(?:by|style of)\s+[a-z0-9_()-]+/iu.test(stripNovelAiTagWeight(tag));
-}
-
-function createCueText(cue: ImageCue): string {
-  return [cue.scene, cue.tags.join(" "), cue.visualContext].filter(Boolean).join(" ").toLowerCase();
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -2114,6 +1744,8 @@ function cueFromJob(job: ImageGenerationJob): ImageCue {
     reason: job.reason,
     characters: Array.isArray(cue?.characters) ? cue.characters : [],
     tags: Array.isArray(cue?.tags) ? cue.tags : [],
+    baseTags: Array.isArray(cue?.baseTags) ? cue.baseTags : undefined,
+    characterPrompts: Array.isArray(cue?.characterPrompts) ? cue.characterPrompts.filter(isImageCueCharacterPrompt) : undefined,
     scene: typeof cue?.scene === "string" ? cue.scene : "generated scene",
     suppressionReason: typeof cue?.suppressionReason === "string" ? cue.suppressionReason : undefined,
     visualContext: typeof cue?.visualContext === "string" ? cue.visualContext : undefined

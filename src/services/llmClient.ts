@@ -4795,10 +4795,12 @@ function createRecentTranscriptBlock(state: AppState): string {
         isLatestAssistant ? "tail" : "balanced"
       );
       const roleLabel = isLatestAssistant ? `${message.role} (latest ending)` : message.role;
-      return content ? `${roleLabel}: ${content}` : "";
+      return content ? `${roleLabel}:\n${content}` : "";
     })
     .filter(Boolean)
-    .join("\n");
+    // Excerpts keep their own paragraph breaks now, so messages need a blank line between them to stay
+    // distinguishable from a paragraph break inside one message.
+    .join("\n\n");
 }
 
 function findLatestMessageByRole(state: AppState, role: AppState["messages"][number]["role"]): AppState["messages"][number] | undefined {
@@ -4811,8 +4813,20 @@ function findLatestUsableAssistantMessage(state: AppState): AppState["messages"]
     .find((message) => message.role === "assistant" && !looksLikeProviderBoilerplateText(message.content));
 }
 
+// Collapse only horizontal whitespace. Paragraph breaks must survive: the recent transcript is the model's
+// single strongest exemplar of how this simulation's prose reads, and flattening it to one line teaches the
+// model that the register is an unbroken pile of short sentences — which it then reproduces, no matter what
+// the creator's Main rules or the paragraph-formatting instruction say. Few-shot beats instruction.
+function normalizeContinuityWhitespace(value: string): string {
+  return value
+    .replace(/[^\S\n]+/gu, " ")
+    .replace(/[^\S\n]*\n[^\S\n]*/gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+}
+
 function createContinuityExcerpt(value: string, maxChars: number, mode: "balanced" | "tail"): string {
-  const normalized = value.replace(/\s+/gu, " ").trim();
+  const normalized = normalizeContinuityWhitespace(value);
   if (normalized.length <= maxChars) {
     return normalized;
   }

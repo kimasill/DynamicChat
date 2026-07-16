@@ -1,5 +1,5 @@
 import { createId } from "../lib/id";
-import type { AppState, ContextPack, MemoryEvent, NeuralMapSettings, SessionHandoff } from "../types";
+import type { AppState, ContextPack, MemoryEvent, NeuralMapSettings, PromptModule, SessionHandoff } from "../types";
 import {
   SIMULATION_MEMORY_PROFILE_ID,
   createMemoryGraphNeuronId,
@@ -7,6 +7,7 @@ import {
   type MemoryDelta,
   type MemoryDeltaRecord
 } from "./memoryCompiler";
+import { createDefaultProgressRunId } from "./progressRuns";
 import { inferCurrentSceneCharacterIds } from "./sceneCast";
 import { createScopeMetadata } from "./security";
 
@@ -492,6 +493,37 @@ export class NeuralMapClient {
     }
   }
 
+  // Ingest RAG-eligible prompt-tree modules (sub_prompt / scene_rule) as graph documents so /context/compose
+  // can surface them by SEMANTIC similarity — not just by literal keyword. Without this, a sub-prompt only
+  // activates when its keyword appears verbatim in the turn, which pushes creators to bloat the main prompt.
+  // Idempotent upsert keyed by module.id; no-op when NeuralMap is disabled.
+  async syncPromptModuleDocuments(state: AppState, moduleIds?: ReadonlySet<string>): Promise<number> {
+    if (!this.settings.enabled) {
+      return 0;
+    }
+
+    const targets = state.modules.filter(
+      (module) => isSemanticRetrievalModule(module) && (!moduleIds || moduleIds.has(module.id))
+    );
+    if (targets.length === 0) {
+      return 0;
+    }
+
+    const results = await Promise.all(
+      targets.map((module) =>
+        this.upsertGraphDocument(state, {
+          id: module.id,
+          title: module.title,
+          body: `${module.title}\n\n${module.body}`.trim(),
+          kind: "dynamicchat_prompt_module",
+          tags: module.activationTags,
+          importance: Math.min(1, Math.max(0, module.priority / 100))
+        })
+      )
+    );
+    return results.filter(Boolean).length;
+  }
+
   async createHandoff(state: AppState, nextSessionId: string, handoffEvent: MemoryEvent): Promise<SessionHandoff> {
     if (!this.settings.enabled) {
       return createLocalSessionHandoff(state, nextSessionId, handoffEvent);
@@ -676,7 +708,7 @@ function createGraphActorRef(state: AppState, id: string, name?: string): GraphA
   const localId = character?.id ?? id;
   const actorName = character?.name ?? name ?? id;
   return {
-    nodeId: `simulation:${graphIdPart(state.simulation.id)}:person:${graphIdPart(localId)}`,
+    nodeId: `${createRunScopedSimNamespace(state)}:person:${graphIdPart(localId)}`,
     localId,
     name: actorName
   };
@@ -727,13 +759,22 @@ function createCharacterNeuron(state: AppState, actor: GraphActorRef): NeuralMap
       name: actor.name,
       local_character_id: actor.localId,
       simulation_id: state.simulation.id,
-      session_id: state.simulation.activeSessionId
+      session_id: state.simulation.activeSessionId,
+      // Run scope on parity with scene/memory neurons. Without this a character node carried no run/progress
+      // marker, so a copied simulation that reuses a character name could not be distinguished from the source
+      // by run-level scope checks (and an external entity resolver had no per-run discriminator to keep them apart).
+      progress_run_id: state.activeProgressRunId,
+      run_id: state.activeProgressRunId
     },
     metadata: {
       ...createScopeMetadata(state),
       agent_id: createNeuralMapAgentId(state),
       source: "dynamicchat",
       kind: "simulation_character",
+      simulation_id: state.simulation.id,
+      session_id: state.simulation.activeSessionId,
+      progress_run_id: state.activeProgressRunId,
+      run_id: state.activeProgressRunId,
       graph_profile_id: SIMULATION_MEMORY_PROFILE_ID
     }
   };
@@ -1419,7 +1460,7 @@ function getRecordObserverRefs(
 }
 
 function createSceneNodeId(state: AppState, sceneId: string): string {
-  return `simulation:${graphIdPart(state.simulation.id)}:${sceneId.split(":").map(graphIdPart).join(":")}`;
+  return `${createRunScopedSimNamespace(state)}:${sceneId.split(":").map(graphIdPart).join(":")}`;
 }
 
 function uniqueNeurons(neurons: NeuralMapGraphDeltaNeuron[]): NeuralMapGraphDeltaNeuron[] {
@@ -1460,9 +1501,20 @@ function createNeuralMapScope(state: AppState): NeuralMapScope {
   return {
     tenant_id: scope.ownerId,
     workspace_id: scope.workspaceId,
-    project_id: scope.projectId,
+    project_id: `${scope.projectId}::run:${createNeuralMapRunSlug(state)}`,
     owner_scope: scope.ownerId
   };
+}
+
+// 각 progress_run(진행)을 독립된 NeuralMap scope/그래프로 격리하기 위한 run 식별자.
+// 세션 초기화는 activeProgressRunId를 유지하므로 같은 run = 같은 scope(연속성 유지),
+// 새 진행은 새 activeProgressRunId = 새 scope(완전 격리)가 된다.
+function createNeuralMapRunSlug(state: AppState): string {
+  return graphIdPart(state.activeProgressRunId || createDefaultProgressRunId(state.simulation.activeSessionId));
+}
+
+function createRunScopedSimNamespace(state: AppState): string {
+  return `simulation:${graphIdPart(state.simulation.id)}:run:${createNeuralMapRunSlug(state)}`;
 }
 
 function createNeuralMapAgentId(state: AppState): string {
@@ -2050,6 +2102,20 @@ function matchesPrivatePromptText(state: AppState, title: string, summary: strin
   });
 }
 
+// RAG sub-prompts and scene rules benefit from semantic retrieval; foundation modules (main/world/always)
+// are injected every turn anyway and never need to be "found".
+export function isSemanticRetrievalModule(module: PromptModule): boolean {
+  if (!module.enabled || module.tokenPolicy === "disabled" || module.tokenPolicy === "always") {
+    return false;
+  }
+  return module.kind === "sub_prompt" || module.kind === "scene_rule";
+}
+
+// Stable per-module content fingerprint so callers can skip re-ingesting unchanged modules.
+export function createPromptModuleSyncSignature(module: PromptModule): string {
+  return `${module.id}:${module.title.length}:${module.body.length}:${module.activationTags.join(",")}:${module.priority}:${module.enabled ? 1 : 0}`;
+}
+
 function looksLikePromptModuleSnippet(snippet: string): boolean {
   return /^\s*(Prompt module:|Prompt module manifest:|\[excerpted long prompt module:)/iu.test(snippet);
 }
@@ -2217,7 +2283,7 @@ function createLocalLiveGraph(state: AppState, error?: string): NeuralMapLiveGra
 }
 
 function createLocalCharacterNodeId(state: AppState, characterId: string): string {
-  return `simulation:${state.simulation.id}:person:${characterId}`;
+  return `${createRunScopedSimNamespace(state)}:person:${graphIdPart(characterId)}`;
 }
 
 function upsertLiveNode(nodes: Map<string, NeuralMapLiveNode>, node: NeuralMapLiveNode): void {

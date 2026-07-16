@@ -154,11 +154,12 @@ async function readSourceChecks() {
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("NovelAI/Danbooru tag conversion rules") &&
+      llmClient.includes("NovelAI V4 prompt split") &&
+        llmClient.includes("one separate entry per character") &&
         llmClient.includes("Image cue ownership: this main response owns final image_cues") &&
         llmClient.includes("Image cue authoring reference") &&
         imageOrchestrator.includes("getNovelAiPositiveTagRank"),
-      "Main simulation LLM has the NAI tag contract, outfit/profile context, and final tag ordering."
+      "Main simulation LLM keeps the structural NAI V4 split contract, ownership, and authoring reference."
     ),
     assertCheck(
       "source.image",
@@ -200,11 +201,26 @@ async function readSourceChecks() {
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("background tags alone are a failure") &&
-        llmClient.includes("emphasize a body part") &&
-        llmClient.includes("characters is metadata for traces/reuse only") &&
-        llmClient.includes("acting exercise, intimidation, abduction, fear"),
-      "Main image cue prompt has strict NAI cue rules for action/body focus, character scoping, and abstract tag rejection."
+      llmClient.includes("example_prompts") &&
+        llmClient.includes("selectScenePresetExampleFiles") &&
+        llmClient.includes("IMAGE_SCENE_PRESET_EXAMPLE_TOTAL") &&
+        llmClient.includes("example_prompts are optional references") &&
+        llmClient.includes("labeled groups") &&
+        seedSource.includes("normalizeScenePresetExampleFiles") &&
+        appSource.includes("scene-tag-preset-example-file") &&
+        appSource.includes("addExampleFile"),
+      "Scene tag keyword presets accept multiple labeled example-prompt files (with .txt import), optional, capped, and sent to the LLM as few-shot references mapped to the matching character."
+    ),
+    assertCheck(
+      "source.image",
+      llmClient.includes("One character_prompt per visible character") &&
+        llmClient.includes("Character identity lock") &&
+        llmClient.includes("DynamicChat injects that character's saved base appearance and current outfit") &&
+        llmClient.includes("follow the image prompt user rules and the situational tag keyword presets") &&
+        !llmClient.includes("NovelAI/Danbooru tag conversion rules") &&
+        !llmClient.includes("Good action tags look like") &&
+        !llmClient.includes("Use this strict tag order for every generated cue"),
+      "Main image cue contract keeps per-character separation, injects saved character appearance/outfit, and defers tag vocabulary to user rules/presets."
     ),
     assertCheck(
       "source.image",
@@ -216,19 +232,17 @@ async function readSourceChecks() {
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("short hair plus long hair") &&
-        llmClient.includes("2girls/3girls") &&
-        llmClient.includes("emotion/voice stack") &&
-        llmClient.includes("Character metadata rule") &&
+      llmClient.includes("2girls/3girls") &&
+        llmClient.includes("Registered vs unregistered characters") &&
         llmClient.includes("Character identity lock") &&
         llmClient.includes("required_identity_tags"),
-      "Main image cue prompt guards subject counts, contradictory appearance tags, emotion stacks, and character metadata."
+      "Main image cue prompt guards subject counts and character identity/metadata scoping."
     ),
     assertCheck(
       "source.image",
       sceneCast.includes("collectRecentImageCharacterIds") &&
         sceneCast.includes("shouldUseImageCastContinuity") &&
-        llmClient.includes("preserve the previous visible image cast") &&
+        llmClient.includes("Character ambiguity rule") &&
         llmClient.includes("latest image/assistant beat"),
       "Image cue character scoping preserves recent visible cast for pronoun-only continuations."
     ),

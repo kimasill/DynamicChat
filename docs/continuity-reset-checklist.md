@@ -7,7 +7,7 @@ harness exists.
 
 1. Start the app.
 2. Optionally start `pnpm api` and set `DynamicChat API` to
-   `http://127.0.0.1:4318`.
+   `http://127.0.0.1:8788`.
 3. Keep NeuralMap disabled for local fallback verification, then repeat with
    NeuralMap enabled when the API is available.
 

@@ -37,14 +37,56 @@ async function startNeuralMapIfNeeded() {
     return;
   }
 
-  const useRepoEnv = process.env.DYNAMICCHAT_NEURALMAP_USE_REPO_ENV === "1";
+  // Default to the NeuralMap repo env so the API connects to its Postgres graph
+  // DB (database mode) and runs precisely. Set DYNAMICCHAT_NEURALMAP_USE_REPO_ENV=0
+  // to force the in-memory sample fallback (no DB required).
+  const useRepoEnv = process.env.DYNAMICCHAT_NEURALMAP_USE_REPO_ENV !== "0";
   const env = { ...process.env };
   if (!useRepoEnv) {
     delete env.DATABASE_URL;
     delete env.NEURALMAP_DATABASE_ROUTES;
   }
 
+  // Under WSL mirrored networking the WSL VM IP (172.16-31.x.x) is unreachable
+  // from Windows -- the Postgres/Redis containers must be reached via localhost.
+  // A stale user-level DATABASE_URL env var can override the repo .env, so
+  // normalize any WSL-VM-IP host to 127.0.0.1 and pin it (static) here.
+  if (useRepoEnv && process.platform === "win32") {
+    const wslIpHost = /@172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+/u;
+    for (const key of ["DATABASE_URL", "REDIS_URL"]) {
+      if (env[key] && wslIpHost.test(env[key])) {
+        env[key] = env[key].replace(wslIpHost, "@127.0.0.1");
+      }
+    }
+    env.NEURALMAP_DATABASE_HOST_SOURCE = "static";
+  }
+
   const pnpm = resolvePnpmInvocation();
+
+  // Hold a WSL session open for the dev session. Without an attached wsl.exe,
+  // WSL2 tears down its network relay seconds after the last session exits,
+  // which silently drops Windows->WSL Postgres connectivity (NeuralMap then
+  // falls back to sample data). This keepalive lives only as long as `pnpm dev`.
+  // Disable with DYNAMICCHAT_WSL_KEEPALIVE=0.
+  if (useRepoEnv && process.platform === "win32" && process.env.DYNAMICCHAT_WSL_KEEPALIVE !== "0") {
+    const distro = process.env.NEURALMAP_WSL_DISTRO ?? "Ubuntu-24.04";
+    registerChild(
+      start("wsl-keepalive", "wsl.exe", ["-d", distro, "--exec", "sleep", "infinity"], { optional: true })
+    );
+  }
+
+  // Best-effort: bring up the NeuralMap Postgres/Redis containers first so the
+  // API has a graph DB to connect to. Non-fatal -- the API degrades gracefully
+  // to local fallback if the DB never comes up. Disable with
+  // DYNAMICCHAT_START_NEURALMAP_INFRA=0.
+  if (useRepoEnv && process.env.DYNAMICCHAT_START_NEURALMAP_INFRA !== "0") {
+    start("neuralmap-infra", pnpm.command, [...pnpm.args, "infra:up"], {
+      cwd: neuralMapRoot,
+      env,
+      optional: true
+    });
+  }
+
   registerChild(
     start(
       "neuralmap",

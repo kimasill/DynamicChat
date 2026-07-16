@@ -1,4 +1,9 @@
 import { createId } from "../lib/id";
+import {
+  MAX_ACTIVE_MODULE_BODY_CHARS,
+  MAX_FOUNDATION_MODULE_BODY_CHARS,
+  promptModuleBodyCharLimit
+} from "../lib/promptLimits";
 import type {
   AppState,
   AssistantImageCueDraft,
@@ -11,6 +16,7 @@ import type {
   ImageGenerationCadence,
   MemoryEvent,
   PromptModule,
+  PromptModuleKind,
   PromptModuleUsage,
   SessionHandoff,
   SidecarTrace,
@@ -19,10 +25,11 @@ import type {
 } from "../types";
 
 import { findReusableImageAsset, pickStoredAsset, planImageJob, shouldPlanImageJob } from "./imageOrchestrator";
-import { generateAssistantText } from "./llmClient";
+import { generateAssistantText, requestTurnAnnotations, sanitizeAssistantNarrative } from "./llmClient";
 import {
   compileSimulationMemoryDelta,
   createStructuredContextSummary,
+  deriveImageCueOverlayEvents,
   memoryDeltaToEvents,
   type MemoryDelta
 } from "./memoryCompiler";
@@ -33,10 +40,30 @@ import { characterIsReferencedInText, getCurrentSceneCharacters, inferCurrentSce
 const IMPORTANT_PATTERN = /기억|약속|관계|갈등|위험|비밀|장소|문제|목표|선택|상태|변화|단서/u;
 const IMAGE_PATTERN =
   /그려|보여|이미지|장면|모습|표정|빛|배경|의상|옷|복장|학교|교실|연습|훈련|무대|숙소|기숙|주방|거리|사무실|카페|병원|전투|여행/u;
-const MAX_ACTIVE_MODULE_BODY_CHARS = 2400;
+// Per-module excerpt budgets (MAX_ACTIVE_MODULE_BODY_CHARS / MAX_FOUNDATION_MODULE_BODY_CHARS / main-prompt)
+// live in ../lib/promptLimits so the simulation builder can display the exact same numbers as "current / max"
+// counters. Foundation modules (main_prompt, world_lore) carry creator law and get much larger budgets than
+// RAG modules, and are only trimmed when extremely long — the excerpt keeps the opening directives plus
+// current-scene-relevant windows. This caps a runaway main prompt (e.g. 성전's 10.5k-char main rule) that was
+// previously injected verbatim every turn and drove LLM latency/timeouts.
+// Total compacted-body budget across the selected NON-foundation modules, so a module-heavy simulation cannot
+// stack 11 large RAG/character modules into one giant prompt. Reserved lore + higher-ranked modules are kept
+// first (selection is already ordered that way); lower-value modules are dropped once the budget is exceeded.
+const MAX_TOTAL_ACTIVE_MODULE_BODY_CHARS = 9000;
 const MODULE_EXCERPT_WINDOW_CHARS = 700;
 const MODULE_EXCERPT_MAX_WINDOWS = 3;
+// Kept at 12 (not raised): the per-kind reservation below fixes "lore crowded out by characters" by
+// reallocating slots within the SAME budget, so prompt size — and therefore LLM latency on module-heavy
+// simulations — does not grow. Topic stickiness also competes within this cap rather than adding to it.
 const MAX_SELECTED_PROMPT_MODULES = 12;
+// A RAG lore/sub module stays retrievable for this many subsequent turns after it was last selected, so an
+// active topic (e.g. a drug, a faction, a location) does not drop out the moment its keyword scrolls out of
+// the retrieval window or the user just types "이어서 진행".
+const STICKY_TOPIC_MODULE_TURNS = 3;
+// Reserved slots so character modules (one per on-stage character) cannot crowd matched lore/sub/scene-rule
+// modules out of the per-turn cap.
+const MIN_RESERVED_LORE_MODULE_SLOTS = 5;
+const STICKY_TOPIC_MODULE_KINDS = new Set<PromptModuleKind>(["sub_prompt", "world_lore", "scene_rule"]);
 const RETRIEVAL_RECENT_MESSAGE_CHARS = 520;
 const RETRIEVAL_LATEST_ASSISTANT_CHARS = 1400;
 const RETRIEVAL_SETTING_MODULE_CHARS = 360;
@@ -46,6 +73,19 @@ const IMAGE_PROGRESSION_CUE_TARGET = 10;
 interface RunSimulationTurnOptions {
   deferImagePlanning?: boolean;
   deferMemoryIngest?: boolean;
+  // Fired after context retrieval + module selection complete and just before the LLM generation call starts,
+  // so the UI can distinguish "retrieving context" time from "LLM generating" time (the latter includes the
+  // image_cues that the field order emits before assistant_text). Carries the measured retrieval latency.
+  onGenerationStart?: (info: { retrievalLatencyMs: number; selectedModuleCount: number }) => void;
+  // Fired as soon as the front-loaded image_cues are parsed from the LLM stream (before the narrative
+  // finishes), carrying the turn context the caller needs to dispatch the image request early.
+  onEarlyImageCues?: (payload: {
+    cues: AssistantImageCueDraft[];
+    userMessage: ChatMessage;
+    assistantMessage: ChatMessage;
+    contextPack: ContextPack;
+    promptModuleUsages: PromptModuleUsage[];
+  }) => void;
   onAssistantText?: (snapshot: {
     userMessage: ChatMessage;
     assistantMessage: ChatMessage;
@@ -115,6 +155,7 @@ export async function runSimulationTurn(
     moduleSelections,
     contextPack.createdAt
   );
+  options.onGenerationStart?.({ retrievalLatencyMs, selectedModuleCount: relevantModules.length });
   const fallbackContent = createAssistantContent(state, userText, relevantModules, contextPack.evidence.map((item) => item.snippet));
   const assistantMessageBase: ChatMessage = {
     id: createId("msg"),
@@ -134,25 +175,50 @@ export async function runSimulationTurn(
     evidence: contextPack.evidence,
     fallback: fallbackContent,
     manualImage,
+    // Image tags are authored by a SEPARATE image-cue LLM call (requestTurnImageCues) after the narrative, so the
+    // narrative model is never polluted by tag rules. No mid-stream early dispatch in this mode.
+    separateImageCues: true,
     onAssistantText: options.onAssistantText
       ? (content) =>
           options.onAssistantText?.({
             userMessage,
             assistantMessage: {
               ...assistantMessageBase,
-              content
+              // Strip any leaked status/relationship panel during streaming too, so it never flashes in the UI.
+              content: sanitizeAssistantNarrative(state, relevantModules, content)
             }
           })
       : undefined
   });
   const llmRequestMs = Date.now() - llmStartedAt;
   const assistantContent = assistantGeneration.content;
+  // The relationship/status panel belongs only in the relationship tab (fed by memory_events). Strip it from the
+  // VISIBLE/stored narrative deterministically — the model keeps emitting it despite prompt instructions. Memory
+  // compilation and image cues below still use the full original assistantContent, so persisted state is unaffected.
+  const displayAssistantContent = sanitizeAssistantNarrative(state, relevantModules, assistantContent);
+
+  // Annotation call: runs after the narrative, extracts state_events (Wearing/pose/scene/relationship-params)
+  // and (when image generation is active) authors image_cues. Runs even when images are off so the
+  // relationship tab and stateMemory stay current. The narrative call has zero tag vocabulary; all state
+  // extraction happens here so the narrative model never enters annotation mode.
+  const annotationResult = await requestTurnAnnotations(state, { userText, assistantText: assistantContent, manualImage });
+
+  // Merge annotation results into the sidecar before memory compilation so both semantic events (from the
+  // narrative) and state events (from the annotation) flow through a single memoryCompiler pass.
+  // image_cues from the annotation call replace the narrative's (empty) imageCues as the authoritative list.
+  const mergedSidecar: AssistantSidecar = {
+    ...assistantGeneration.sidecar,
+    memoryEvents: [...assistantGeneration.sidecar.memoryEvents, ...annotationResult.stateEvents],
+    imageCues: annotationResult.imageCues.length > 0 ? annotationResult.imageCues : assistantGeneration.sidecar.imageCues,
+    imageCue: annotationResult.imageCues[0] ?? assistantGeneration.sidecar.imageCue
+  };
+
   const sidecarTrace = createSidecarTrace(state, userMessage.id, assistantGeneration);
   const compiledMemoryDelta = compileSimulationMemoryDelta({
     state,
     userText,
     assistantText: assistantContent,
-    sidecar: assistantGeneration.sidecar,
+    sidecar: mergedSidecar,
     sourceTurnId: userMessage.id
   });
   const memoryEvents = shouldCurateAssistantMemory(assistantGeneration)
@@ -179,7 +245,7 @@ export async function runSimulationTurn(
   }
   const assistantMessage: ChatMessage = {
     ...assistantMessageBase,
-    content: assistantContent,
+    content: displayAssistantContent,
   };
   const nextStateForImage = {
     ...optimisticState,
@@ -198,7 +264,7 @@ export async function runSimulationTurn(
         assistantMessage,
         contextPack,
         promptModuleUsages,
-        sidecar: assistantGeneration.sidecar,
+        sidecar: mergedSidecar,
         sidecarTrace,
         manualImage
       });
@@ -236,7 +302,8 @@ export async function runSimulationTurn(
       contextPack,
       promptModuleUsages,
       sidecarTrace,
-      sidecar: assistantGeneration.sidecar,
+      sidecar: mergedSidecar,
+      sidecarExpansion: assistantGeneration.sidecarExpansion,
       imageCue,
       turnTrace,
       imageJob: job,
@@ -274,7 +341,12 @@ export async function runSimulationTurn(
     contextPack,
     promptModuleUsages,
     sidecarTrace,
-    sidecar: assistantGeneration.sidecar,
+    // Must be the MERGED sidecar (narrative + annotation), not the narrative-only one. The narrative call runs
+    // with omitImageAuthoring, so assistantGeneration.sidecar.imageCues is always []. With deferImagePlanning
+    // (the App's chat path) no jobs are planned here, so this is the return the caller actually gets — handing
+    // it the narrative sidecar handed the App an empty cue list and no image was ever dispatched.
+    sidecar: mergedSidecar,
+    sidecarExpansion: assistantGeneration.sidecarExpansion,
     imageCue,
     turnTrace,
     imageJobs: jobs,
@@ -359,35 +431,43 @@ export async function planImageJobForCompletedTurn(
   );
   const contextNodeIds = input.contextPack.evidence.map((item) => item.nodeId);
   const reusedAssetIds: string[] = [];
-  const imageJobs = imageCues
-    .map((imageCue, index) => {
-      const draft = drafts[index];
-      if (isImageCueSuppressedForMissingMainLlmTags(imageCue)) {
-        return undefined;
-      }
-      const canForcePlanning = shouldForceImagePlanningFromUserRules(state, draft, imageCue, Boolean(input.manualImage));
-      if (!shouldPlanImageJob(state, imageCue, input.manualImage) && !canForcePlanning) {
-        return undefined;
-      }
+  const imageJobs: ReturnType<typeof planImageJob>[] = [];
+  // Plan cuts in order against a working state that accumulates each earlier cut's established situation/detail state,
+  // so multiple image cuts in one output stay consistent and carry detail changes forward (intra-output continuity).
+  let workingState = state;
+  imageCues.forEach((imageCue, index) => {
+    const draft = drafts[index];
+    if (isImageCueSuppressedForMissingMainLlmTags(imageCue)) {
+      return;
+    }
+    const canForcePlanning = shouldForceImagePlanningFromUserRules(workingState, draft, imageCue, Boolean(input.manualImage));
+    if (!shouldPlanImageJob(workingState, imageCue, input.manualImage) && !canForcePlanning) {
+      return;
+    }
 
-      const plannedJob = addImageCuePlannerMetadata(
-        planImageJob(state, input.assistantMessage.id, imageCue, contextNodeIds, input.manualImage),
-        draft,
-        index,
-        state,
-        input.sidecarTrace
-      );
-      const reuseMatch = input.manualImage
-        ? undefined
-        : findReusableImageAsset(state, plannedJob, { excludeAssetIds: reusedAssetIds });
-      if (reuseMatch) {
-        reusedAssetIds.push(reuseMatch.asset.id);
-        return undefined;
-      }
+    const plannedJob = addImageCuePlannerMetadata(
+      planImageJob(workingState, input.assistantMessage.id, imageCue, contextNodeIds, input.manualImage),
+      draft,
+      index,
+      workingState,
+      input.sidecarTrace
+    );
+    const reuseMatch = input.manualImage
+      ? undefined
+      : findReusableImageAsset(workingState, plannedJob, { excludeAssetIds: reusedAssetIds });
+    if (reuseMatch) {
+      reusedAssetIds.push(reuseMatch.asset.id);
+    } else {
+      imageJobs.push(plannedJob);
+    }
 
-      return plannedJob;
-    })
-    .filter((job): job is ReturnType<typeof planImageJob> => Boolean(job));
+    // Fold this cut's established state into the working overlay so a later cut in the SAME output inherits the
+    // situation/detail it set (applied whether or not this cut was reused — the cut still happened visually).
+    const overlayEvents = deriveImageCueOverlayEvents(workingState, draft, input.assistantMessage.id);
+    if (overlayEvents.length > 0) {
+      workingState = { ...workingState, memoryEvents: [...workingState.memoryEvents, ...overlayEvents] };
+    }
+  });
   const primaryCueIndex =
     typeof imageJobs[0]?.providerPayload.cueIndex === "number" ? imageJobs[0].providerPayload.cueIndex : 0;
   const primaryImageCue =
@@ -1174,12 +1254,13 @@ function selectRelevantModules(
   const queryTerms = createSelectionTerms(userText);
   const selectionEvidence = getModuleSelectionEvidence(contextPack);
   const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, currentSceneText));
+  const recentTopicModuleIds = collectRecentTopicModuleIds(state, currentSceneText);
 
-  return modules
+  const candidates = modules
     .filter((module) => module.enabled && module.tokenPolicy !== "disabled")
     .map((module): PromptModuleSelection | undefined => {
       const character = findModuleCharacter(state, module);
-      const tagMatch = module.activationTags.some((tag) => textContainsSelectionPhrase(normalizedText, tag));
+      const tagMatch = module.activationTags.some((tag) => activationTagMatchesQuery(normalizedText, queryTerms, tag));
       const titleMatch = normalizedText.includes(module.title.toLowerCase());
       const characterNameMatch = character ? characterIsReferencedInText(character, userText) : false;
       const moduleSignalScore = scoreModuleSignalMatch(module, character, queryTerms);
@@ -1237,6 +1318,19 @@ function selectRelevantModules(
         return undefined;
       }
 
+      if (
+        module.tokenPolicy === "rag" &&
+        (module.kind === "sub_prompt" || module.kind === "scene_rule") &&
+        module.priority >= 92
+      ) {
+        return {
+          module,
+          source: "local",
+          reason: "high-priority creator sub/scene rule",
+          score: 0.74 + module.priority / 1000
+        };
+      }
+
       if (neuralMapEvidence) {
         return {
           module,
@@ -1273,15 +1367,120 @@ function selectRelevantModules(
         };
       }
 
+      // Topic stickiness: this RAG lore/sub/scene module did not match the current query, but it was active
+      // within the last few turns. Keep retrieving it so the topic survives turns that do not restate its
+      // keyword (continuation, "이어서 진행", or a long paragraph whose keyword fell outside the window).
+      if (recentTopicModuleIds.has(module.id)) {
+        return {
+          module,
+          source: "local",
+          reason: "최근 턴에 활성화된 토픽 지속",
+          score: 0.7
+        };
+      }
+
       return undefined;
     })
-    .filter((selection): selection is PromptModuleSelection => Boolean(selection))
-    .sort((a, b) => b.module.priority + b.score * 100 - (a.module.priority + a.score * 100))
-    .slice(0, MAX_SELECTED_PROMPT_MODULES)
-    .map((selection) => ({
-      ...selection,
-      module: compactPromptModuleForActiveContext(selection.module, userText, contextPack)
-    }));
+    .filter((selection): selection is PromptModuleSelection => Boolean(selection));
+
+  const capped = capSelectionsByKind(candidates, MAX_SELECTED_PROMPT_MODULES).map((selection) => ({
+    ...selection,
+    module: compactPromptModuleForActiveContext(selection.module, userText, contextPack)
+  }));
+  return applyTotalModuleBodyBudget(capped);
+}
+
+// Drop lower-value non-foundation modules once their cumulative compacted body exceeds the total budget.
+// Foundation/always modules are kept regardless (creator law / explicit always policy). Input order already
+// puts mandatory then reserved-lore then rank, so the budget keeps the most relevant modules first.
+function applyTotalModuleBodyBudget(selections: PromptModuleSelection[]): PromptModuleSelection[] {
+  let usedChars = 0;
+  const kept: PromptModuleSelection[] = [];
+  for (const selection of selections) {
+    if (selection.source === "always" || isFoundationPromptModule(selection.module)) {
+      kept.push(selection);
+      continue;
+    }
+    const bodyChars = selection.module.body.length;
+    if (usedChars > 0 && usedChars + bodyChars > MAX_TOTAL_ACTIVE_MODULE_BODY_CHARS) {
+      continue;
+    }
+    usedChars += bodyChars;
+    kept.push(selection);
+  }
+  return kept;
+}
+
+// Per-kind cap: mandatory modules (always-policy + foundation main/world) are never dropped, matched
+// lore/sub/scene-rule modules get a reserved minimum so a large on-stage cast cannot crowd them out, and the
+// rest fill by combined priority+score. Replaces a flat top-N slice that let character modules evict lore.
+function capSelectionsByKind(selections: PromptModuleSelection[], max: number): PromptModuleSelection[] {
+  const rank = (selection: PromptModuleSelection): number => selection.module.priority + selection.score * 100;
+  const sorted = [...selections].sort((a, b) => rank(b) - rank(a));
+  const isMandatory = (selection: PromptModuleSelection): boolean =>
+    selection.source === "always" || isFoundationPromptModule(selection.module);
+  const isLore = (selection: PromptModuleSelection): boolean =>
+    selection.module.kind === "sub_prompt" ||
+    selection.module.kind === "world_lore" ||
+    selection.module.kind === "scene_rule";
+
+  const chosen: PromptModuleSelection[] = [];
+  const chosenIds = new Set<string>();
+  const take = (selection: PromptModuleSelection): void => {
+    if (chosenIds.has(selection.module.id) || chosen.length >= max) {
+      return;
+    }
+    chosen.push(selection);
+    chosenIds.add(selection.module.id);
+  };
+
+  sorted.filter(isMandatory).forEach(take);
+  sorted.filter((selection) => isLore(selection) && !isMandatory(selection)).slice(0, MIN_RESERVED_LORE_MODULE_SLOTS).forEach(take);
+  sorted.forEach(take);
+  return chosen;
+}
+
+// Recently-active RAG lore/sub/scene-rule module ids in the current session, used to keep an established
+// topic in context for a few turns. A hard scene change clears the stickiness so a new scene starts fresh.
+function collectRecentTopicModuleIds(state: AppState, currentSceneText: string): Set<string> {
+  if (sceneChangeBreaksTopicContinuity(currentSceneText)) {
+    return new Set();
+  }
+  const sessionId = state.simulation.activeSessionId;
+  const sessionUsages = state.promptModuleUsages.filter((usage) => usage.sessionId === sessionId);
+  if (sessionUsages.length === 0) {
+    return new Set();
+  }
+
+  const orderedByRecency = [...sessionUsages].sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+  const recentTurnIds = new Set<string>();
+  for (const usage of orderedByRecency) {
+    if (!recentTurnIds.has(usage.turnId)) {
+      recentTurnIds.add(usage.turnId);
+    }
+    if (recentTurnIds.size >= STICKY_TOPIC_MODULE_TURNS) {
+      break;
+    }
+  }
+
+  const kindById = new Map(state.modules.map((module) => [module.id, module.kind] as const));
+  const topicModuleIds = new Set<string>();
+  for (const usage of orderedByRecency) {
+    if (!recentTurnIds.has(usage.turnId) || usage.source === "always") {
+      continue;
+    }
+    const kind = kindById.get(usage.moduleId);
+    if (kind && STICKY_TOPIC_MODULE_KINDS.has(kind)) {
+      topicModuleIds.add(usage.moduleId);
+    }
+  }
+  return topicModuleIds;
+}
+
+function sceneChangeBreaksTopicContinuity(currentSceneText: string): boolean {
+  return /(?:장면\s*전환|다음\s*날|다음날|며칠\s*뒤|몇\s*시간\s*뒤|한편|다른\s*곳|새(?:로운)?\s*장면|scene\s*change|cut\s*to|meanwhile|시간\s*경과|에필로그|epilogue)/iu.test(
+    currentSceneText
+  );
 }
 
 function isFoundationPromptModule(module: PromptModule): boolean {
@@ -1541,6 +1740,24 @@ function textContainsSelectionPhrase(normalizedText: string, phrase: string | un
   return Boolean(normalizedPhrase && isUsefulSelectionPhrase(normalizedPhrase) && normalizedText.includes(normalizedPhrase));
 }
 
+// Activation keywords may be multi-word phrases. A phrase fires when it appears verbatim (exact substring)
+// OR — to survive Korean particles, spacing, and word reordering — when every meaningful term in the phrase
+// is present somewhere in the scanned query terms. Single-word tags keep the prior substring behavior.
+function activationTagMatchesQuery(normalizedText: string, queryTerms: Set<string>, tag: string | undefined): boolean {
+  const phrase = tag?.trim().toLowerCase();
+  if (!phrase) {
+    return false;
+  }
+  if (textContainsSelectionPhrase(normalizedText, phrase)) {
+    return true;
+  }
+  const phraseTerms = Array.from(createSelectionTerms(phrase));
+  if (phraseTerms.length >= 2) {
+    return phraseTerms.every((term) => queryTerms.has(term));
+  }
+  return false;
+}
+
 function isUsefulSelectionPhrase(phrase: string): boolean {
   return phrase.length >= 3 || /[\u3131-\uD79D]{2,}/u.test(phrase);
 }
@@ -1562,7 +1779,19 @@ function shouldIncludeCharacterScopedContext(
 }
 
 function compactPromptModuleForActiveContext(module: PromptModule, userText: string, contextPack: ContextPack): PromptModule {
-  if (module.body.length <= MAX_ACTIVE_MODULE_BODY_CHARS) {
+  const isFoundation = isFoundationPromptModule(module);
+  // Non-foundation always-policy modules (e.g. short safety/style policies) are kept verbatim. Foundation
+  // modules ARE compacted, but only when very long and with a much larger budget so creator law survives.
+  if (!isFoundation && module.tokenPolicy === "always") {
+    return module;
+  }
+
+  // Foundation modules are always compacted (creator law survives via windowed excerpts); non-foundation
+  // always-policy modules returned above keep their body verbatim, so the null case never reaches here.
+  const budget =
+    promptModuleBodyCharLimit(module.kind, module.tokenPolicy) ??
+    (isFoundation ? MAX_FOUNDATION_MODULE_BODY_CHARS : MAX_ACTIVE_MODULE_BODY_CHARS);
+  if (module.body.length <= budget) {
     return module;
   }
 
@@ -1572,15 +1801,15 @@ function compactPromptModuleForActiveContext(module: PromptModule, userText: str
     windows.length > 0
       ? windows.join("\n\n[...]\n\n")
       : [
-          module.body.slice(0, Math.floor(MAX_ACTIVE_MODULE_BODY_CHARS * 0.7)),
-          module.body.slice(-Math.floor(MAX_ACTIVE_MODULE_BODY_CHARS * 0.25))
+          module.body.slice(0, Math.floor(budget * 0.7)),
+          module.body.slice(-Math.floor(budget * 0.25))
         ].join("\n\n[...]\n\n");
 
   return {
     ...module,
     body: [
       `[excerpted long prompt module: original ${module.body.length} chars, policy ${module.tokenPolicy}]`,
-      excerptBody.slice(0, MAX_ACTIVE_MODULE_BODY_CHARS)
+      excerptBody.slice(0, budget)
     ].join("\n")
   };
 }

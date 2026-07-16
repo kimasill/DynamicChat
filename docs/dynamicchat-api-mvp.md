@@ -15,7 +15,7 @@ pnpm api
 By default it listens at:
 
 ```text
-http://127.0.0.1:4318
+http://127.0.0.1:8788
 ```
 
 For local development, the browser client reads an optional API base URL from:

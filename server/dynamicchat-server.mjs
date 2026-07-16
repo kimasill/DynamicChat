@@ -1,6 +1,9 @@
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,13 +14,28 @@ const defaultObjectDir = path.join(dataDir, "objects");
 const backupDir = path.join(dataDir, "backups");
 const statePath = path.join(dataDir, "state.json");
 const secretPath = path.join(dataDir, "dev-secrets.json");
-const port = Number(process.env.DYNAMICCHAT_API_PORT ?? 4318);
-const novelAiSubscriptionUrl = "https://api.novelai.net/user/subscription";
+// Neutral working directory for the claude CLI bridge. We spawn claude outside the project
+// workspace so it does not auto-load the DynamicChat git repo context, CLAUDE.md, or any
+// project-specific files that would re-activate the "Claude Code coding assistant" identity.
+// codex and gemini continue to run from dataDir (gemini requires --skip-trust otherwise).
+const claudeNeutralCwd = path.join(os.tmpdir(), "dynamicchat-claude-bridge");
+// 4318 is inside a common Windows/Hyper-V excluded range (4287-4386) and fails with EACCES.
+const port = Number(process.env.DYNAMICCHAT_API_PORT ?? 8788);
+// NovelAI is migrating user/account routes off api.novelai.net onto the image host. api.novelai.net
+// now answers a valid token with 400 "Please refresh NovelAI.net. If using a third-party tool, update
+// to the image URL." so we hit the image host first and fall back to the legacy host only if the route
+// is missing there (404/405).
+const novelAiSubscriptionUrls = [
+  "https://image.novelai.net/user/subscription",
+  "https://api.novelai.net/user/subscription"
+];
 const novelAiGenerateImageUrl = "https://image.novelai.net/ai/generate-image";
+const novelAiEncodeVibeUrl = "https://image.novelai.net/ai/encode-vibe";
 const rateLimitWindowMs = Number(process.env.DYNAMICCHAT_RATE_LIMIT_WINDOW_MS ?? 60_000);
 const rateLimitMaxRequests = Number(process.env.DYNAMICCHAT_RATE_LIMIT_MAX ?? 180);
 const rateLimitBuckets = new Map();
 let stateStoreWriteQueue = Promise.resolve();
+let secretStoreWriteQueue = Promise.resolve();
 
 const corsHeaders = {
   "access-control-allow-origin": process.env.DYNAMICCHAT_CORS_ORIGIN ?? "*",
@@ -27,6 +45,10 @@ const corsHeaders = {
 };
 
 await ensureStore();
+// Create the neutral claude bridge directory if it doesn't exist yet. Errors are swallowed —
+// a missing directory is not fatal; runCliAgentProcess falls back gracefully (spawn will fail
+// with ENOENT and the bridge returns a clean 502 rather than crashing the server).
+await mkdir(claudeNeutralCwd, { recursive: true }).catch(() => {});
 
 const server = createServer(async (request, response) => {
   try {
@@ -49,6 +71,11 @@ const server = createServer(async (request, response) => {
 
     await route.handler(request, response, route.params);
   } catch (error) {
+    console.error("DynamicChat API request failed:", error);
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
     sendJson(response, 500, {
       error: error instanceof Error ? error.message : "Unknown DynamicChat API error"
     });
@@ -66,6 +93,8 @@ function matchRoute(method, pathname) {
     ["GET", /^\/health$/u, health],
     ["GET", /^\/novelai\/subscription$/u, getNovelAiSubscription],
     ["POST", /^\/novelai\/generate-image$/u, proxyNovelAiGenerateImage],
+    ["POST", /^\/novelai\/encode-vibe$/u, proxyNovelAiEncodeVibe],
+    ["POST", /^\/llm\/cli-agent$/u, proxyLlmCliAgent],
     ["GET", /^\/objects\/(.+)$/u, getObjectAsset],
     ["GET", /^\/simulations$/u, listSimulations],
     ["POST", /^\/simulations$/u, createSimulation],
@@ -136,13 +165,25 @@ async function getNovelAiSubscription(request, response) {
     return;
   }
 
-  const upstream = await fetch(novelAiSubscriptionUrl, {
-    method: "GET",
-    headers: {
-      authorization: `Bearer ${token}`
+  let upstream;
+  let text = "";
+  for (let index = 0; index < novelAiSubscriptionUrls.length; index += 1) {
+    upstream = await fetch(novelAiSubscriptionUrls[index], {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      }
+    });
+    text = await upstream.text();
+    const routeMissing = upstream.status === 404 || upstream.status === 405;
+    const hasFallback = index < novelAiSubscriptionUrls.length - 1;
+    // Only fall through to the legacy host when the current host doesn't serve this route at all.
+    if (routeMissing && hasFallback) {
+      continue;
     }
-  });
-  const text = await upstream.text();
+    break;
+  }
 
   if (!upstream.ok) {
     sendJson(response, upstream.status, {
@@ -162,7 +203,41 @@ async function proxyNovelAiGenerateImage(request, response) {
   }
 
   const payload = await readJsonBody(request);
+  // Temporary timing probe: isolates whether a slow "first image" is NovelAI's upstream latency or our own
+  // client/pipeline overhead. Reports the request body size (large vibe payloads inflate the first upload) and
+  // the upstream round-trip in ms. Remove once the first-image delay is pinpointed.
+  const requestBody = JSON.stringify(payload);
+  const upstreamStartedAt = Date.now();
   const upstream = await fetch(novelAiGenerateImageUrl, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json"
+    },
+    body: requestBody
+  });
+  const bytes = Buffer.from(await upstream.arrayBuffer());
+  console.log(
+    `[novelai-timing] generate-image status=${upstream.status} bodyKB=${Math.round(requestBody.length / 1024)} upstreamMs=${Date.now() - upstreamStartedAt}`
+  );
+
+  response.writeHead(upstream.status, {
+    ...corsHeaders,
+    "content-type": upstream.headers.get("content-type") ?? "application/octet-stream",
+    "content-length": String(bytes.byteLength)
+  });
+  response.end(bytes);
+}
+
+async function proxyNovelAiEncodeVibe(request, response) {
+  const token = readBearerToken(request);
+  if (!token) {
+    sendJson(response, 400, { error: "NovelAI API token is required." });
+    return;
+  }
+
+  const payload = await readJsonBody(request);
+  const upstream = await fetch(novelAiEncodeVibeUrl, {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`,
@@ -180,21 +255,494 @@ async function proxyNovelAiGenerateImage(request, response) {
   response.end(bytes);
 }
 
-async function getObjectAsset(_request, response, [objectKey]) {
-  let objectFile;
+// claude is used here as a plain single-shot completion engine, NOT for agentic coding. `claude --print`
+// otherwise loads the full agent harness (global MCP servers, built-in tool defs, multi-turn loops) which
+// inflates latency/usage. We strip the biggest cost — extended THINKING and CLAUDE.md/auto-memory — via env
+// vars in runCliAgentProcess (those can never break the invocation).
+//
+// The hardcoded claude flags below are verified on claude CLI ≥ 2.1.202 (validated on 2.1.202 with exit 0
+// and pure Korean prose output). They fully suppress the coding-agent identity so the model writes
+// narrative prose instead of refusing or executing shell commands:
+//   --tools=:                            disables all built-in tools (Bash, Computer Use, etc.).
+//                                        Written as a single `--tools=` token (equals-with-no-value form)
+//                                        so Windows cmd.exe shell:true cannot misparse it as consuming the
+//                                        next flag (the two-token `--tools ""` form was eaten by cmd.exe).
+//   --strict-mcp-config:                 blocks all MCP server connections.
+//   --exclude-dynamic-system-prompt-sections: strips the cwd/env/memory/git injections that establish
+//                                        "Claude Code coding assistant" identity.
+//   --system-prompt-file {systemPromptFile}: passes the simulation system prompt via a temp file rather
+//                                        than an argv string. Windows cmd.exe has an ~8191-char command-
+//                                        line limit; a full DynamicChat systemPrompt (~8 KB) would hit
+//                                        "The command line is too long." (exit 1). A temp file path is
+//                                        always short. proxyLlmCliAgent writes the file before spawn and
+//                                        deletes it after the process closes.
+//
+// If your installed claude is older than 2.1.x and rejects these flags (exit non-zero → HTTP 502),
+// override the whole command via DYNAMICCHAT_CLI_CLAUDE, e.g.:
+//   DYNAMICCHAT_CLI_CLAUDE="claude --print --model {model} --output-format text"
+// The env override bypasses this default entirely (older-version escape hatch).
+const CLI_AGENT_DEFAULT_COMMANDS = {
+  // User turn is piped to stdin; system prompt goes via a temp file (--system-prompt-file, claude only).
+  // {model} is replaced by resolveCliAgentArgv. {systemPromptFile} is replaced with the temp-file path.
+  claude: ["claude", "--print", "--model", "{model}", "--tools=", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections", "--system-prompt-file", "{systemPromptFile}", "--output-format", "text"],
+  codex: ["codex", "exec", "--model", "{model}", "-"],
+  // --skip-trust: the bridge spawns gemini headlessly in the data dir (an untrusted workspace), which it otherwise
+  // refuses with exit 55. Gemini reads the piped stdin as the prompt and runs non-interactively (no -p flag needed).
+  gemini: ["gemini", "--skip-trust", "--model", "{model}"]
+};
+
+// Streaming variants. `claude --output-format stream-json --verbose --include-partial-messages` emits
+// token-level NDJSON deltas, which the bridge parses into plain-text chunks (parseClaudeStreamChunk).
+// This makes the first byte arrive in ~1s instead of after the whole (possibly multi-minute) generation,
+// so the client never trips its time-to-first-byte timeout, and the idle-timeout below keeps long-but-
+// progressing generations alive instead of killing them at a hard ceiling. Agents without a stream entry
+// fall back to their default command and have their raw stdout forwarded as-is.
+const CLI_AGENT_STREAM_COMMANDS = {
+  // Same narrative-hardening flags as the default command; see comment above for rationale.
+  claude: ["claude", "--print", "--model", "{model}", "--tools=", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections", "--system-prompt-file", "{systemPromptFile}", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+};
+
+const CLI_AGENT_ENV_OVERRIDES = {
+  claude: "DYNAMICCHAT_CLI_CLAUDE",
+  codex: "DYNAMICCHAT_CLI_CODEX",
+  gemini: "DYNAMICCHAT_CLI_GEMINI"
+};
+
+// Kept below the client-side CLI ceiling (MAX_CLI_AGENT_REQUEST_TIMEOUT_MS = 300s in llmClient)
+// so the bridge times out first and returns a clean 502 rather than the client aborting opaquely.
+// This is the hard ceiling for the NON-streaming path (whole response buffered before we see anything).
+const cliAgentTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_TIMEOUT_MS ?? 540_000);
+// Streaming path uses an inactivity (idle) timeout instead: as long as tokens keep flowing we never
+// abort, so a long-but-healthy generation completes; we only give up after a real stall. A generous
+// absolute backstop still bounds a truly wedged process.
+const cliAgentIdleTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_IDLE_TIMEOUT_MS ?? 120_000);
+const cliAgentStreamMaxTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_STREAM_MAX_MS ?? 900_000);
+
+async function proxyLlmCliAgent(_request, response) {
+  let payload;
   try {
-    objectFile = resolveExistingObjectFile(objectKey, await getRequestObjectRoots(_request));
+    payload = await readJsonBody(_request);
   } catch {
-    sendJson(response, 400, { error: "Invalid object key." });
+    sendJson(response, 400, { error: "Invalid JSON body." });
     return;
   }
 
+  const agent = String(payload.agent ?? "").toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(CLI_AGENT_DEFAULT_COMMANDS, agent)) {
+    sendJson(response, 400, { error: `Unsupported CLI agent: ${agent || "(none)"}. Use claude, codex, or gemini.` });
+    return;
+  }
+
+  const model = sanitizeCliModel(payload.model);
+  if (payload.model && !model) {
+    sendJson(response, 400, { error: "Invalid model name for CLI agent." });
+    return;
+  }
+
+  const systemPrompt = typeof payload.systemPrompt === "string" ? payload.systemPrompt : "";
+  const userPrompt = typeof payload.prompt === "string" ? payload.prompt : "";
+  const fullPrompt = [systemPrompt.trim(), userPrompt.trim()].filter(Boolean).join("\n\n");
+  if (!fullPrompt) {
+    sendJson(response, 400, { error: "CLI agent prompt is empty." });
+    return;
+  }
+
+  const wantStream = payload.stream === true;
+
+  // For claude only: write the system prompt to a per-request temp file so it can be passed via
+  // --system-prompt-file. This avoids the Windows cmd.exe command-line length limit (~8191 chars)
+  // that causes "The command line is too long." (exit 1) when a full DynamicChat systemPrompt
+  // (~8 KB) is embedded directly in the argv string. codex/gemini don't use this path.
+  let sysPromptFilePath = "";
+  if (agent === "claude" && systemPrompt) {
+    sysPromptFilePath = path.join(
+      claudeNeutralCwd,
+      `sys_${Date.now().toString(36)}_${randomUUID()}.txt`
+    );
+    await writeFile(sysPromptFilePath, systemPrompt, "utf8");
+  }
+  // Called after the subprocess closes (on every exit path) to remove the temp file.
+  const cleanupSysPromptFile = () => {
+    if (sysPromptFilePath) {
+      rm(sysPromptFilePath).catch(() => {});
+      sysPromptFilePath = "";
+    }
+  };
+
+  const [command, ...args] = resolveCliAgentArgv(agent, model, { stream: wantStream }, sysPromptFilePath);
+
+  // claude receives its system prompt via --system-prompt-file (above); its stdin carries only the
+  // user turn so the two don't collide. Other agents (codex, gemini) get the combined system+user
+  // prompt via stdin, unchanged from before.
+  const stdinText = agent === "claude" ? (userPrompt.trim() || fullPrompt) : fullPrompt;
+
+  const describeSpawnError = (error) =>
+    error?.code === "ENOENT"
+      ? `${agent} CLI not found (command: ${command}). Install it and ensure it is on PATH, or set ${CLI_AGENT_ENV_OVERRIDES[agent]}.`
+      : error instanceof Error
+        ? error.message
+        : `${agent} CLI agent failed.`;
+
+  if (wantStream) {
+    // Stream stdout to the client as it is produced so the UI can render text incrementally.
+    let headersSent = false;
+    const beginStream = () => {
+      // response.headersSent guards against late stdout chunks arriving after the
+      // response was already finalized (e.g. via sendJson on the timeout/error path).
+      if (!headersSent && !response.headersSent && !response.writableEnded) {
+        response.writeHead(200, { ...corsHeaders, "content-type": "text/plain; charset=utf-8", "cache-control": "no-cache" });
+        headersSent = true;
+      }
+    };
+    // claude streams token-level NDJSON; translate it to plain-text deltas so the client's plain-text
+    // stream reader is unchanged. Other agents have their raw stdout forwarded verbatim (works whether
+    // they emit incrementally or buffer — see the early-header grace timer below).
+    const claudeStream = wantStream && agent === "claude" && CLI_AGENT_STREAM_COMMANDS.claude ? createClaudeStreamTextParser() : undefined;
+    // Send headers shortly after spawn even before any stdout, so an agent that buffers its whole
+    // response (no incremental output) still establishes the connection fast and the client switches to
+    // an untimed body read instead of tripping its time-to-first-byte timeout. The grace delay is long
+    // enough that a spawn failure (ENOENT, fires in ms) still rejects with headers unsent → clean 502.
+    const headerGraceTimer = setTimeout(beginStream, 3000);
+    // Only claude is known to emit incrementally, so only it gets the inactivity (idle) timeout that
+    // resets on each delta. For the others we rely on the generous absolute backstop, since a buffering
+    // agent is legitimately silent until the end and an idle timeout would kill a healthy generation.
+    const idleTimeoutMs = claudeStream ? cliAgentIdleTimeoutMs : undefined;
+    // Temporary streaming probe: confirms whether the CLI emits text INCREMENTALLY (many chunks, first chunk
+    // arrives early → early image dispatch can work) or buffers the whole response (1 chunk near the end → no
+    // streaming, so image_cues-first vs assistant_text-first makes no difference to first-image latency).
+    let streamedChunks = 0;
+    let firstChunkMs = -1;
+    const streamStartedAt = Date.now();
+    let result;
+    try {
+      result = await runCliAgentProcess(command, args, stdinText, {
+        idleTimeoutMs,
+        maxTimeoutMs: cliAgentStreamMaxTimeoutMs,
+        // claude spawns in a neutral directory outside the project to prevent it from loading
+        // the DynamicChat git context or CLAUDE.md. codex/gemini stay in dataDir (gemini
+        // requires --skip-trust and is already scoped; codex has no similar cwd restriction).
+        cwd: agent === "claude" ? claudeNeutralCwd : undefined,
+        onStdout: (chunk) => {
+          beginStream();
+          if (!headersSent || response.writableEnded) {
+            return;
+          }
+          if (claudeStream) {
+            const text = claudeStream.push(chunk);
+            if (text) {
+              if (firstChunkMs < 0) firstChunkMs = Date.now() - streamStartedAt;
+              streamedChunks += 1;
+              response.write(text);
+            }
+          } else {
+            if (firstChunkMs < 0) firstChunkMs = Date.now() - streamStartedAt;
+            streamedChunks += 1;
+            response.write(chunk);
+          }
+        }
+      });
+      console.log(
+        `[cli-stream-timing] agent=${agent} streamedChunks=${streamedChunks} firstChunkMs=${firstChunkMs} totalMs=${Date.now() - streamStartedAt}`
+      );
+    } catch (error) {
+      clearTimeout(headerGraceTimer);
+      cleanupSysPromptFile();
+      if (!headersSent) {
+        sendJson(response, 502, { error: describeSpawnError(error) });
+        return;
+      }
+      response.end();
+      return;
+    }
+    clearTimeout(headerGraceTimer);
+    cleanupSysPromptFile();
+
+    if (!headersSent) {
+      // Process produced no stdout: surface an error (client checks response.ok before reading the stream).
+      if (result.code !== 0) {
+        sendJson(response, 502, {
+          error: `${agent} CLI exited with code ${result.code}.${result.stderr ? ` ${result.stderr.slice(0, 500)}` : ""}`
+        });
+        return;
+      }
+      beginStream();
+    }
+    // Flush any trailing claude text: a final delta with no newline, or — if no deltas ever streamed
+    // (e.g. partial messages unsupported) — the complete assistant/result text as a one-shot fallback.
+    if (claudeStream && !response.writableEnded) {
+      const tail = claudeStream.flush();
+      if (tail) {
+        response.write(tail);
+      }
+    }
+    response.end();
+    return;
+  }
+
+  try {
+    const result = await runCliAgentProcess(command, args, stdinText, {
+      cwd: agent === "claude" ? claudeNeutralCwd : undefined
+    });
+    if (result.code !== 0) {
+      sendJson(response, 502, {
+        error: `${agent} CLI exited with code ${result.code}.${result.stderr ? ` ${result.stderr.slice(0, 500)}` : ""}`
+      });
+      return;
+    }
+
+    sendJson(response, 200, { text: result.stdout, agent, model: model || undefined });
+  } catch (error) {
+    sendJson(response, 502, { error: describeSpawnError(error) });
+  } finally {
+    cleanupSysPromptFile();
+  }
+}
+
+function sanitizeCliModel(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  // Only allow safe model identifiers and never let a value be parsed as a flag.
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(trimmed) ? trimmed : "";
+}
+
+function resolveCliAgentArgv(agent, model, options = {}, systemPromptFile = "") {
+  const override = process.env[CLI_AGENT_ENV_OVERRIDES[agent]]?.trim();
+  // An explicit env override always wins; otherwise the streaming variant (if any) is used for streaming
+  // requests so the agent emits incremental output instead of buffering the whole response.
+  const template = override
+    ? override.split(/\s+/u)
+    : (options.stream && CLI_AGENT_STREAM_COMMANDS[agent]) || CLI_AGENT_DEFAULT_COMMANDS[agent];
+  const argv = [];
+  for (let index = 0; index < template.length; index += 1) {
+    const token = template[index];
+    if (token.includes("{model}")) {
+      // No model selected: drop the placeholder AND the flag that introduces it (e.g. "--model"), otherwise the agent
+      // sees a dangling flag with no value (e.g. `gemini --model` → "Not enough arguments following: model").
+      if (!model) {
+        const previous = argv[argv.length - 1];
+        if (index > 0 && previous && previous.startsWith("-")) {
+          argv.pop();
+        }
+        continue;
+      }
+      argv.push(token.replace(/\{model\}/gu, model));
+      continue;
+    }
+    if (token.includes("{systemPromptFile}")) {
+      // No system-prompt file: drop the placeholder AND the flag that introduces it
+      // ("--system-prompt-file") so the agent is not called with a dangling flag and no value.
+      if (!systemPromptFile) {
+        const previous = argv[argv.length - 1];
+        if (index > 0 && previous && previous.startsWith("-")) {
+          argv.pop();
+        }
+        continue;
+      }
+      // File path is always short (just a temp filename); safe to pass as a regular argv token.
+      argv.push(systemPromptFile);
+      continue;
+    }
+    if (token.length > 0 || index === 0) {
+      argv.push(token);
+    }
+  }
+  return argv;
+}
+
+function runCliAgentProcess(command, args, stdinText, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      // Callers may supply a custom cwd (e.g. claudeNeutralCwd for the claude bridge).
+      // Defaults to dataDir (the original behavior for codex and gemini).
+      cwd: options.cwd ?? dataDir,
+      shell: process.platform === "win32",
+      windowsHide: true,
+      // Lean-completion env for the claude CLI (ignored by codex/gemini): disable extended thinking so it does
+      // not burn thousands of hidden reasoning tokens (the main cause of ~14 tok/s, 466s turns), and skip
+      // CLAUDE.md / auto-memory loading. Subscription OAuth auth is preserved (we do NOT use --bare).
+      env: {
+        ...process.env,
+        MAX_THINKING_TOKENS: process.env.MAX_THINKING_TOKENS ?? "0",
+        CLAUDE_CODE_DISABLE_CLAUDE_MDS: process.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS ?? "1",
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY ?? "1"
+      }
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    // Non-streaming callers pass no idleTimeoutMs and keep the original behavior: a single absolute
+    // timeout (cliAgentTimeoutMs). Streaming callers pass an idle timeout that resets on every chunk so
+    // a long-but-progressing generation is never killed, plus a generous absolute backstop.
+    const idleTimeoutMs = options.idleTimeoutMs;
+    const absoluteTimeoutMs = options.maxTimeoutMs ?? cliAgentTimeoutMs;
+    let idleTimer;
+    let absoluteTimer;
+    const clearTimers = () => {
+      clearTimeout(idleTimer);
+      clearTimeout(absoluteTimer);
+    };
+    const fail = (message) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimers();
+      child.kill("SIGKILL");
+      reject(new Error(message));
+    };
+    const armIdleTimer = () => {
+      if (!idleTimeoutMs) {
+        return;
+      }
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => fail(`CLI agent stalled: no output for ${Math.round(idleTimeoutMs / 1000)}s.`),
+        idleTimeoutMs
+      );
+    };
+    absoluteTimer = setTimeout(() => fail(`CLI agent timed out after ${absoluteTimeoutMs}ms.`), absoluteTimeoutMs);
+    armIdleTimer();
+
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString("utf8");
+      stdout += text;
+      armIdleTimer();
+      // Stop forwarding once the promise has settled (timeout/error) so we never
+      // touch a response that may already have been finalized.
+      if (!settled) {
+        options.onStdout?.(text);
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+      // stderr activity also counts as liveness (the agent is doing work, e.g. emitting progress logs).
+      armIdleTimer();
+    });
+    child.on("error", (error) => {
+      if (!settled) {
+        settled = true;
+        clearTimers();
+        reject(error);
+      }
+    });
+    child.on("close", (code) => {
+      if (!settled) {
+        settled = true;
+        clearTimers();
+        resolve({ code: code ?? 0, stdout: stdout.trim(), stderr: stderr.trim() });
+      }
+    });
+
+    child.stdin.on("error", () => {
+      // Ignore EPIPE if the agent closes stdin early; close/error handlers settle the promise.
+    });
+    child.stdin.end(stdinText);
+  });
+}
+
+// Parses claude's `--output-format stream-json` NDJSON into plain text. `push` returns the incremental
+// text to forward for each chunk; `flush` returns any trailing text once the process closes.
+function createClaudeStreamTextParser() {
+  let buffer = "";
+  let emittedDelta = false;
+  let completeText = "";
+
+  const extractDeltaText = (event) => {
+    // With --include-partial-messages: {"type":"stream_event","event":{"type":"content_block_delta",
+    // "delta":{"type":"text_delta","text":"..."}}}. Some builds surface the inner event at top level.
+    const inner = event?.type === "stream_event" ? event.event : event;
+    if (inner?.type === "content_block_delta" && inner?.delta?.type === "text_delta") {
+      return typeof inner.delta.text === "string" ? inner.delta.text : "";
+    }
+    return "";
+  };
+  const extractCompleteText = (event) => {
+    if (event?.type === "result" && typeof event.result === "string") {
+      return event.result;
+    }
+    if (event?.type === "assistant" && Array.isArray(event?.message?.content)) {
+      return event.message.content
+        .filter((block) => block?.type === "text" && typeof block.text === "string")
+        .map((block) => block.text)
+        .join("");
+    }
+    return "";
+  };
+  const consumeLine = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return "";
+    }
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      return "";
+    }
+    const delta = extractDeltaText(event);
+    if (delta) {
+      emittedDelta = true;
+      return delta;
+    }
+    const complete = extractCompleteText(event);
+    if (complete) {
+      completeText = complete;
+    }
+    return "";
+  };
+
+  return {
+    push(chunk) {
+      buffer += chunk;
+      let out = "";
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        out += consumeLine(line);
+      }
+      return out;
+    },
+    flush() {
+      let out = consumeLine(buffer);
+      buffer = "";
+      // If partial-message deltas never streamed, fall back to the one-shot complete text so the turn
+      // still gets its full response (no incremental render, but no data loss).
+      if (!emittedDelta && completeText) {
+        out += completeText;
+      }
+      return out;
+    }
+  };
+}
+
+async function getObjectAsset(_request, response, [objectKey]) {
+  let objectRoots;
+  try {
+    objectRoots = await getRequestObjectRoots(_request);
+  } catch (error) {
+    console.error("getObjectAsset: failed to resolve object roots", error);
+    sendJson(response, 500, { error: "Internal server error." });
+    return;
+  }
+
+  const objectFile = resolveExistingObjectFile(objectKey, objectRoots);
   if (!objectFile) {
     sendJson(response, 404, { error: "Object not found" });
     return;
   }
 
-  const bytes = await readFile(objectFile.filePath);
+  let bytes;
+  try {
+    bytes = await readFile(objectFile.filePath);
+  } catch (error) {
+    console.error("getObjectAsset: failed to read object file", error);
+    sendJson(response, 500, { error: "Internal server error." });
+    return;
+  }
   response.writeHead(200, {
     ...corsHeaders,
     "content-type": mimeTypeForObjectKey(objectKey),
@@ -378,14 +926,15 @@ async function listAssets(request, response, [simulationId]) {
         .filter((assetId) => !deletedAssetIds.has(assetId))
         .filter((assetId) => !storedAssetIds.has(assetId))
         .map((assetId) => createRecoveredImageAsset(state, assetId));
-  const assets = await hydrateAssetCollection(
-    simulationId,
-    [...storedAssets, ...recoveredAssets]
-      .filter((asset) => !deletedAssetIds.has(asset.id))
-      .filter((asset) => requestedAssetIds.size === 0 || requestedAssetIds.has(asset.id))
-      .map(stripAssetDataUrl),
-    objectRoot
-  );
+  const allCandidates = [...storedAssets, ...recoveredAssets]
+    .filter((asset) => !deletedAssetIds.has(asset.id))
+    .filter((asset) => requestedAssetIds.size === 0 || requestedAssetIds.has(asset.id))
+    .map(stripAssetDataUrl);
+
+  const assets =
+    requestedAssetIds.size === 0
+      ? allCandidates
+      : await hydrateAssetCollection(simulationId, allCandidates, objectRoot);
   appendAuditEvent(state, request, "asset_accessed", "simulation", simulationId, { assetCount: assets.length });
   void writeStateStore(store).catch(() => undefined);
   sendJson(response, 200, assets);
@@ -1468,12 +2017,31 @@ function findLeadingJsonObjectEnd(raw) {
 }
 
 async function readSecretStore() {
-  return JSON.parse(await readFile(secretPath, "utf8"));
+  const raw = await readFile(secretPath, "utf8");
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const recovered = parseLeadingJsonObject(raw);
+    if (!recovered) {
+      throw new Error(`DynamicChat secret store is not valid JSON and could not be recovered: ${secretPath}`);
+    }
+    await writeSecretStore(recovered);
+    return recovered;
+  }
 }
 
 async function writeSecretStore(store) {
+  secretStoreWriteQueue = secretStoreWriteQueue
+    .catch(() => undefined)
+    .then(() => writeSecretStoreNow(store));
+  return secretStoreWriteQueue;
+}
+
+async function writeSecretStoreNow(store) {
   await mkdir(path.dirname(secretPath), { recursive: true });
-  await writeFile(secretPath, `${JSON.stringify(store, null, 2)}\n`);
+  const tmpPath = `${secretPath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmpPath, `${JSON.stringify(store, null, 2)}\n`);
+  await renameWithRetry(tmpPath, secretPath);
 }
 
 function send(response, statusCode) {

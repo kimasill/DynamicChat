@@ -2,6 +2,7 @@ import { createId } from "../lib/id";
 import type { AppState, AssistantMemoryEventDraft, AssistantSidecar, ContextEvidence, MemoryEvent } from "../types";
 import { characterIsReferencedInText, inferCurrentSceneCharacterIds } from "./sceneCast";
 import {
+  IMAGE_MACHINERY_STATE_TYPES,
   canonicalizeStateType,
   classifyImageStateTags,
   formatImageStateTypeLabel,
@@ -54,6 +55,8 @@ export interface MemoryDelta {
 }
 
 const MAX_DELTA_RECORDS = 8;
+// Scene-level state types persisted as scene-owned (no actor) so the established place/setting carries across turns.
+const SCENE_CONTINUITY_STATE_TYPES = ["SceneTags", "EnvironmentTags", "Location"] as const;
 const IMAGE_CUE_CHARACTER_STATE_TYPES = new Set<string>([
   "Wearing",
   "OutfitTags",
@@ -124,6 +127,26 @@ const STATE_PATTERNS: Array<{
   }
 ];
 
+// Maps a stored relationship-parameter value to a qualitative Korean descriptor.
+// The narrative LLM must never receive raw digits — numerals in the context induce annotation-mode
+// prose (e.g. "반응도 85의 신경을" leaking into the story). Non-numeric text passes through unchanged.
+// Scale inference: |value| ≤ 10 is assumed a 0–10 or 0–5 scale and rescaled ×10 before banding.
+// Shared by memoryCompiler (narrative state rendering) and llmClient (relationship-map rules block).
+export function describeRelationshipParameterValue(raw: string): string {
+  const trimmed = raw.trim();
+  const num = Number(trimmed);
+  if (!Number.isFinite(num)) {
+    return trimmed; // non-numeric (Korean word, phrase, etc.) — pass through unchanged
+  }
+  // Normalize to 0-100 equivalent before banding.
+  const normalized = Math.abs(num) <= 10 ? num * 10 : num;
+  if (normalized >= 85) return "매우 높음";
+  if (normalized >= 65) return "높음";
+  if (normalized >= 45) return "보통";
+  if (normalized >= 25) return "낮음";
+  return "매우 낮음";
+}
+
 export function compileSimulationMemoryDelta(input: {
   state: AppState;
   userText: string;
@@ -139,7 +162,7 @@ export function compileSimulationMemoryDelta(input: {
   const warnings: string[] = [];
 
   records.push(...recordsFromSidecar(input.state, input.sidecar.memoryEvents, input.assistantText));
-  records.push(...recordsFromImageCueDrafts(input.state, input.sidecar.imageCues.length > 0 ? input.sidecar.imageCues : [input.sidecar.imageCue], records));
+  records.push(...recordsFromImageCueDrafts(input.state, input.sidecar.imageCues.length > 0 ? input.sidecar.imageCues : [input.sidecar.imageCue], records, input.assistantText));
   records.push(...extractStateRecords(input.state, input.userText, input.assistantText));
   records.push(...extractObservationAndBeliefRecords(input.state, input.userText, input.assistantText));
 
@@ -236,10 +259,14 @@ export function memoryDeltaToEvents(state: AppState, delta: MemoryDelta, created
 
 export function createStructuredContextSummary(
   state: AppState,
-  options: { maxEvents?: number; maxStates?: number; currentText?: string } = {}
+  options: { maxEvents?: number; maxStates?: number; currentText?: string; audience?: "narrative" | "annotation" } = {}
 ): string {
   const maxEvents = options.maxEvents ?? 8;
   const maxStates = options.maxStates ?? 10;
+  // "narrative" filters image-machinery state types and qualitatively bands relationship-map values
+  // so the prose model never sees NovelAI tag vocabulary or raw numeric stats.
+  // "annotation" (default) renders everything verbatim — the annotation/image pipeline needs exact values.
+  const narrativeAudience = options.audience === "narrative";
   const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, options.currentText ?? ""));
   const activeCharacterNames = state.characters
     .filter((character) => activeCharacterIds.has(character.id))
@@ -251,9 +278,12 @@ export function createStructuredContextSummary(
   const currentSceneRecords = records.filter((record) =>
     recordIsRelevantToCurrentSceneCast(state, record, activeCharacterIds)
   );
-  const currentStates = latestByKey(
+  const rawStates = latestByKey(
     currentSceneRecords.filter((record) => record.kind === "state"),
     (record) => `${record.ownerId ?? record.actorId ?? "world"}:${record.stateType ?? "State"}`
+  );
+  const currentStates = (
+    narrativeAudience ? applyNarrativeStateFilter(state, rawStates) : rawStates
   ).slice(0, maxStates);
   const observations = currentSceneRecords.filter((record) => record.kind === "observation").slice(-6);
   const beliefs = currentSceneRecords.filter((record) => record.kind === "belief").slice(-6);
@@ -288,7 +318,9 @@ export function createStructuredContextSummary(
 }
 
 export function createStructuredContextEvidence(state: AppState): ContextEvidence | undefined {
-  const summary = createStructuredContextSummary(state);
+  // This evidence snippet is injected into the narrative prompt's "Memory/context evidence" section,
+  // so it must use narrative audience filtering (no image-machinery types, qualitative stat values).
+  const summary = createStructuredContextSummary(state, { audience: "narrative" });
   if (!state.memoryEvents.some((event) => event.tags.includes("memory-delta"))) {
     return undefined;
   }
@@ -328,7 +360,8 @@ function recordsFromSidecar(state: AppState, drafts: AssistantMemoryEventDraft[]
       const stateValue = normalizeStateRecordValue(state, {
         ownerId,
         stateType,
-        value: draft.stateValue ?? inferStateValue(draft.content, stateType)
+        value: draft.stateValue ?? inferStateValue(draft.content, stateType),
+        changeText: `${draft.content ?? ""}\n${assistantText}`
       });
       return createRecord({
         state,
@@ -354,11 +387,14 @@ function recordsFromSidecar(state: AppState, drafts: AssistantMemoryEventDraft[]
 function recordsFromImageCueDrafts(
   state: AppState,
   drafts: AssistantSidecar["imageCues"],
-  existingRecords: MemoryDeltaRecord[]
+  existingRecords: MemoryDeltaRecord[],
+  assistantText = ""
 ): MemoryDeltaRecord[] {
-  if (!state.relationshipMap.enabled) {
-    return [];
-  }
+  // Image-cue continuity (scene + per-character pose/action/interaction/Wearing) is what keeps a cut continuing the
+  // ongoing situation instead of resetting to a neutral pose. The image orchestrator's continuity injection
+  // (resolvePersistedCharacterContinuityTags / resolveCurrentCharacterOutfit) reads these states unconditionally, so
+  // they must be persisted regardless of relationshipMap — image continuity is independent of relationship/status
+  // tracking. (Relationship STATUS computation stays separately gated on relationshipMap.enabled.)
 
   const existingStateKeys = new Set(
     existingRecords
@@ -368,8 +404,43 @@ function recordsFromImageCueDrafts(
   const records: MemoryDeltaRecord[] = [];
 
   for (const draft of drafts) {
-    if (draft.tags.length === 0 || (draft.shouldGenerate === false && !draft.visualContext?.trim())) {
+    const hasAnyTags =
+      draft.tags.length > 0 ||
+      (draft.baseTags?.length ?? 0) > 0 ||
+      (draft.characterPrompts?.some((prompt) => prompt.prompt.trim()) ?? false);
+    if (!hasAnyTags || (draft.shouldGenerate === false && !draft.visualContext?.trim())) {
       continue;
+    }
+
+    // Scene/place continuity: persist the cut's scene/location/environment from base_tags (V4) or flat tags as a
+    // scene-owned state so the established setting carries to the next turn instead of being re-invented each cut.
+    const sceneSource = draft.baseTags && draft.baseTags.length > 0 ? draft.baseTags : draft.tags;
+    const sceneGroups = classifyImageStateTags(sceneSource);
+    for (const sceneStateType of SCENE_CONTINUITY_STATE_TYPES) {
+      const tags = sceneGroups[sceneStateType];
+      if (!tags || tags.length === 0) {
+        continue;
+      }
+      const sceneKey = `scene:${sceneStateType}`;
+      if (existingStateKeys.has(sceneKey)) {
+        continue;
+      }
+      existingStateKeys.add(sceneKey);
+      const value = tags.join(", ");
+      records.push(
+        createRecord({
+          state,
+          kind: "state",
+          layer: "episodic",
+          content: `장면 ${formatImageStateTypeLabel(sceneStateType)}: ${value}`,
+          importance: 0.6,
+          confidence: 0.6,
+          stateType: sceneStateType,
+          value,
+          tags: ["image-cue-state", sceneStateType, "scene-continuity"],
+          importanceReasons: ["image_cue_tags_returned", "scene_continuity"]
+        })
+      );
     }
 
     const characters = draft.characters
@@ -379,8 +450,17 @@ function recordsFromImageCueDrafts(
       continue;
     }
 
-    const groups = classifyImageStateTags(draft.tags);
     for (const character of characters) {
+      // Prefer this character's own V4 character_prompt tags so per-character pose/position/interaction is captured
+      // accurately; fall back to the cut's flat tags for legacy single-subject cues.
+      const characterPrompt = (draft.characterPrompts ?? []).find((prompt) => prompt.characterId === character.id);
+      const characterSource =
+        characterPrompt?.prompt.trim() && characters.length > 1
+          ? [characterPrompt.prompt]
+          : characterPrompt?.prompt.trim()
+            ? [characterPrompt.prompt, ...draft.tags]
+            : draft.tags;
+      const groups = classifyImageStateTags(characterSource);
       for (const [rawStateType, tags] of Object.entries(groups)) {
         const stateType = canonicalizeStateType(rawStateType);
         if (!isImageStateType(stateType) || !IMAGE_CUE_CHARACTER_STATE_TYPES.has(stateType) || tags.length === 0) {
@@ -396,7 +476,8 @@ function recordsFromImageCueDrafts(
         const value = normalizeStateRecordValue(state, {
           ownerId: character.id,
           stateType,
-          value: tags.join(", ")
+          value: tags.join(", "),
+          changeText: assistantText
         }) ?? tags.join(", ");
         records.push(
           createRecord({
@@ -419,12 +500,40 @@ function recordsFromImageCueDrafts(
     }
   }
 
-  return records.slice(0, 6);
+  return records.slice(0, 12);
+}
+
+// Intra-output continuity overlay: when one LLM turn emits multiple image cuts, derive the state facts each cut
+// establishes (per-character outfit/pose/action/interaction/physical-detail + scene) as transient memory events so the
+// NEXT cut in the SAME output inherits them — e.g. a torn shirt or a bleeding lip introduced in an earlier cut keeps
+// showing in a later close-up, and an established pose carries into a body-region focus. These overlay events are for
+// in-turn planning only and are NOT persisted; the turn's durable delta is still compiled separately from the full
+// sidecar. Active regardless of relationshipMap, matching the (now ungated) persistence path and the orchestrator's
+// continuity read path, so image continuity works whether or not relationship/status tracking is enabled.
+export function deriveImageCueOverlayEvents(
+  state: AppState,
+  draft: AssistantSidecar["imageCues"][number],
+  turnId: string,
+  createdAt = new Date().toISOString()
+): MemoryEvent[] {
+  const records = recordsFromImageCueDrafts(state, [draft], []);
+  if (records.length === 0) {
+    return [];
+  }
+  const delta: MemoryDelta = {
+    id: createId("memdelta"),
+    turnId,
+    simTime: createdAt,
+    sceneId: inferSceneId(state, "", draft.visualContext ?? ""),
+    upsertRecords: records,
+    warnings: []
+  };
+  return memoryDeltaToEvents(state, delta, createdAt);
 }
 
 function normalizeStateRecordValue(
   state: AppState,
-  input: { ownerId?: string; stateType?: string; value?: string }
+  input: { ownerId?: string; stateType?: string; value?: string; changeText?: string }
 ): string | undefined {
   if (!input.value?.trim()) {
     return undefined;
@@ -435,13 +544,25 @@ function normalizeStateRecordValue(
     return input.value.trim();
   }
 
-  return preserveWearingStateDetails(state, input.ownerId, input.value);
+  return preserveWearingStateDetails(state, input.ownerId, input.value, input.changeText);
 }
 
-function preserveWearingStateDetails(state: AppState, ownerId: string | undefined, value: string): string {
+function preserveWearingStateDetails(
+  state: AppState,
+  ownerId: string | undefined,
+  value: string,
+  changeText?: string
+): string {
   const incomingTags = expandOutfitKeywordTags(state, ownerId, splitImageStateTagValue(value), value);
   if (incomingTags.length === 0) {
     return value.trim();
+  }
+
+  // When the current change describes a garment being removed/taken off, the incoming value is the
+  // authoritative remaining outfit. Re-merging the previous base would re-add the item that was
+  // just removed (e.g. a chastity cage that the scene took off), so skip base preservation here.
+  if (isOutfitRemovalChange(changeText)) {
+    return limitStateTagValue(incomingTags).join(", ");
   }
 
   const baseTags = findStableOutfitBaseTags(state, ownerId);
@@ -603,6 +724,14 @@ const OUTFIT_CONDITION_WORD_PATTERN =
   /\b(?:torn|ripped|damaged|shredded|frayed|ragged|cut|slashed|wet|soaked|drenched|dirty|muddy|stained|bloodstained|dusty|wrinkled|disheveled|loose|open|unbuttoned|unfastened|burnt|scorched)\b/giu;
 const OUTFIT_IDENTITY_WORD_PATTERN =
   /\b(?:academy|business|casual|doctor|gothic|gym|hanbok|idol|kimono|lab|lolita|maid|military|nurse|office|police|rain|sailor|school|sports|stage|track|training|wedding)\b/giu;
+// Removal/undressing language. Unlike OUTFIT_CONDITION_PATTERN (torn/wet/open → keep base and
+// append the condition), removal means a garment is taken off and must drop out of the outfit.
+const OUTFIT_REMOVAL_PATTERN =
+  /\b(?:removed?|removing|removes|takes?\s+off|took\s+off|taking\s+off|strips?|stripped|stripping|undress(?:ed|es|ing)?|slips?\s+off|slipped\s+off|pulls?\s+off|pulled\s+off|peels?\s+off|peeled\s+off|unequip(?:ped|s)?|unfasten(?:ed|s)?|unlocks?|unlocked|came\s+off|cast\s+off|sheds?|doff(?:ed|s)?|discards?|discarded|naked|nude|topless|bottomless|fully\s+exposed)\b|벗(?:다|었|어|고|기|긴|겨|는|은|을|겼)|벗겨|탈의|알몸|나체/iu;
+
+function isOutfitRemovalChange(changeText: string | undefined): boolean {
+  return Boolean(changeText && OUTFIT_REMOVAL_PATTERN.test(changeText));
+}
 
 function extractStateRecords(state: AppState, userText: string, assistantText: string): MemoryDeltaRecord[] {
   const text = `${userText}\n${assistantText}`;
@@ -1011,6 +1140,37 @@ function getRecordCharacterIds(state: AppState, record: ReadableMemoryRecord): s
   return [...new Set([record.ownerId, record.actorId, record.targetId].filter((id): id is string => Boolean(id)))].filter((id) =>
     knownCharacterIds.has(id)
   );
+}
+
+// Filters and transforms state records for the narrative audience:
+// 1. Drops records whose canonical stateType is in IMAGE_MACHINERY_STATE_TYPES (NovelAI tag vocabulary
+//    that contaminates prose when present in context).
+// 2. Replaces numeric values for creator-defined relationship-map parameters with qualitative
+//    descriptors so the narrative model never sees raw stat numbers.
+function applyNarrativeStateFilter(state: AppState, records: ReadableMemoryRecord[]): ReadableMemoryRecord[] {
+  // Collect enabled relationship-map parameter titles for qualitative banding.
+  const relParamTitles = new Set<string>(
+    state.relationshipMap?.enabled
+      ? (state.relationshipMap.parameters ?? [])
+          .filter((parameter) => parameter.enabled && parameter.title.trim())
+          .map((parameter) => parameter.title.trim())
+      : []
+  );
+
+  return records
+    .filter((record) => {
+      const canonical = canonicalizeStateType(record.stateType);
+      // Drop pure image-machinery types; keep narratively load-bearing ones (Wearing, Location,
+      // PhysicalCondition, Emotion, Goal) and creator relationship-map parameter titles.
+      return !(canonical && IMAGE_MACHINERY_STATE_TYPES.has(canonical));
+    })
+    .map((record) => {
+      // Replace raw numeric value with qualitative descriptor for relationship-map parameters.
+      if (record.value && record.stateType && relParamTitles.has(record.stateType)) {
+        return { ...record, value: describeRelationshipParameterValue(record.value) };
+      }
+      return record;
+    });
 }
 
 function formatRecordLines(state: AppState, records: ReadableMemoryRecord[], fallback: string): string[] {

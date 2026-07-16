@@ -1,5 +1,6 @@
 import type { LlmApiSettings, NovelAiApiSettings } from "../types";
-import { getNovelAiSubscriptionProxyUrl } from "./dynamicChatApi";
+import { cliAgentKindForProvider } from "../types";
+import { getLlmCliAgentProxyUrl, getNovelAiSubscriptionProxyUrl } from "./dynamicChatApi";
 
 export interface ApiValidationResult {
   ok: boolean;
@@ -15,6 +16,42 @@ export async function validateLlmApi(settings: LlmApiSettings): Promise<ApiValid
       message: "Mock 모드는 외부 API 검증 없이 등록할 수 있습니다.",
       verifiedAt: new Date().toISOString()
     };
+  }
+
+  const cliAgentKind = cliAgentKindForProvider(settings.provider);
+  if (cliAgentKind) {
+    try {
+      const response = await fetchWithTimeout(
+        getLlmCliAgentProxyUrl(),
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            agent: cliAgentKind,
+            model: settings.model,
+            systemPrompt: "Reply with OK only.",
+            prompt: "Connection test.",
+            maxTokens: 16
+          })
+        },
+        60_000
+      );
+      const data = (await response.json().catch(() => ({}))) as { text?: string; error?: string };
+      if (response.ok && data.text?.trim()) {
+        return success(`${cliAgentKind} 구독 CLI 검증 및 등록이 완료되었습니다.`);
+      }
+      return {
+        ok: false,
+        message: `${cliAgentKind} 구독 CLI 검증 실패: ${data.error ?? `HTTP ${response.status}`}`
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        message: `DynamicChat API 서버를 통한 ${cliAgentKind} CLI 검증에 실패했습니다. 서버 실행 여부와 CLI 설치/로그인을 확인하세요. ${
+          error instanceof Error ? error.message : ""
+        }`
+      };
+    }
   }
 
   if (!settings.apiKey.trim()) {
@@ -94,6 +131,19 @@ export async function validateNovelAiApi(settings: NovelAiApiSettings): Promise<
     };
   }
 
+  const badChar = firstNonLatin1Char(token);
+  if (badChar) {
+    return {
+      ok: false,
+      message: `NovelAI 토큰에 인증 헤더로 보낼 수 없는 문자(U+${badChar
+        .codePointAt(0)!
+        .toString(16)
+        .toUpperCase()
+        .padStart(4, "0")})가 포함되어 있습니다. 토큰을 지우고 계정 설정에서 다시 복사해 붙여넣으세요.`,
+      details: { tier: "invalid_token_char", normalizedApiKey: token }
+    };
+  }
+
   if (token === "api_test_BCF13af9#d") {
     return {
       ok: true,
@@ -132,9 +182,24 @@ export async function validateNovelAiApi(settings: NovelAiApiSettings): Promise<
     }
 
     if (!response.ok) {
+      const upstreamDetail = await readProxyErrorDetail(response);
+      // NovelAI is migrating account routes to the image host; a valid token can still hit a legacy-URL
+      // gate ("Please refresh NovelAI.net / update to the image URL"). Image generation runs against the
+      // image host independently, so treat this as a soft pass rather than blocking registration.
+      if (response.status === 400 && /refresh NovelAI|image URL/iu.test(upstreamDetail)) {
+        return {
+          ok: true,
+          message:
+            "NovelAI 토큰을 저장했습니다. 구독 등급 조회 엔드포인트가 점검/이전 중이라 등급은 확인하지 못했지만, 이미지 생성은 정상 동작합니다.",
+          verifiedAt: new Date().toISOString(),
+          details: { tier: "unverified", normalizedApiKey: token }
+        };
+      }
       return {
         ok: false,
-        message: `NovelAI 검증 실패: DynamicChat API 프록시가 HTTP ${response.status}를 반환했습니다.`,
+        message: `NovelAI 검증 실패: DynamicChat API 프록시가 HTTP ${response.status}를 반환했습니다.${
+          upstreamDetail ? ` (${upstreamDetail})` : ""
+        }`,
         details: { tier: "proxy_http_error", normalizedApiKey: token }
       };
     }
@@ -142,6 +207,18 @@ export async function validateNovelAiApi(settings: NovelAiApiSettings): Promise<
     const data = (await response.json()) as Record<string, unknown>;
     const perks = isRecord(data.perks) ? data.perks : {};
     const trainingStepsLeft = isRecord(data.trainingStepsLeft) ? data.trainingStepsLeft : {};
+
+    // The image host may return an authorized 200 without the legacy subscription schema. Accept the
+    // token instead of falsely reporting "insufficient Anlas" off a shape we don't recognize.
+    if (!isRecord(data.perks) && !isRecord(data.trainingStepsLeft)) {
+      return {
+        ok: true,
+        message: "NovelAI 토큰을 저장했습니다. 등급 정보는 확인하지 못했지만 이미지 생성은 정상 동작합니다.",
+        verifiedAt: new Date().toISOString(),
+        details: { tier: "unverified", normalizedApiKey: token }
+      };
+    }
+
     const fixedAnlas = readNumber(trainingStepsLeft.fixedTrainingStepsLeft) ?? 0;
     const purchasedAnlas = readNumber(trainingStepsLeft.purchasedTrainingSteps) ?? 0;
     const totalAnlas = fixedAnlas + purchasedAnlas;
@@ -182,7 +259,48 @@ export async function validateNovelAiApi(settings: NovelAiApiSettings): Promise<
 }
 
 export function normalizeApiToken(value: string): string {
-  return value.trim().replace(/^Bearer\s+/iu, "").trim();
+  return (
+    value
+      // Strip zero-width / BOM / soft-hyphen / word-joiner artifacts that ride along on copy-paste.
+      .replace(/[\u200B-\u200D\uFEFF\u2060\u00AD]/gu, "")
+      // Remove control characters (C0 and C1 blocks).
+      .replace(/[\u0000-\u001F\u007F-\u009F]/gu, "")
+      // Collapse any Unicode whitespace (incl. NBSP, ideographic space) - a token never contains spaces.
+      .replace(/\s+/gu, "")
+      .replace(/^Bearer/iu, "")
+      .trim()
+  );
+}
+
+// HTTP header values must be Latin-1 (ISO-8859-1). A token with any character outside that range
+// makes the browser throw when building the request, so we detect it up front with a clear message.
+function firstNonLatin1Char(value: string): string | undefined {
+  for (const ch of value) {
+    if (ch.codePointAt(0)! > 0xff) {
+      return ch;
+    }
+  }
+  return undefined;
+}
+
+async function readProxyErrorDetail(response: Response): Promise<string> {
+  try {
+    const raw = (await response.text()).trim();
+    if (!raw) {
+      return "";
+    }
+    try {
+      const parsed = JSON.parse(raw) as { error?: unknown };
+      if (typeof parsed.error === "string" && parsed.error.trim()) {
+        return parsed.error.trim();
+      }
+    } catch {
+      // Not JSON — fall through to the raw text.
+    }
+    return raw.slice(0, 300);
+  } catch {
+    return "";
+  }
 }
 
 function success(message: string): ApiValidationResult {

@@ -14,6 +14,7 @@ import {
   GripVertical,
   Home,
   Image as ImageIcon,
+  ImagePlus,
   Info,
   KeyRound,
   Layers,
@@ -34,6 +35,10 @@ import {
   Sparkles,
   Square,
   SlidersHorizontal,
+  Sun,
+  Moon,
+  RotateCcw,
+  Type as TypeIcon,
   ThumbsDown,
   ThumbsUp,
   Trash2,
@@ -48,17 +53,30 @@ import type {
   DragEvent as ReactDragEvent,
   FormEvent,
   PointerEvent as ReactPointerEvent,
+  ReactNode,
   SetStateAction,
   WheelEvent as ReactWheelEvent
 } from "react";
-import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { builtInSimulationStates, createStateFromDraft, hydrateState, seedState, type SimulationDraft } from "./data/seed";
 import { createId } from "./lib/id";
+import {
+  MAX_FOUNDATION_MODULE_BODY_CHARS,
+  MAX_MAIN_PROMPT_BODY_CHARS,
+  promptModuleBodyCharLimit
+} from "./lib/promptLimits";
 import { normalizeApiToken, validateLlmApi, validateNovelAiApi } from "./services/apiValidation";
 import { executeImageJob, planImageJob, shouldAutoRunImageJob } from "./services/imageOrchestrator";
 import { generateAssistantText } from "./services/llmClient";
-import { NeuralMapClient, type NeuralMapLiveGraph, type NeuralMapLiveNode } from "./services/neuralMapClient";
+import { encodeNovelAiVibe } from "./services/novelAiClient";
+import {
+  NeuralMapClient,
+  createPromptModuleSyncSignature,
+  isSemanticRetrievalModule,
+  type NeuralMapLiveGraph,
+  type NeuralMapLiveNode
+} from "./services/neuralMapClient";
 import { toShareableLlmSettings, toShareableNovelAiSettings } from "./services/runtimeApiSettings";
 import { relaxImageUserRulesForAdultMode } from "./services/contentRating";
 import {
@@ -80,12 +98,17 @@ import {
 } from "./services/dynamicChatApi";
 import { createAuditEvent, createRedactionRequest } from "./services/security";
 import { createResetSessionState, planImageJobForCompletedTurn, runSimulationTurn } from "./services/simulationEngine";
+import { slimProgressRunForStorage } from "./services/progressRuns";
 import { activateSimulationProgressRun, createFreshSimulationRun, deleteSimulationProgressRun } from "./services/simulationRuns";
+import { isCliAgentLlmProvider } from "./types";
 import type {
   AppState,
   ApiRegistrationStatus,
+  AssistantImageCueDraft,
+  AssistantSidecar,
   ContentRating,
   ContextEvidence,
+  ContextPack,
   EvaluationScenario,
   ImageAsset,
   ImageCue,
@@ -93,6 +116,7 @@ import type {
   ImageGenerationCadence,
   ImageGenerationJob,
   ImageGenerationProfile,
+  ImageScenePresetExampleFile,
   ImageSceneTagPreset,
   ImageSceneTagPresetNode,
   ImageSafetyLevel,
@@ -102,12 +126,15 @@ import type {
   NeuralMapSettings,
   NovelAiAutomationTermination,
   NovelAiApiSettings,
+  NovelAiVibeTransferReference,
   NovelAiModelPreset,
   NovelAiNoiseSchedule,
   PromptModule,
   PromptModuleKind,
+  PromptModuleUsage,
   RelationshipMapSettings,
   RelationshipStatusParameter,
+  SidecarTrace,
   SimulationProgressRun,
   SimulationPromptMode,
   SimulationCharacterDraft,
@@ -220,8 +247,8 @@ const llmProviderOptions: Array<{
     value: "codex",
     label: "Codex / OpenAI",
     baseUrl: "https://api.openai.com/v1",
-    defaultModel: "gpt-4.1-mini",
-    models: ["gpt-4.1-mini", "gpt-4.1", "o4-mini"],
+    defaultModel: "gpt-5-mini",
+    models: ["gpt-5", "gpt-5-mini", "o4-mini", "gpt-4.1", "gpt-4.1-mini"],
     keyPlaceholder: "sk-...",
     advancedBaseUrl: false
   },
@@ -229,9 +256,10 @@ const llmProviderOptions: Array<{
     value: "gemini",
     label: "Gemini",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-    defaultModel: "gemini-2.5-flash",
+    defaultModel: "gemini-3-pro-preview",
     models: [
       "gemini-3.1-pro-preview",
+      "gemini-3-pro-preview",
       "gemini-3-flash-preview",
       "gemini-3.1-flash-lite-preview",
       "gemini-2.5-pro",
@@ -246,8 +274,14 @@ const llmProviderOptions: Array<{
     value: "claude",
     label: "Claude",
     baseUrl: "https://api.anthropic.com/v1",
-    defaultModel: "claude-3-5-sonnet-latest",
-    models: ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-opus-latest"],
+    defaultModel: "claude-sonnet-4-6",
+    models: [
+      "claude-opus-4-7",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5-20251001",
+      "claude-3-7-sonnet-latest",
+      "claude-3-5-haiku-latest"
+    ],
     keyPlaceholder: "sk-ant-...",
     advancedBaseUrl: false
   },
@@ -259,6 +293,41 @@ const llmProviderOptions: Array<{
     models: ["local-model", "custom"],
     keyPlaceholder: "provider key",
     advancedBaseUrl: true
+  },
+  {
+    value: "claude_cli",
+    label: "Claude 구독 CLI",
+    baseUrl: "",
+    defaultModel: "sonnet",
+    models: ["sonnet", "opus", "haiku", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    keyPlaceholder: "구독 CLI — API 키 불필요",
+    advancedBaseUrl: false
+  },
+  {
+    value: "codex_cli",
+    label: "Codex 구독 CLI",
+    baseUrl: "",
+    defaultModel: "gpt-5-codex",
+    models: ["gpt-5-codex", "gpt-5", "gpt-5-mini", "o4-mini"],
+    keyPlaceholder: "구독 CLI — API 키 불필요",
+    advancedBaseUrl: false
+  },
+  {
+    value: "gemini_cli",
+    label: "Gemini 구독 CLI",
+    baseUrl: "",
+    defaultModel: "gemini-3-pro-preview",
+    models: [
+      "gemini-3.1-pro-preview",
+      "gemini-3-pro-preview",
+      "gemini-3-flash-preview",
+      "gemini-3.1-flash-lite-preview",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite"
+    ],
+    keyPlaceholder: "구독 CLI — API 키 불필요",
+    advancedBaseUrl: false
   }
 ];
 
@@ -315,6 +384,7 @@ type NeuralMapNodeEditDraft = {
 };
 const SIMULATION_LIBRARY_STORAGE_KEY = "dynamicchat.simulationLibrary.v1";
 const PERSONAL_API_VAULT_STORAGE_KEY = "dynamicchat.personalApiVault.v1";
+const AUTO_PROGRESS_INTENT_STORAGE_KEY = "dynamicchat.autoProgressIntent.v1";
 const OPS_RAIL_WIDTH_STORAGE_KEY = "dynamicchat.opsRailWidth.v1";
 const DEFAULT_OPS_RAIL_WIDTH = 360;
 const MIN_OPS_RAIL_WIDTH = 280;
@@ -328,10 +398,182 @@ const AUTO_RESET_DEGRADED_TRACE_MIN_TURNS = 5;
 const AUTO_RESET_DEGRADED_TRACE_LIMIT = 2;
 const AUTO_RESET_PRESSURE_NOTICE_THRESHOLD = 0.72;
 const AUTO_CONTINUE_TURN_TEXT = "이어서 진행";
+// Ordered stages of a single turn, shown live in the chat thread's pending card.
+type TurnPhase = "retrieving" | "generating" | "images";
 const PRODUCT_TAGLINE = "기억, 장면, 이미지를 한 흐름으로 잇는 시뮬레이션 작업대.";
 const PRODUCT_HOME_DESCRIPTION = "Prompt Tree와 Context Pack으로 세계를 정리하고, Image Cue까지 한 턴의 흐름 안에서 붙잡습니다.";
 const EMPTY_IMAGE_ASSETS: ImageAsset[] = [];
 const EMPTY_IMAGE_JOBS: ImageGenerationJob[] = [];
+
+// ── Reader (story output) preferences ───────────────────────────────────────
+// The narrative window is the surface users stare at for hours, so it gets first-class
+// typographic controls — font, size, leading, measure, theme — persisted locally.
+const READER_SETTINGS_STORAGE_KEY = "dynamicchat.readerSettings.v1";
+
+type ReaderFontKey = "maruburi" | "pretendard" | "noto-serif" | "gowun" | "ibm-plex" | "system";
+type ReaderTheme = "day" | "sepia" | "night";
+type ReaderWidth = "narrow" | "normal" | "wide";
+
+interface ReaderFontOption {
+  key: ReaderFontKey;
+  label: string;
+  hint: string;
+  stack: string;
+  kind: "serif" | "sans";
+}
+
+const READER_FONT_OPTIONS: ReaderFontOption[] = [
+  {
+    key: "maruburi",
+    label: "마루부리",
+    hint: "기본 명조",
+    kind: "serif",
+    stack: '"MaruBuri", "Nanum Myeongjo", "Apple SD Gothic Neo", serif'
+  },
+  {
+    key: "noto-serif",
+    label: "본명조",
+    hint: "또렷한 명조",
+    kind: "serif",
+    stack: '"Noto Serif KR", "MaruBuri", serif'
+  },
+  {
+    key: "gowun",
+    label: "고운바탕",
+    hint: "부드러운 바탕",
+    kind: "serif",
+    stack: '"Gowun Batang", "MaruBuri", serif'
+  },
+  {
+    key: "pretendard",
+    label: "프리텐다드",
+    hint: "기본 고딕",
+    kind: "sans",
+    stack: 'Pretendard, "Apple SD Gothic Neo", system-ui, sans-serif'
+  },
+  {
+    key: "ibm-plex",
+    label: "IBM Plex",
+    hint: "모던 고딕",
+    kind: "sans",
+    stack: '"IBM Plex Sans KR", Pretendard, sans-serif'
+  },
+  {
+    key: "system",
+    label: "시스템",
+    hint: "기기 기본",
+    kind: "sans",
+    stack: 'system-ui, "Apple SD Gothic Neo", "Segoe UI", sans-serif'
+  }
+];
+
+const READER_WIDTH_OPTIONS: Array<{ key: ReaderWidth; label: string; measure: number }> = [
+  { key: "narrow", label: "좁게", measure: 720 },
+  { key: "normal", label: "기본", measure: 840 },
+  { key: "wide", label: "넓게", measure: 1040 }
+];
+
+const READER_THEME_OPTIONS: Array<{ key: ReaderTheme; label: string }> = [
+  { key: "day", label: "낮" },
+  { key: "sepia", label: "세피아" },
+  { key: "night", label: "밤" }
+];
+
+const READER_FONT_SIZE_MIN = 15;
+const READER_FONT_SIZE_MAX = 24;
+const READER_LINE_HEIGHT_MIN = 1.6;
+const READER_LINE_HEIGHT_MAX = 2.2;
+
+interface ReaderSettings {
+  fontKey: ReaderFontKey;
+  fontSize: number;
+  lineHeight: number;
+  width: ReaderWidth;
+  theme: ReaderTheme;
+  dialogueEmphasis: boolean;
+}
+
+const DEFAULT_READER_SETTINGS: ReaderSettings = {
+  fontKey: "maruburi",
+  fontSize: 18,
+  lineHeight: 1.9,
+  width: "normal",
+  theme: "day",
+  dialogueEmphasis: true
+};
+
+function clampNumber(value: number, min: number, max: number, fallback: number): number {
+  return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+}
+
+function resolveReaderFontStack(fontKey: ReaderFontKey): string {
+  return (READER_FONT_OPTIONS.find((option) => option.key === fontKey) ?? READER_FONT_OPTIONS[0]).stack;
+}
+
+function resolveReaderMeasure(width: ReaderWidth): number {
+  return (READER_WIDTH_OPTIONS.find((option) => option.key === width) ?? READER_WIDTH_OPTIONS[1]).measure;
+}
+
+function normalizeReaderSettings(input: Partial<ReaderSettings> | null | undefined): ReaderSettings {
+  if (!input || typeof input !== "object") {
+    return { ...DEFAULT_READER_SETTINGS };
+  }
+  const fontKey = READER_FONT_OPTIONS.some((option) => option.key === input.fontKey)
+    ? (input.fontKey as ReaderFontKey)
+    : DEFAULT_READER_SETTINGS.fontKey;
+  const width = READER_WIDTH_OPTIONS.some((option) => option.key === input.width)
+    ? (input.width as ReaderWidth)
+    : DEFAULT_READER_SETTINGS.width;
+  const theme = READER_THEME_OPTIONS.some((option) => option.key === input.theme)
+    ? (input.theme as ReaderTheme)
+    : DEFAULT_READER_SETTINGS.theme;
+  return {
+    fontKey,
+    width,
+    theme,
+    fontSize: Math.round(
+      clampNumber(Number(input.fontSize), READER_FONT_SIZE_MIN, READER_FONT_SIZE_MAX, DEFAULT_READER_SETTINGS.fontSize)
+    ),
+    lineHeight:
+      Math.round(
+        clampNumber(Number(input.lineHeight), READER_LINE_HEIGHT_MIN, READER_LINE_HEIGHT_MAX, DEFAULT_READER_SETTINGS.lineHeight) *
+          10
+      ) / 10,
+    dialogueEmphasis: input.dialogueEmphasis ?? DEFAULT_READER_SETTINGS.dialogueEmphasis
+  };
+}
+
+function loadReaderSettings(): ReaderSettings {
+  if (typeof window === "undefined") {
+    return { ...DEFAULT_READER_SETTINGS };
+  }
+  try {
+    const raw = window.localStorage.getItem(READER_SETTINGS_STORAGE_KEY);
+    return normalizeReaderSettings(raw ? (JSON.parse(raw) as Partial<ReaderSettings>) : null);
+  } catch {
+    return { ...DEFAULT_READER_SETTINGS };
+  }
+}
+
+function saveReaderSettings(settings: ReaderSettings): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(READER_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // best-effort persistence; ignore quota/availability errors
+  }
+}
+
+function readerStageStyle(settings: ReaderSettings): CSSProperties {
+  return {
+    "--story-font": resolveReaderFontStack(settings.fontKey),
+    "--reader-size": `${settings.fontSize}px`,
+    "--reader-line": settings.lineHeight,
+    "--reader-measure": `${resolveReaderMeasure(settings.width)}px`
+  } as CSSProperties;
+}
 
 type PresetPromptMode = Exclude<SimulationPromptMode, "custom">;
 
@@ -503,9 +745,17 @@ type PersonalSecretRecord = {
   subscriptionTier?: string;
 };
 
+type PersonalVibeTransferSettings = {
+  enabled: boolean;
+  references: NovelAiVibeTransferReference[];
+};
+
 type PersonalApiVault = {
   llmByProvider: Partial<Record<LlmApiSettings["provider"], PersonalSecretRecord>>;
   novelAi: PersonalSecretRecord;
+  // Vibe transfer is a global personal setting (references + their encodings) so it applies to every
+  // simulation and survives switching/new progressions, rather than living in per-simulation state.
+  vibeTransfer: PersonalVibeTransferSettings;
   imageStoragePath: string;
   updatedAt?: string;
 };
@@ -551,17 +801,142 @@ const dynamicTextBlockAliases: Record<string, DynamicTextBlockKind> = {
   memo: "memory",
   system: "status"
 };
+type NarrationMediaContextValue = {
+  slots: NarrationFlowItem[];
+  onFeedback: (assetId: string, rating: ImageFeedbackRating) => void;
+};
+
+// Lets the markdown `img` renderer reach the message's generated media so [Image: ...] markers can be swapped for the
+// actual image inline (inside paragraphs, table cells, etc.) instead of leaking the literal marker text.
+const NarrationMediaContext = createContext<NarrationMediaContextValue | undefined>(undefined);
+
+function parseNarrationImageMarker(src: string | undefined): number | undefined {
+  if (!src) {
+    return undefined;
+  }
+  const match = src.match(/^dynamicchat-image:(\d+)$/u);
+  return match ? Number(match[1]) : undefined;
+}
+
+function NarrationImage({ src, alt }: { src?: string; alt?: string }) {
+  const media = useContext(NarrationMediaContext);
+  const markerIndex = parseNarrationImageMarker(src);
+  if (markerIndex !== undefined) {
+    const slot = media?.slots[markerIndex];
+    if (slot?.kind === "image") {
+      return <CrackMarkerImage asset={slot.asset} onFeedback={media?.onFeedback} />;
+    }
+    if (slot?.kind === "job") {
+      return <CrackMarkerJob status={slot.job.status} />;
+    }
+    // Marker with no matching media (e.g. image generation disabled): drop it instead of showing the literal token.
+    return null;
+  }
+  if (!src) {
+    return null;
+  }
+  return <img className="rich-inline-image" src={src} alt={alt ?? ""} loading="lazy" />;
+}
+
+const CrackMarkerImage = memo(function CrackMarkerImage({
+  asset,
+  onFeedback
+}: {
+  asset: ImageAsset;
+  onFeedback?: (assetId: string, rating: ImageFeedbackRating) => void;
+}) {
+  const [measuredAspectRatio, setMeasuredAspectRatio] = useState<string>();
+  const style = {
+    "--tone-a": asset.palette[0],
+    "--tone-b": asset.palette[1],
+    "--tone-c": asset.palette[2],
+    "--image-aspect-ratio": measuredAspectRatio ?? createImageAssetAspectRatio(asset)
+  } as CSSProperties;
+
+  return (
+    <span className="crack-marker-image" style={style}>
+      <AssetImage
+        src={createImageAssetSrc(asset)}
+        alt={asset.title}
+        onNaturalSize={(width, height) => setMeasuredAspectRatio(`${width} / ${height}`)}
+      />
+      {onFeedback ? (
+        <span className="crack-marker-image-actions">
+          <button type="button" onClick={() => onFeedback(asset.id, "liked")} aria-label="이미지 선호">
+            <ThumbsUp size={13} />
+          </button>
+          <button type="button" onClick={() => onFeedback(asset.id, "rejected")} aria-label="이미지 제외">
+            <ThumbsDown size={13} />
+          </button>
+        </span>
+      ) : null}
+    </span>
+  );
+});
+
+function CrackMarkerJob({ status }: { status: ImageGenerationJob["status"] }) {
+  return (
+    <span className="crack-marker-job" role="status">
+      <ImageIcon size={13} />
+      {status === "failed" ? "이미지 생성 실패" : "이미지 생성 중…"}
+    </span>
+  );
+}
+
+// Wrap quoted dialogue runs (straight, curly, guillemet, and 「」 corner quotes) in a span so the reader
+// can optionally tint spoken lines — a differentiator most narrative chat UIs lack. Pure text segments are
+// left untouched so markdown structure (bold/links/images) is never disturbed.
+const dialogueSpanPattern = /(“[^”]*”|「[^」]*」|«[^»]*»|"[^"\n]{0,400}")/u;
+const dialogueSplitPattern = new RegExp(dialogueSpanPattern.source, "gu");
+
+function decorateDialogue(children: ReactNode): ReactNode {
+  const counter = { value: 0 };
+  const transform = (node: ReactNode): ReactNode => {
+    if (typeof node === "string") {
+      if (!dialogueSpanPattern.test(node)) {
+        return node;
+      }
+      const parts = node.split(dialogueSplitPattern);
+      return parts.map((part, index) =>
+        index % 2 === 1 ? (
+          <span className="rich-speech" key={`speech-${counter.value++}`}>
+            {part}
+          </span>
+        ) : (
+          part
+        )
+      );
+    }
+    if (Array.isArray(node)) {
+      return node.map((child) => transform(child as ReactNode));
+    }
+    return node;
+  };
+  return transform(children);
+}
+
 const dynamicMarkdownComponents: Components = {
+  img: ({ node: _node, src, alt }) => (
+    <NarrationImage src={typeof src === "string" ? src : undefined} alt={typeof alt === "string" ? alt : ""} />
+  ),
   h1: ({ node: _node, ...props }) => <h3 className="rich-heading level-1" {...props} />,
   h2: ({ node: _node, ...props }) => <h3 className="rich-heading level-2" {...props} />,
   h3: ({ node: _node, ...props }) => <h4 className="rich-heading level-3" {...props} />,
-  p: ({ node: _node, ...props }) => <p className="rich-paragraph" {...props} />,
+  p: ({ node: _node, children, ...props }) => (
+    <p className="rich-paragraph" {...props}>
+      {decorateDialogue(children)}
+    </p>
+  ),
   strong: ({ node: _node, ...props }) => <strong className="rich-strong" {...props} />,
   em: ({ node: _node, ...props }) => <em className="rich-emphasis" {...props} />,
   blockquote: ({ node: _node, ...props }) => <blockquote className="rich-quote" {...props} />,
   ul: ({ node: _node, ...props }) => <ul className="rich-list" {...props} />,
   ol: ({ node: _node, ...props }) => <ol className="rich-list ordered" {...props} />,
-  li: ({ node: _node, ...props }) => <li className="rich-list-item" {...props} />,
+  li: ({ node: _node, children, ...props }) => (
+    <li className="rich-list-item" {...props}>
+      {decorateDialogue(children)}
+    </li>
+  ),
   hr: ({ node: _node, ...props }) => <hr className="rich-divider" {...props} />,
   table: ({ node: _node, ...props }) => (
     <div className="rich-table-wrap">
@@ -688,9 +1063,72 @@ function separateAdjacentMarkdownTables(lines: string[]): string[] {
   return normalizedLines;
 }
 
+function createMarkdownTableDelimiterRow(columnCount: number): string {
+  const cells = Array.from({ length: Math.max(1, columnCount) }, () => "---");
+  return `| ${cells.join(" | ")} |`;
+}
+
+function insertMissingMarkdownTableDelimiters(lines: string[]): string[] {
+  const normalizedLines: string[] = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\s*```/u.test(line)) {
+      inFence = !inFence;
+      normalizedLines.push(line);
+      continue;
+    }
+
+    if (!inFence && isMarkdownTableRow(line)) {
+      const nextLine = readNextNonEmptyLine(lines, index + 1);
+      if (nextLine && isMarkdownTableRow(nextLine) && !isMarkdownTableDelimiter(nextLine)) {
+        normalizedLines.push(line);
+        normalizedLines.push(createMarkdownTableDelimiterRow(readMarkdownTableCells(line).length));
+        continue;
+      }
+    }
+
+    normalizedLines.push(line);
+  }
+
+  return normalizedLines;
+}
+
 function normalizeLooseMarkdownTables(content: string): string {
   const lines = content.replace(/\r\n/gu, "\n").split("\n");
-  return separateAdjacentMarkdownTables(removeLooseMarkdownTableHeaderGaps(lines)).join("\n");
+  return separateAdjacentMarkdownTables(
+    removeLooseMarkdownTableHeaderGaps(collapseBlankLinesWithinTables(insertMissingMarkdownTableDelimiters(lines)))
+  ).join("\n");
+}
+
+// Removes blank lines that sit BETWEEN two table rows so a "loose" table stays one contiguous block. Without this the
+// blank-line chunk splitter (and remark-gfm) would treat the body rows as a separate paragraph, so the table renders as
+// a plain block instead of a real table. Genuine table-to-table gaps are restored later by separateAdjacentMarkdownTables.
+function collapseBlankLinesWithinTables(lines: string[]): string[] {
+  const normalizedLines: string[] = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\s*```/u.test(line)) {
+      inFence = !inFence;
+      normalizedLines.push(line);
+      continue;
+    }
+
+    if (!inFence && !line.trim()) {
+      const previousLine = readPreviousNonEmptyLine(normalizedLines);
+      const nextLine = readNextNonEmptyLine(lines, index + 1);
+      if (previousLine && nextLine && isMarkdownTableRow(previousLine) && isMarkdownTableRow(nextLine)) {
+        continue;
+      }
+    }
+
+    normalizedLines.push(line);
+  }
+
+  return normalizedLines;
 }
 
 function formatActivationTags(tags: string[]): string {
@@ -867,8 +1305,16 @@ function normalizeStoredSecretRecord(
     ...(record ?? {})
   };
 
+  // Auth-failed tokens used to be wiped here, which forced the user to retype the API key on every restart
+  // and made the "register" button fail with "key required". Keep the saved key, just reset the status so
+  // the dialog reopens populated and the user can re-verify (or correct) without re-entering the token.
   if (options.discardAuthFailures && isAuthFailureSecretRecord(normalized)) {
-    return createEmptySecretRecord();
+    return {
+      ...normalized,
+      registrationStatus: "idle",
+      verificationMessage: "이전 검증이 실패했습니다. 토큰을 확인하고 다시 검증하세요.",
+      subscriptionTier: undefined
+    };
   }
 
   if (hasStoredSecret(normalized) && normalized.registrationStatus === "idle") {
@@ -897,10 +1343,24 @@ function normalizeStoredLlmSecrets(
   ) as Partial<Record<LlmApiSettings["provider"], PersonalSecretRecord>>;
 }
 
+function createEmptyVibeTransferSettings(): PersonalVibeTransferSettings {
+  return { enabled: false, references: [] };
+}
+
+function normalizeStoredVibeTransferSettings(
+  candidate: Partial<PersonalVibeTransferSettings> | undefined
+): PersonalVibeTransferSettings {
+  return {
+    enabled: candidate?.enabled === true,
+    references: Array.isArray(candidate?.references) ? candidate!.references : []
+  };
+}
+
 function createEmptyPersonalApiVault(): PersonalApiVault {
   return {
     llmByProvider: {},
     novelAi: createEmptySecretRecord(),
+    vibeTransfer: createEmptyVibeTransferSettings(),
     imageStoragePath: ""
   };
 }
@@ -909,8 +1369,25 @@ function hydratePersonalApiVault(candidate: Partial<PersonalApiVault> | undefine
   return {
     llmByProvider: normalizeStoredLlmSecrets(candidate?.llmByProvider),
     novelAi: normalizeStoredNovelAiSecretRecord(candidate?.novelAi),
+    vibeTransfer: normalizeStoredVibeTransferSettings(candidate?.vibeTransfer),
     imageStoragePath: candidate?.imageStoragePath?.trim() ?? "",
     updatedAt: candidate?.updatedAt
+  };
+}
+
+// Promote any per-simulation vibe transfer setup (from before vibe became global) into the vault so the
+// existing configuration keeps working across all simulations. Pure: only fills an empty vault.
+function promoteVibeTransferToVault(vault: PersonalApiVault, state: AppState | undefined): PersonalApiVault {
+  const stateReferences = state?.novelAi?.vibeTransferReferences;
+  if (vault.vibeTransfer.references.length > 0 || !Array.isArray(stateReferences) || stateReferences.length === 0) {
+    return vault;
+  }
+  return {
+    ...vault,
+    vibeTransfer: {
+      enabled: state?.novelAi?.vibeTransferEnabled === true,
+      references: stateReferences
+    }
   };
 }
 
@@ -930,7 +1407,111 @@ function loadPersonalApiVault(): PersonalApiVault {
 }
 
 function savePersonalApiVault(vault: PersonalApiVault): void {
-  window.localStorage.setItem(PERSONAL_API_VAULT_STORAGE_KEY, JSON.stringify(vault));
+  try {
+    window.localStorage.setItem(PERSONAL_API_VAULT_STORAGE_KEY, JSON.stringify(vault));
+  } catch (error) {
+    console.warn(
+      "DynamicChat: personal vault local cache write failed (storage quota?); vault will be re-read from server on next load.",
+      error
+    );
+  }
+}
+
+/**
+ * Downscale a data-URL image to at most `maxDim` pixels on the long edge,
+ * then re-encode as JPEG at the given quality. Returns the compressed data URL,
+ * or the original data URL if the canvas path fails for any reason.
+ */
+async function downscaleImageToDataUrl(dataUrl: string, maxDim = 448, quality = 0.85): Promise<string> {
+  try {
+    return await new Promise<string>((resolve) => {
+      const img = new window.Image();
+      img.onload = () => {
+        const { naturalWidth: w, naturalHeight: h } = img;
+        const scale = Math.min(1, maxDim / Math.max(w, h, 1));
+        const tw = Math.max(1, Math.round(w * scale));
+        const th = Math.max(1, Math.round(h * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = tw;
+        canvas.height = th;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(dataUrl);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, tw, th);
+        const compressed = canvas.toDataURL("image/jpeg", quality);
+        resolve(compressed);
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    });
+  } catch {
+    return dataUrl;
+  }
+}
+
+// Auto-progress runs as a client-side loop. To make it survive a page refresh / reload we persist the
+// "keep going" intent (which run, how many turns remain). On the next load we resume the loop only when the
+// stored intent still points at the EXACT same simulation/session/progress run, so a resume never bleeds into
+// a different run (isolation) or a sim the user has since switched away from.
+interface AutoProgressIntent {
+  simulationId: string;
+  activeSessionId: string;
+  activeProgressRunId: string;
+  remaining: number;
+  total: number;
+}
+
+function loadAutoProgressIntent(): AutoProgressIntent | undefined {
+  const raw = window.localStorage.getItem(AUTO_PROGRESS_INTENT_STORAGE_KEY);
+  if (!raw) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<AutoProgressIntent>;
+    if (
+      typeof parsed.simulationId === "string" &&
+      typeof parsed.activeSessionId === "string" &&
+      typeof parsed.activeProgressRunId === "string" &&
+      typeof parsed.remaining === "number" &&
+      parsed.remaining > 0
+    ) {
+      return {
+        simulationId: parsed.simulationId,
+        activeSessionId: parsed.activeSessionId,
+        activeProgressRunId: parsed.activeProgressRunId,
+        remaining: parsed.remaining,
+        total: typeof parsed.total === "number" ? parsed.total : parsed.remaining
+      };
+    }
+  } catch {
+    /* fall through to clear */
+  }
+
+  window.localStorage.removeItem(AUTO_PROGRESS_INTENT_STORAGE_KEY);
+  return undefined;
+}
+
+function saveAutoProgressIntent(intent: AutoProgressIntent): void {
+  try {
+    window.localStorage.setItem(AUTO_PROGRESS_INTENT_STORAGE_KEY, JSON.stringify(intent));
+  } catch {
+    /* best-effort; resume after refresh is non-critical */
+  }
+}
+
+function clearAutoProgressIntent(): void {
+  window.localStorage.removeItem(AUTO_PROGRESS_INTENT_STORAGE_KEY);
+}
+
+function autoProgressIntentMatchesState(intent: AutoProgressIntent, state: AppState): boolean {
+  return (
+    intent.simulationId === state.simulation.id &&
+    intent.activeSessionId === state.simulation.activeSessionId &&
+    intent.activeProgressRunId === state.activeProgressRunId
+  );
 }
 
 function getPersonalLlmSecret(vault: PersonalApiVault, provider: LlmApiSettings["provider"]): PersonalSecretRecord {
@@ -964,13 +1545,22 @@ function applyPersonalApiVault(state: AppState, vault: PersonalApiVault): AppSta
       registrationStatus: novelAiSecret.registrationStatus,
       verifiedAt: novelAiSecret.verifiedAt,
       verificationMessage: novelAiSecret.verificationMessage,
-      subscriptionTier: novelAiSecret.subscriptionTier
+      subscriptionTier: novelAiSecret.subscriptionTier,
+      // Vibe transfer is global: the vault is the source of truth, so it applies to whichever simulation
+      // is active (including brand-new ones / new progressions).
+      vibeTransferEnabled: vault.vibeTransfer.enabled,
+      vibeTransferReferences: vault.vibeTransfer.references
     }
   };
 }
 
 function hasPersonalApiVaultSecrets(vault: PersonalApiVault): boolean {
-  return Boolean(vault.imageStoragePath.trim()) || hasStoredSecret(vault.novelAi) || Object.values(vault.llmByProvider).some((record) => Boolean(record && hasStoredSecret(record)));
+  return (
+    Boolean(vault.imageStoragePath.trim()) ||
+    hasStoredSecret(vault.novelAi) ||
+    vault.vibeTransfer.references.length > 0 ||
+    Object.values(vault.llmByProvider).some((record) => Boolean(record && hasStoredSecret(record)))
+  );
 }
 
 function mergePersonalSecretRecord(
@@ -1008,9 +1598,20 @@ function mergePersonalApiVaults(localVault: PersonalApiVault, serverVault: Perso
   const localUpdatedAt = new Date(localVault.updatedAt ?? 0).getTime();
   const serverUpdatedAt = new Date(serverVault.updatedAt ?? 0).getTime();
 
+  const newerVault = serverUpdatedAt > localUpdatedAt ? serverVault : localVault;
+  // Vibe transfer (references + encodings) is taken from whichever side is newer, but never let a newer-but-
+  // empty side wipe a populated one (e.g. a fresh device that synced before the user re-added references).
+  const mergedVibeTransfer =
+    newerVault.vibeTransfer.references.length > 0
+      ? newerVault.vibeTransfer
+      : localVault.vibeTransfer.references.length > 0
+        ? localVault.vibeTransfer
+        : serverVault.vibeTransfer;
+
   return {
     llmByProvider,
     novelAi: mergePersonalSecretRecord(localVault.novelAi, serverVault.novelAi, { discardAuthFailures: true }),
+    vibeTransfer: normalizeStoredVibeTransferSettings(mergedVibeTransfer),
     imageStoragePath: serverUpdatedAt > localUpdatedAt
       ? serverVault.imageStoragePath.trim()
       : localVault.imageStoragePath.trim() || serverVault.imageStoragePath.trim(),
@@ -1123,8 +1724,9 @@ function pickInitialSimulation(localState: AppState, library: SimulationLibrary,
   const localUpdatedAt = new Date(localState.simulation.updatedAt).getTime();
   const matching = library.find((item) => item.simulation.id === localState.simulation.id);
 
-  if (preferLocalMatch && matching && new Date(matching.simulation.updatedAt).getTime() >= localUpdatedAt) {
-    return matching;
+  if (preferLocalMatch && matching) {
+    // If library (server) version is newer or equal, use it; otherwise local is newer so keep local.
+    return new Date(matching.simulation.updatedAt).getTime() >= localUpdatedAt ? matching : localState;
   }
 
   return library[0] ?? localState;
@@ -1338,6 +1940,13 @@ function stripLibrarySecrets(state: AppState): AppState {
   return {
     ...state,
     llm: toShareableLlmSettings(state.llm),
+    imageTagLlm: {
+      ...state.imageTagLlm,
+      apiKey: "",
+      registrationStatus: "idle" as const,
+      verifiedAt: undefined,
+      verificationMessage: ""
+    },
     novelAi: toShareableNovelAiSettings(state.novelAi)
   };
 }
@@ -1595,8 +2204,34 @@ function mergeHydratedImagePayloadsIntoState(state: AppState, hydratedAssets: Im
       };
 }
 
+/** Maximum number of progress runs to persist. Older runs beyond this cap are
+ *  silently dropped at save time (in-memory state is unaffected). 30 gives a
+ *  generous history without letting the stored file grow unboundedly. */
+const MAX_STORED_PROGRESS_RUNS = 30;
+
+/**
+ * Returns a copy of the given state where every stored progressRun has been
+ * slimmed (heavy NAI payloads + debug traces removed) and the list is capped
+ * to MAX_STORED_PROGRESS_RUNS most-recent entries.
+ *
+ * This ONLY affects the snapshot that gets written to storage. The live
+ * in-memory state (state.imageAssets, state.imageJobs, state.turnTraces …)
+ * is intentionally left untouched so the active session keeps all runtime
+ * data it needs.
+ */
+function slimStateProgressRunsForStorage(state: AppState): AppState {
+  const sorted = [...state.progressRuns].sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+  );
+  const cappedSlimRuns = sorted.slice(0, MAX_STORED_PROGRESS_RUNS).map(slimProgressRunForStorage);
+  return {
+    ...state,
+    progressRuns: cappedSlimRuns
+  };
+}
+
 function saveStateSnapshot(state: AppState, options?: SaveStateOptions): void {
-  saveState(state, options);
+  saveState(slimStateProgressRunsForStorage(state), options);
 }
 
 function scheduleIdleTask(callback: () => void, timeout = 1400): () => void {
@@ -1650,8 +2285,56 @@ async function createVerifiedNovelAiPatch(settings: NovelAiApiSettings): Promise
   };
 }
 
-function waitForImagePipelineStep(): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, 140));
+const IMAGE_JOB_CONCURRENCY = 2;
+
+// The subset of a turn that image dispatch actually needs. A full TurnResult satisfies it, and the
+// early (mid-stream) dispatch synthesizes a minimal one before the turn has fully resolved.
+interface ImageDispatchTurn {
+  userMessage: ChatMessage;
+  assistantMessage: ChatMessage;
+  contextPack: ContextPack;
+  promptModuleUsages: PromptModuleUsage[];
+  sidecar?: AssistantSidecar;
+  sidecarTrace?: SidecarTrace;
+  turnTrace: { id: string };
+}
+
+// Payload the engine hands back the instant it has parsed the (front-loaded) image_cues mid-stream,
+// carrying the real turn context so the client can dispatch the image before the narrative finishes.
+interface EarlyImageCuePayload {
+  cues: AssistantImageCueDraft[];
+  userMessage: ChatMessage;
+  assistantMessage: ChatMessage;
+  contextPack: ContextPack;
+  promptModuleUsages: PromptModuleUsage[];
+}
+
+async function runRunnableImageJobs(
+  jobs: ImageGenerationJob[],
+  snapshot: AppState,
+  runJob: (job: ImageGenerationJob, snapshot: AppState) => Promise<void>
+): Promise<void> {
+  const runnableJobs = jobs.filter(shouldAutoRunImageJob);
+  if (runnableJobs.length === 0) {
+    return;
+  }
+
+  // Run every job through the concurrency pool from the start. Previously the first job was awaited ALONE
+  // before the rest began, which serialized it — with no early-dispatch path anymore that just made the first
+  // image an isolated wait. Now the first IMAGE_JOB_CONCURRENCY jobs start together. (setState merges via
+  // upsertImageAssets, so concurrent completions are race-safe.)
+  const queue = [...runnableJobs];
+  const workerCount = Math.min(IMAGE_JOB_CONCURRENCY, queue.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        const job = queue.shift();
+        if (job) {
+          await runJob(job, snapshot);
+        }
+      }
+    })
+  );
 }
 
 function runAfterNextPaint(callback: () => void): void {
@@ -1768,8 +2451,24 @@ function getImageJobCue(job: ImageGenerationJob): Partial<ImageCue> {
   return cue && typeof cue === "object" && !Array.isArray(cue) ? cue as Partial<ImageCue> : {};
 }
 
+function getImageJobBaseCue(job: ImageGenerationJob): Partial<ImageCue> {
+  const storedCue = getImageJobCue(job);
+  const variants = Array.isArray(job.providerPayload.promptVariants) ? job.providerPayload.promptVariants : [];
+  const firstVariant = variants[0];
+  const variantCue =
+    firstVariant && typeof firstVariant === "object" && !Array.isArray(firstVariant)
+      ? (firstVariant as { cue?: unknown }).cue
+      : undefined;
+  const rawCue =
+    variantCue && typeof variantCue === "object" && !Array.isArray(variantCue) ? (variantCue as Partial<ImageCue>) : {};
+  // The first variant cue preserves the RAW LLM-authored character_prompts (before local appearance/outfit
+  // composition), so prefer it on regeneration to avoid both dropping per-character captions and double-injecting
+  // identity/outfit when the plan re-composes them. Falls back to the stored cue for older jobs without variants.
+  return { ...storedCue, ...rawCue };
+}
+
 function createImageCueForRegeneration(state: AppState, job: ImageGenerationJob): ImageCue {
-  const cue = getImageJobCue(job);
+  const cue = getImageJobBaseCue(job);
   const characters =
     Array.isArray(cue.characters) && cue.characters.length > 0
       ? cue.characters.filter((characterId) => state.characters.some((character) => character.id === characterId))
@@ -1788,6 +2487,8 @@ function createImageCueForRegeneration(state: AppState, job: ImageGenerationJob)
     reason: job.reason || cue.reason || "이미지 재생성",
     characters,
     tags: Array.isArray(cue.tags) ? cue.tags : [],
+    baseTags: Array.isArray(cue.baseTags) ? cue.baseTags : undefined,
+    characterPrompts: Array.isArray(cue.characterPrompts) ? cue.characterPrompts : undefined,
     scene: typeof cue.scene === "string" ? cue.scene : "current simulation scene",
     suppressionReason: undefined,
     visualContext: [cue.scene, state.simulation.title, characterVisualContext].filter(Boolean).join(", ")
@@ -2141,6 +2842,7 @@ function cloneImageScenePresetNodes(nodes: ImageSceneTagPresetNode[] | undefined
   return (nodes ?? []).map((node) => ({
     ...node,
     tags: [...node.tags],
+    exampleFiles: node.exampleFiles ? node.exampleFiles.map((file) => ({ ...file, prompts: [...file.prompts] })) : undefined,
     children: cloneImageScenePresetNodes(node.children)
   }));
 }
@@ -2186,6 +2888,13 @@ function normalizeDraftImageScenePresetNodes(
     keyword: node.keyword.trim() || `scene-${index + 1}`,
     tags: node.tags.map((tag) => tag.trim()).filter(Boolean),
     note: node.note.trim(),
+    exampleFiles: (node.exampleFiles ?? [])
+      .map((file) => ({
+        ...file,
+        label: file.label.trim(),
+        prompts: file.prompts.map((line) => line.trim()).filter(Boolean)
+      }))
+      .filter((file) => file.label || file.prompts.length > 0),
     enabled: node.enabled,
     priority: Math.min(120, Math.max(0, Number(node.priority) || 70)),
     updatedAt,
@@ -2475,8 +3184,31 @@ function createDraftFromState(source: AppState): SimulationDraft {
 function normalizeBuilderDraft(draft: SimulationDraft): SimulationDraft {
   return {
     ...draft,
+    relationshipMap: {
+      ...draft.relationshipMap,
+      parameters: ensureUniqueRelationshipParameterIds(draft.relationshipMap.parameters)
+    },
     imageScenePresets: ensureDraftImageScenePresetIds(draft.imageScenePresets ?? [])
   };
+}
+
+// Duplicate parameter ids make the editor treat several rows as one: updateRelationshipStatusParameter
+// matches by id, so editing one row's title/priority writes to every row sharing that id (and React
+// reuses DOM for the duplicate key). Persisted data can accumulate collisions across reloads, so repair
+// them whenever a draft enters the builder.
+function ensureUniqueRelationshipParameterIds(
+  parameters: RelationshipStatusParameter[]
+): RelationshipStatusParameter[] {
+  const seen = new Set<string>();
+  return parameters.map((parameter) => {
+    if (!parameter.id || seen.has(parameter.id)) {
+      const id = createId("rel_param");
+      seen.add(id);
+      return { ...parameter, id };
+    }
+    seen.add(parameter.id);
+    return parameter;
+  });
 }
 
 function updateStateFromDraft(existing: AppState, draft: SimulationDraft): AppState {
@@ -2957,11 +3689,14 @@ function findCharacterForNeuralNode(state: AppState, nodeId: string) {
 }
 
 function normalizeNeuralEditorTags(value: string): string[] {
+  // Keep multi-word phrases intact (collapse internal whitespace to a single space) instead of
+  // hyphenating them. Hyphenated phrases like "silver-key" never matched natural input ("silver key"),
+  // which silently limited creators to single-word triggers — see selectRelevantModules phrase matching.
   return value
     .split(",")
-    .map((tag) => tag.trim().toLowerCase().replace(/\s+/gu, "-"))
+    .map((tag) => tag.trim().toLowerCase().replace(/\s+/gu, " "))
     .filter(Boolean)
-    .slice(0, 10);
+    .slice(0, 16);
 }
 
 function parseCharacterContent(content: string): { summary: string; relationship: string; currentMood: string } {
@@ -3274,7 +4009,10 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    const fenceMatch = line.match(/^\s*```([\p{L}\p{N}_-]+)\s*$/u);
+    // Tolerate a space and any case after the opening backticks (e.g. "``` Status") so a status/dynamic
+    // block the LLM wrote as a loosely-fenced code block still becomes one styled block instead of a raw
+    // monospace code block whose rows render as separate lines.
+    const fenceMatch = line.match(/^\s*```\s*([\p{L}\p{N}_-]+)\s*$/u);
     const fenceKind = fenceMatch ? normalizeDynamicTextBlockKind(fenceMatch[1]) : undefined;
     if (fenceKind) {
       flushMarkdown();
@@ -3324,21 +4062,26 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
 
     const looseDirective = parseLooseDynamicTextDirective(line);
     if (looseDirective) {
-      flushMarkdown();
-      const blockLines = looseDirective.content ? [looseDirective.content] : [];
-      if (!looseDirective.content) {
-        index += 1;
-        while (index < lines.length && lines[index].trim()) {
-          blockLines.push(lines[index]);
+      const nextLine = lines[index + 1];
+      const opensMarkdownTable =
+        !looseDirective.content && Boolean(nextLine && isMarkdownTableRow(nextLine) && !isMarkdownTableDelimiter(nextLine));
+      if (!opensMarkdownTable) {
+        flushMarkdown();
+        const blockLines = looseDirective.content ? [looseDirective.content] : [];
+        if (!looseDirective.content) {
           index += 1;
+          while (index < lines.length && lines[index].trim()) {
+            blockLines.push(lines[index]);
+            index += 1;
+          }
         }
+        segments.push({
+          id: `${looseDirective.kind}-${segments.length}`,
+          kind: looseDirective.kind,
+          content: blockLines.join("\n").trim()
+        });
+        continue;
       }
-      segments.push({
-        id: `${looseDirective.kind}-${segments.length}`,
-        kind: looseDirective.kind,
-        content: blockLines.join("\n").trim()
-      });
-      continue;
     }
 
     markdownLines.push(line);
@@ -3402,18 +4145,60 @@ function mergeGeneratedMessageImageAssetIds(existingIds: string[], currentAssets
   return uniqueIds([...existingGeneratedIds, ...generatedNextIds]);
 }
 
-function createNarrationFlow(content: string, assets: ImageAsset[], jobs: ImageGenerationJob[]): NarrationFlowItem[] {
-  const textItems = createNarrationTextItems(content);
-  const mediaItems: NarrationFlowItem[] = [
-    ...jobs.map((job) => ({ id: `job-${job.id}`, kind: "job" as const, job })),
-    ...assets.map((asset) => ({ id: `asset-${asset.id}`, kind: "image" as const, asset }))
+interface NarrationRender {
+  items: NarrationFlowItem[];
+  markerSlots: NarrationFlowItem[];
+}
+
+const narrationImageMarkerPattern = /\[\s*(?:image|img|이미지|그림|일러스트|illustration)\s*[:：]\s*([^\]\n]*)\](?!\()/giu;
+
+// Handles the inline [Image: ...] markers the LLM writes. Only markers INSIDE a markdown table row become inline image
+// tokens (swapped for the actual generated image in that cell); markers elsewhere are stripped so they never show as
+// literal text, and their images fall back to the normal per-beat anchored placement. Returns the rewritten content and
+// how many table markers were converted.
+function prepareNarrationContent(content: string): { content: string; markerCount: number } {
+  let count = 0;
+  const converted = content
+    .replace(/\r\n/gu, "\n")
+    .split("\n")
+    .map((line) => {
+      const insideTable = isMarkdownTableRow(line);
+      return line.replace(narrationImageMarkerPattern, (_match, description: string) => {
+        if (!insideTable) {
+          // Prose marker: drop the literal text; the image is placed per beat by the normal flow.
+          return "";
+        }
+        const alt = String(description ?? "")
+          .replace(/[[\]()]/gu, " ")
+          .replace(/\s+/gu, " ")
+          .trim();
+        const token = `![${alt || `image ${count + 1}`}](dynamicchat-image:${count})`;
+        count += 1;
+        return token;
+      });
+    })
+    .join("\n");
+  return { content: converted, markerCount: count };
+}
+
+function createNarrationFlow(content: string, assets: ImageAsset[], jobs: ImageGenerationJob[]): NarrationRender {
+  const { content: preparedContent, markerCount } = prepareNarrationContent(content);
+  const textItems = createNarrationTextItems(preparedContent);
+  // Order completed assets before pending jobs so marker index k maps to the k-th image in document order.
+  const orderedMedia: NarrationFlowItem[] = [
+    ...assets.map((asset) => ({ id: `asset-${asset.id}`, kind: "image" as const, asset })),
+    ...jobs.map((job) => ({ id: `job-${job.id}`, kind: "job" as const, job }))
   ];
+  // The first markerCount media are rendered inline at their [Image: ...] markers (via NarrationMediaContext), so only
+  // the remaining (unmarked) media still need to be anchored/appended in the flow.
+  const markerSlots = orderedMedia.slice(0, markerCount);
+  const mediaItems = orderedMedia.slice(markerCount);
 
   if (mediaItems.length === 0) {
-    return textItems;
+    return { items: textItems, markerSlots };
   }
   if (textItems.length === 0) {
-    return mediaItems;
+    return { items: mediaItems, markerSlots };
   }
 
   const mediaBeforeByAnchor = new Map<number, NarrationFlowItem[]>();
@@ -3426,11 +4211,12 @@ function createNarrationFlow(content: string, assets: ImageAsset[], jobs: ImageG
     mediaByAnchor.set(anchorIndex, anchored);
   });
 
-  return textItems.flatMap((item, index) => [
+  const items = textItems.flatMap((item, index) => [
     ...(mediaBeforeByAnchor.get(index) ?? []),
     item,
     ...(mediaAfterByAnchor.get(index) ?? [])
   ]);
+  return { items, markerSlots };
 }
 
 function createNarrationTextItems(content: string): NarrationFlowItem[] {
@@ -3454,6 +4240,9 @@ function createNarrationTextItems(content: string): NarrationFlowItem[] {
   });
 }
 
+// Split a markdown segment into rendering chunks ONLY at real paragraph breaks (blank lines), keeping fenced code blocks
+// intact. We deliberately do not split mid-paragraph: per-beat images are placed at paragraph boundaries, and finer
+// splitting fragmented prose and broke multi-line markdown structures (tables, lists) into separate blocks.
 function splitMarkdownNarrationChunks(content: string): string[] {
   const lines = content.replace(/\r\n/gu, "\n").split("\n");
   const chunks: string[] = [];
@@ -3474,14 +4263,6 @@ function splitMarkdownNarrationChunks(content: string): string[] {
       continue;
     }
 
-    if (!inFence && current.length > 0 && shouldStartNarrationChunkForMedia(line, current[current.length - 1])) {
-      const chunk = current.join("\n").trim();
-      if (chunk) {
-        chunks.push(chunk);
-      }
-      current.length = 0;
-    }
-
     current.push(line);
   }
 
@@ -3491,24 +4272,6 @@ function splitMarkdownNarrationChunks(content: string): string[] {
   }
 
   return chunks.length > 0 ? chunks : [content];
-}
-
-function shouldStartNarrationChunkForMedia(line: string, previousLine: string | undefined): boolean {
-  const trimmed = line.trim();
-  const previous = previousLine?.trim() ?? "";
-  if (!trimmed || !previous) {
-    return false;
-  }
-  if (/^["“”「」『』]|\S.{0,20}[:：]/u.test(trimmed)) {
-    return true;
-  }
-  if (/^\*[^*]{2,}\*$|^_[^_]{2,}_$|^[（(].+[）)]$/u.test(trimmed)) {
-    return true;
-  }
-  return (
-    /손|손목|팔|어깨|가슴|허리|허벅지|다리|발|시선|얼굴|표정|움직|걸음|다가|멈추|잡|놓|돌아|밀|당기|뻗|action|gesture|reaches?|grabs?|holds?|leans?/iu.test(trimmed) &&
-    /["“”「」『』]|말하|속삭|외치|신음|voice|says?|said|whisper|moan/iu.test(previous)
-  );
 }
 
 function chooseNarrationMediaAnchor(
@@ -3665,9 +4428,22 @@ function normalizeNarrationAnchorText(value: string): string {
 
 function applyTurnResultToState(baseState: AppState, result: TurnResult): AppState {
   const resultImageJobs = result.imageJobs?.length ? result.imageJobs : result.imageJob ? [result.imageJob] : [];
+  // Early-dispatched images are attached to the live assistant message WHILE it streams, but result.assistantMessage
+  // was built at turn start with imageAssetIds: []. Without this merge, the final commit replaces the message and the
+  // first image vanishes (it appears briefly, then disappears). The result id is freshly generated each turn, so the
+  // only existing same-id message is this turn's own streaming message — merging never carries stale images forward.
+  const existingAssistant = baseState.messages.find((message) => message.id === result.assistantMessage.id);
+  const assistantMessage =
+    existingAssistant && existingAssistant.imageAssetIds.length > 0
+      ? {
+          ...result.assistantMessage,
+          imageAssetIds: uniqueIds([...existingAssistant.imageAssetIds, ...result.assistantMessage.imageAssetIds])
+        }
+      : result.assistantMessage;
   return {
     ...baseState,
-    messages: upsertMessagesById(baseState.messages, [result.userMessage, result.assistantMessage]),
+    simulation: { ...baseState.simulation, updatedAt: result.assistantMessage.createdAt },
+    messages: upsertMessagesById(baseState.messages, [result.userMessage, assistantMessage]),
     memoryEvents: upsertMemoryEventsById(baseState.memoryEvents, result.memoryEvents),
     contextPacks: [...baseState.contextPacks, result.contextPack],
     selectedContextPackId: result.contextPack.id,
@@ -3691,6 +4467,35 @@ function applyTurnResultToState(baseState: AppState, result: TurnResult): AppSta
         })
       )
     ]
+  };
+}
+
+// A session reset is a CONVERSATION reset, not a SIMULATION reset (docs/continuity-reset-checklist.md):
+// the new session must carry forward every simulation-level asset. createResetSessionState derives its
+// output from the turn's base snapshot (the auto-progress working state), which never accumulates this run's
+// async-generated image assets/jobs or the message/trace image links — those only ever reach the live React
+// state. Rebuilding React state straight from that reset base therefore wipes turns 1..N-1's rendered images
+// at the exact turn the handoff fires. Instead, layer ONLY the reset's new-session deltas (new activeSessionId,
+// handoff record + memory event, new-session system message, reset Context Pack, continuity check) on top of
+// the richer live React state. Idempotent: safe to apply once during streaming and again at final commit.
+function layerSessionResetOntoLiveState(liveState: AppState, resetState: AppState): AppState {
+  const liveMessageIds = new Set(liveState.messages.map((message) => message.id));
+  const liveMemoryEventIds = new Set(liveState.memoryEvents.map((event) => event.id));
+  const liveContextPackIds = new Set(liveState.contextPacks.map((pack) => pack.id));
+  const liveHandoffIds = new Set(liveState.handoffs.map((handoff) => handoff.id));
+  const liveContinuityIds = new Set(liveState.continuityChecks.map((check) => check.id));
+  return {
+    ...liveState,
+    simulation: resetState.simulation,
+    messages: [...liveState.messages, ...resetState.messages.filter((message) => !liveMessageIds.has(message.id))],
+    memoryEvents: [...liveState.memoryEvents, ...resetState.memoryEvents.filter((event) => !liveMemoryEventIds.has(event.id))],
+    contextPacks: [...liveState.contextPacks, ...resetState.contextPacks.filter((pack) => !liveContextPackIds.has(pack.id))],
+    handoffs: [...liveState.handoffs, ...resetState.handoffs.filter((handoff) => !liveHandoffIds.has(handoff.id))],
+    continuityChecks: [
+      ...liveState.continuityChecks,
+      ...resetState.continuityChecks.filter((check) => !liveContinuityIds.has(check.id))
+    ],
+    selectedContextPackId: resetState.selectedContextPackId ?? liveState.selectedContextPackId
   };
 }
 
@@ -3880,6 +4685,10 @@ function isAfterIso(value: string | undefined, threshold: string | undefined): b
 
 function createLlmFallbackNotice(prefix: string, trace: TurnResult["sidecarTrace"]): string {
   const firstError = trace.errors.find((error) => error.trim())?.replace(/\s+/gu, " ").trim();
+  if (firstError && /429|rate limit|요청 제한|RESOURCE_EXHAUSTED|quota exceeded/iu.test(firstError)) {
+    const compact = firstError.slice(0, 180);
+    return `${prefix}: ${compact}${compact.length < firstError.length ? "..." : ""}`;
+  }
   return firstError
     ? `${prefix}: ${firstError.slice(0, 140)}${firstError.length > 140 ? "..." : ""}`
     : `${prefix}. API 키/모델 설정과 응답 JSON 형식을 확인하세요.`;
@@ -3920,8 +4729,16 @@ function createNeuralMapPrimerQuery(state: AppState): string {
 }
 
 function App() {
-  const [personalApiVault, setPersonalApiVault] = useState<PersonalApiVault>(() => loadPersonalApiVault());
-  const [rawState, setRawState] = useState<AppState>(() => applyPersonalApiVault(hydrateState(loadState()), loadPersonalApiVault()));
+  const [personalApiVault, setPersonalApiVault] = useState<PersonalApiVault>(() =>
+    promoteVibeTransferToVault(loadPersonalApiVault(), loadState())
+  );
+  const personalApiVaultRef = useRef(personalApiVault);
+  useEffect(() => {
+    personalApiVaultRef.current = personalApiVault;
+  }, [personalApiVault]);
+  const [rawState, setRawState] = useState<AppState>(() =>
+    applyPersonalApiVault(hydrateState(loadState()), promoteVibeTransferToVault(loadPersonalApiVault(), loadState()))
+  );
   const state = useMemo(() => hydrateState(rawState), [rawState]);
   const setState = useCallback<Dispatch<SetStateAction<AppState>>>((value) => {
     setRawState((current) => {
@@ -3943,6 +4760,15 @@ function App() {
   const [isResetting, setIsResetting] = useState(false);
   const [personalSettingsOpen, setPersonalSettingsOpen] = useState(false);
   const [manualImage, setManualImage] = useState(false);
+  const [isAutoProgressing, setIsAutoProgressing] = useState(false);
+  const [autoProgressRemaining, setAutoProgressRemaining] = useState(0);
+  const [autoProgressTotal, setAutoProgressTotal] = useState(0);
+  // Coarse current-turn phase, surfaced in the chat thread so the user can see what the turn is doing
+  // (context retrieval → response generation → image generation) instead of one opaque "진행 중".
+  const [turnPhase, setTurnPhase] = useState<TurnPhase | undefined>(undefined);
+  const autoProgressStopRef = useRef(false);
+  const autoProgressActiveRef = useRef(false);
+  const autoProgressResumeAttemptedRef = useRef(false);
   const [rightPanel, setRightPanel] = useState<RightPanel>("neuralmap");
   const [runtimeNotice, setRuntimeNotice] = useState<RuntimeNotice | undefined>();
   const [storageReady, setStorageReady] = useState(false);
@@ -3950,6 +4776,10 @@ function App() {
   const imageAssetHydrationAttemptsRef = useRef<Map<string, number>>(new Map());
   const imagePayloadCompactionAttemptsRef = useRef<Map<string, number>>(new Map());
   const neuralMapPrimeAttemptsRef = useRef<Set<string>>(new Set());
+  const promptModuleSyncRef = useRef<Set<string>>(new Set());
+  // Claims each turn+cue exactly once so the early (mid-stream) and post-turn dispatch paths can never
+  // both fire a paid image request for the same cut. Keyed by createImageJobDispatchKey.
+  const dispatchedImageCueKeysRef = useRef<Set<string>>(new Set());
   const pendingStateSaveRef = useRef<AppState | undefined>(undefined);
   const pendingStateSaveOptionsRef = useRef<SaveStateOptions>({});
   const stateSaveScheduledRef = useRef(false);
@@ -3990,6 +4820,32 @@ function App() {
       const hydratedTarget = hydrateState(targetState);
       if (!shouldPrimeNeuralMapSimulation(hydratedTarget)) {
         return;
+      }
+
+      // Keep RAG sub-prompts/scene-rules retrievable by MEANING (semantic), not just literal keyword, by
+      // ingesting changed module bodies as NeuralMap documents. Deduped by content signature so unchanged
+      // modules are never re-sent. Fire-and-forget; failures simply fall back to lexical activation.
+      const unsyncedSignatures = new Map<string, string>();
+      for (const module of hydratedTarget.modules) {
+        if (!isSemanticRetrievalModule(module)) {
+          continue;
+        }
+        const signature = `${hydratedTarget.simulation.id}:${createPromptModuleSyncSignature(module)}`;
+        if (!promptModuleSyncRef.current.has(signature)) {
+          unsyncedSignatures.set(module.id, signature);
+        }
+      }
+      if (unsyncedSignatures.size > 0) {
+        for (const signature of unsyncedSignatures.values()) {
+          promptModuleSyncRef.current.add(signature);
+        }
+        void new NeuralMapClient(hydratedTarget.neuralMap)
+          .syncPromptModuleDocuments(hydratedTarget, new Set(unsyncedSignatures.keys()))
+          .catch(() => {
+            for (const signature of unsyncedSignatures.values()) {
+              promptModuleSyncRef.current.delete(signature);
+            }
+          });
       }
 
       const attemptKey = [
@@ -4052,7 +4908,12 @@ function App() {
       const apiClient = createDynamicChatApiClient();
       const rawLocalState = loadState();
       const localState = hydrateState(rawLocalState);
-      const localVault = loadPersonalApiVault();
+      const storedLocalVault = loadPersonalApiVault();
+      // One-time migration: lift any per-simulation vibe transfer setup into the (now global) vault.
+      const localVault = promoteVibeTransferToVault(storedLocalVault, localState);
+      if (!arePersonalApiVaultsEqual(localVault, storedLocalVault)) {
+        savePersonalApiVault(localVault);
+      }
       const localLibrary = loadSimulationLibrary(localState);
       let nextVault = localVault;
       let nextLibrary = localLibrary;
@@ -4381,12 +5242,17 @@ function App() {
     }));
   }, []);
 
-  const persistPersonalApiVault = useCallback((updater: (current: PersonalApiVault) => PersonalApiVault) => {
-    setPersonalApiVault((current) => {
+  const persistPersonalApiVault = useCallback(
+    (updater: (current: PersonalApiVault) => PersonalApiVault) => {
       const next = {
-        ...updater(current),
+        ...updater(personalApiVaultRef.current),
         updatedAt: new Date().toISOString()
       };
+      personalApiVaultRef.current = next;
+
+      setPersonalApiVault(next);
+      setState((activeState) => applyPersonalApiVault(activeState, next));
+
       savePersonalApiVault(next);
       const apiClient = createDynamicChatApiClient();
       void apiClient
@@ -4399,10 +5265,9 @@ function App() {
           return undefined;
         })
         .catch(() => undefined);
-      setState((activeState) => applyPersonalApiVault(activeState, next));
-      return next;
-    });
-  }, []);
+    },
+    []
+  );
 
   const getActivePersonalApiVault = useCallback(() => {
     const freshVault = readFreshPersonalApiVault(personalApiVault);
@@ -4455,6 +5320,7 @@ function App() {
     },
     [persistPersonalApiVault, showRuntimeNotice]
   );
+
 
   const savePersonalImageStoragePath = useCallback(
     (imageStoragePath: string) => {
@@ -4556,16 +5422,44 @@ function App() {
     });
   }, [personalApiVault.llmByProvider]);
 
+  const updateImageTagLlmSettings = useCallback((patch: Partial<LlmApiSettings>) => {
+    setState((current) => ({
+      ...current,
+      imageTagLlm: {
+        ...current.imageTagLlm,
+        ...patch
+      }
+    }));
+  }, []);
+
   const updateNovelAiSettings = useCallback((patch: Partial<NovelAiApiSettings>) => {
+    // Vibe transfer is a GLOBAL personal setting. Route those fields to the vault (persistPersonalApiVault
+    // re-applies the vault onto the active state, so the editor and generation see them immediately and
+    // every other simulation inherits them). Other NovelAI fields stay per-simulation.
+    if ("vibeTransferEnabled" in patch || "vibeTransferReferences" in patch) {
+      persistPersonalApiVault((current) => ({
+        ...current,
+        vibeTransfer: normalizeStoredVibeTransferSettings({
+          enabled: patch.vibeTransferEnabled ?? current.vibeTransfer.enabled,
+          references: patch.vibeTransferReferences ?? current.vibeTransfer.references
+        })
+      }));
+    }
+    const rest = { ...patch };
+    delete rest.vibeTransferEnabled;
+    delete rest.vibeTransferReferences;
+    if (Object.keys(rest).length === 0) {
+      return;
+    }
     setState((current) => {
       const nextState = {
         ...current,
         novelAi: {
           ...current.novelAi,
-          ...patch
+          ...rest
         }
       };
-      const shouldAudit = patch.registrationStatus && patch.registrationStatus !== current.novelAi.registrationStatus;
+      const shouldAudit = rest.registrationStatus && rest.registrationStatus !== current.novelAi.registrationStatus;
       return shouldAudit
         ? {
             ...nextState,
@@ -4574,13 +5468,13 @@ function App() {
               createAuditEvent(nextState, "api_secret_verified", "api_secret", "novelai", {
                 provider: "novelai",
                 accountLabel: nextState.novelAi.accountLabel,
-                status: patch.registrationStatus
+                status: rest.registrationStatus
               })
             ]
           }
         : nextState;
     });
-  }, []);
+  }, [persistPersonalApiVault]);
 
   const runQueuedImageJob = useCallback((job: ImageGenerationJob, snapshot: AppState, confirmed = false): Promise<void> => {
     const run = async () => {
@@ -4614,9 +5508,7 @@ function App() {
       }));
     };
 
-    markJob({ ...executableJob, status: "planning" });
-    await waitForImagePipelineStep();
-    markJob({ status: "generating" });
+    markJob({ ...executableJob, status: "generating" });
 
     let result: Awaited<ReturnType<typeof executeImageJob>>;
     try {
@@ -4777,17 +5669,23 @@ function App() {
   const regenerateImageJob = useCallback((job: ImageGenerationJob) => {
     const now = new Date().toISOString();
     const replannedJob = planImageJob(state, job.turnId, createImageCueForRegeneration(state, job), job.contextNodeIds, true);
+    // Reuse the original job's id and cue position so the regenerated image REPLACES the failed one in
+    // place (same slot) instead of appearing as an extra image elsewhere. The fresh prompt comes from the
+    // re-plan; identity/turn linkage (turnId, cueIndex) is preserved.
     const nextJob: ImageGenerationJob = {
       ...replannedJob,
+      id: job.id,
+      turnId: job.turnId,
       status: "queued",
       assetIds: [],
       representativeAssetId: undefined,
       completedAt: undefined,
       error: undefined,
-      createdAt: now,
+      createdAt: job.createdAt,
       updatedAt: now,
       providerPayload: {
         ...replannedJob.providerPayload,
+        cueIndex: job.providerPayload?.cueIndex ?? replannedJob.providerPayload?.cueIndex,
         mode: "planned",
         requiresConfirmation: false,
         regeneratedFrom: job.id
@@ -4796,7 +5694,9 @@ function App() {
 
     setState((current) => ({
       ...current,
-      imageJobs: [...current.imageJobs, nextJob],
+      imageJobs: current.imageJobs.some((candidate) => candidate.id === job.id)
+        ? current.imageJobs.map((candidate) => (candidate.id === job.id ? nextJob : candidate))
+        : [...current.imageJobs, nextJob],
       auditLog: [
         ...current.auditLog,
         createAuditEvent(current, "generation_job_created", "image_job", nextJob.id, {
@@ -4979,9 +5879,32 @@ function App() {
   }, [redactPromptModule]);
 
   const planAndQueueImageForTurn = useCallback(
-    async (result: TurnResult, snapshot: AppState, manual: boolean) => {
+    async (result: ImageDispatchTurn, snapshot: AppState, manual: boolean, preResolvedSnapshot?: AppState, options: { isExpansion?: boolean } = {}) => {
+      const isExpansion = options.isExpansion === true;
+      // Claim the initial cue positions SYNCHRONOUSLY, before any await, so the early (mid-stream) and
+      // post-turn paths can never both pass the check and double-fire the paid provider. JS runs this loop
+      // to completion without interruption; whichever path reaches it first owns those turn+cue slots.
+      // Position-based keys line up because realtime turns keep their initial image_cues array stable.
+      // Expansion handles distinct appended tail cues (their cueIndex restarts at 0) that the early path
+      // never touched, so it keeps the original append behavior and is exempt from the claim.
+      const ownedCueIndexes = new Set<number>();
+      if (!isExpansion) {
+        const claimTurnId = result.assistantMessage.id;
+        const claimCueCount = result.sidecar?.imageCues.length ?? 0;
+        for (let cueIndex = 0; cueIndex < claimCueCount; cueIndex += 1) {
+          const key = `${claimTurnId}:cue${cueIndex}`;
+          if (!dispatchedImageCueKeysRef.current.has(key)) {
+            dispatchedImageCueKeysRef.current.add(key);
+            ownedCueIndexes.add(cueIndex);
+          }
+        }
+        if (claimCueCount > 0 && ownedCueIndexes.size === 0) {
+          // Every cue this call would handle was already claimed by the early path; nothing to dispatch.
+          return;
+        }
+      }
       try {
-        const runtimeSnapshot = await resolveStateWithRuntimeSecrets(snapshot);
+        const runtimeSnapshot = preResolvedSnapshot ?? (await resolveStateWithRuntimeSecrets(snapshot));
         const imagePlan = await planImageJobForCompletedTurn(runtimeSnapshot, {
           userMessage: result.userMessage,
           assistantMessage: result.assistantMessage,
@@ -4991,9 +5914,21 @@ function App() {
           sidecarTrace: result.sidecarTrace,
           manualImage: manual
         });
-        const imageJobs = imagePlan.imageJobs.length > 0 ? imagePlan.imageJobs : imagePlan.imageJob ? [imagePlan.imageJob] : [];
-        const primaryImageJob = imagePlan.imageJob ?? imageJobs[0];
+        const plannedImageJobs = imagePlan.imageJobs.length > 0 ? imagePlan.imageJobs : imagePlan.imageJob ? [imagePlan.imageJob] : [];
+        // For the initial dispatch, keep only jobs whose cue position this call owns (claimed above) so the
+        // early path's cues are never re-fired. Expansion (and jobs without a numeric cueIndex) run as-is.
+        const imageJobs = isExpansion
+          ? plannedImageJobs
+          : plannedImageJobs.filter((job) => {
+              const cueIndex = (job.providerPayload as { cueIndex?: unknown }).cueIndex;
+              return typeof cueIndex === "number" ? ownedCueIndexes.has(cueIndex) : true;
+            });
+        const primaryImageJob = imagePlan.imageJob && imageJobs.includes(imagePlan.imageJob) ? imagePlan.imageJob : imageJobs[0];
         const reusedAssetIds = imagePlan.reusedAssetIds ?? [];
+        if (imageJobs.length === 0 && reusedAssetIds.length === 0 && plannedImageJobs.length > 0) {
+          // Every renderable cue this turn was already dispatched early; nothing more to queue.
+          return;
+        }
         const imageEstimatedCost = imageJobs.reduce(
           (sum, job) => sum + (readProviderCost(job.providerPayload) ?? 0),
           0
@@ -5019,15 +5954,17 @@ function App() {
             trace.id === result.turnTrace.id
               ? {
                   ...trace,
-                  imageCue: imagePlan.imageCue,
-                  imageJobId: primaryImageJob?.id,
+                  // In expansion mode the primary cue/job belong to the initial plan; only append.
+                  imageCue: isExpansion ? trace.imageCue ?? imagePlan.imageCue : imagePlan.imageCue,
+                  imageJobId: isExpansion ? trace.imageJobId ?? primaryImageJob?.id : primaryImageJob?.id,
                   imageAssetIds: uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]),
                   metrics: {
                     ...trace.metrics,
-                    imageJobCount: imageJobs.length,
+                    imageJobCount: isExpansion ? (trace.metrics.imageJobCount ?? 0) + newImageJobs.length : imageJobs.length,
                     imageAssetCount: Math.max(trace.metrics.imageAssetCount, uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]).length),
-                    imageEstimatedCost:
-                      imageEstimatedCost > 0 ? imageEstimatedCost : trace.metrics.imageEstimatedCost
+                    imageEstimatedCost: isExpansion
+                      ? (trace.metrics.imageEstimatedCost ?? 0) + imageEstimatedCost
+                      : imageEstimatedCost > 0 ? imageEstimatedCost : trace.metrics.imageEstimatedCost
                   }
                 }
               : trace
@@ -5084,13 +6021,7 @@ function App() {
             )
           };
 
-          runAfterNextPaint(() => {
-            void (async () => {
-              for (const imageJob of runnableImageJobs) {
-                await runQueuedImageJob(imageJob, snapshotWithImageJobs);
-              }
-            })();
-          });
+          void runRunnableImageJobs(runnableImageJobs, snapshotWithImageJobs, runQueuedImageJob);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : "이미지 작업 계획 중 알 수 없는 오류가 발생했습니다.";
@@ -5100,64 +6031,275 @@ function App() {
     [resolveStateWithRuntimeSecrets, runQueuedImageJob, showRuntimeNotice]
   );
 
-  const handleSubmit = useCallback(
-    async (event: FormEvent) => {
-      event.preventDefault();
-      if (isSending || isResetting) {
+  // Fired the instant the engine has parsed the front-loaded image_cues mid-stream — dispatches the
+  // image request before the narrative finishes generating. The shared dispatch-key gate in
+  // planAndQueueImageForTurn guarantees the post-turn pass never re-fires these same cues.
+  const dispatchEarlyTurnImages = useCallback(
+    (payload: EarlyImageCuePayload, snapshot: AppState, manual: boolean) => {
+      const [primaryCue, ...restCues] = payload.cues;
+      if (!primaryCue) {
         return;
       }
+      void planAndQueueImageForTurn(
+        {
+          userMessage: payload.userMessage,
+          assistantMessage: payload.assistantMessage,
+          contextPack: payload.contextPack,
+          promptModuleUsages: payload.promptModuleUsages,
+          sidecar: { assistantText: "", memoryEvents: [], imageCue: primaryCue, imageCues: [primaryCue, ...restCues] },
+          turnTrace: { id: "" }
+        },
+        snapshot,
+        manual,
+        snapshot
+      );
+    },
+    [planAndQueueImageForTurn]
+  );
 
-      const text = createTurnSubmissionText(draft);
+  // Plans/queues the initial images immediately, then appends any extra image_cues that the
+  // background completion retry produces (realtime image pipeline: start fast, fill in the rest).
+  const planTurnImagesWithExpansion = useCallback(
+    async (result: TurnResult, snapshot: AppState, manual: boolean, preResolvedSnapshot?: AppState) => {
+      // Image cues are now authored by requestTurnAnnotations inside runSimulationTurn and embedded in
+      // result.sidecar.imageCues. Use them directly — no separate image-cue LLM call here.
+      const imageCues = result.sidecar?.imageCues ?? [];
+      if (imageCues.length === 0) {
+        return;
+      }
+      await planAndQueueImageForTurn(result, snapshot, manual, preResolvedSnapshot);
+    },
+    [planAndQueueImageForTurn]
+  );
+
+  // Runs one simulation turn from arbitrary text. `baseState` lets a caller (e.g. auto-progress) thread the previous
+  // turn's committed state forward so consecutive turns build on each other without waiting for React to flush.
+  // Returns the committed turn state on success, or null on failure.
+  const runTurnFromText = useCallback(
+    async (
+      text: string,
+      options: { manualImage?: boolean; baseState?: AppState; awaitImages?: boolean; suppressAutoReset?: boolean } = {}
+    ): Promise<AppState | null> => {
+      const shouldPlanManualImage = options.manualImage ?? false;
+      const sourceState = options.baseState ?? state;
       setIsSending(true);
       setPendingUserText(text);
+      setTurnPhase("retrieving");
       try {
-        const runtimeState = await resolveStateWithRuntimeSecrets(state);
+        const runtimeState = await resolveStateWithRuntimeSecrets(sourceState);
         const resetDecision = createAutoResetAgentSessionDecision(runtimeState, text);
-        const turnBaseState = resetDecision.shouldReset
+        // Auto-progress keeps the whole run in ONE session: a mid-run handoff reset drops the rich recent
+        // transcript for a thin handoff summary, which is what makes the self-driven narrative drift and the
+        // dialogue degrade as the run goes on. The caller (startAutoProgress) suppresses the reset so the
+        // continuation context stays intact across the planned turns.
+        const shouldReset = resetDecision.shouldReset && options.suppressAutoReset !== true;
+        const turnBaseState = shouldReset
           ? await createResetSessionState(runtimeState)
           : runtimeState;
         const autoResetApplied = turnBaseState.simulation.activeSessionId !== runtimeState.simulation.activeSessionId;
-        const shouldPlanManualImage = manualImage;
+        // This turn belongs to ONE simulation. If the user navigates to a different simulation while the
+        // turn is still streaming/committing, every setState below must no-op instead of merging this
+        // turn's messages/result into whatever simulation is now active (otherwise the old run "continues"
+        // in the new simulation). The id is stable across an auto session reset (same simulation.id).
+        const turnSimulationId = turnBaseState.simulation.id;
         const result = await runSimulationTurn(turnBaseState, text, shouldPlanManualImage, {
           deferImagePlanning: true,
           deferMemoryIngest: true,
+          // Retrieval/module selection finished; the long part from here is the LLM call itself, so flip the card
+          // to "generating" now instead of waiting for the first streamed assistant_text. Surface unusually slow
+          // retrieval (e.g. an unreachable NeuralMap).
+          onGenerationStart: ({ retrievalLatencyMs }) => {
+            setTurnPhase("generating");
+            if (retrievalLatencyMs > 12_000) {
+              showRuntimeNotice(`문맥 검색이 ${Math.round(retrievalLatencyMs / 1000)}초 걸렸습니다. NeuralMap 서버 상태를 확인하세요.`);
+            }
+          },
           onAssistantText: ({ userMessage, assistantMessage }) => {
+            setTurnPhase("generating");
             setState((current) => {
+              if (current.simulation.id !== turnSimulationId) {
+                return current;
+              }
               const baseState =
                 autoResetApplied && current.simulation.activeSessionId !== turnBaseState.simulation.activeSessionId
-                  ? turnBaseState
+                  ? layerSessionResetOntoLiveState(current, turnBaseState)
                   : current;
               return upsertStreamingTurnMessages(baseState, userMessage, assistantMessage);
             });
           },
           onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
-            setState((current) => applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs));
+            setState((current) =>
+              current.simulation.id !== turnSimulationId
+                ? current
+                : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
+            );
           }
         });
         const committedTurnState = applyTurnResultToState(turnBaseState, result);
         setState((current) => {
-          const baseState = autoResetApplied ? turnBaseState : current;
+          if (current.simulation.id !== turnSimulationId) {
+            return current;
+          }
+          const baseState = autoResetApplied ? layerSessionResetOntoLiveState(current, turnBaseState) : current;
           return applyTurnResultToState(baseState, result);
         });
-        runAfterNextPaint(() => void planAndQueueImageForTurn(result, committedTurnState, shouldPlanManualImage));
+        // Use the committed turn state (it carries this turn's new Wearing/state memory events and
+        // inherits the resolved runtime secrets) so the image reflects outfit changes from this turn.
+        setTurnPhase("images");
+        const imagePlanning = planTurnImagesWithExpansion(result, committedTurnState, shouldPlanManualImage, committedTurnState);
+        if (options.awaitImages) {
+          // Auto-progress pacing: wait for THIS turn's images to be planned, queued, and generated before the
+          // caller starts the next turn. Without it the loop fires image planning fire-and-forget and races
+          // ahead, flooding the serial image queue (cadence "paragraph" can emit up to 8 cues/turn) so most
+          // intermediate-turn jobs stay "queued" forever and only the final turn renders. Failures are surfaced
+          // per job, so never let them reject the turn.
+          try {
+            await imagePlanning;
+            await imageJobQueueRef.current;
+          } catch {
+            /* per-job errors already handled in runQueuedImageJob */
+          }
+        } else {
+          void imagePlanning;
+        }
         if (autoResetApplied) {
           showRuntimeNotice(`자동 handoff: ${resetDecision.reason}. 새 세션으로 이어갑니다.`);
         }
         if (result.sidecarTrace.source !== "llm") {
           showRuntimeNotice(createLlmFallbackNotice("LLM 응답 fallback", result.sidecarTrace));
         }
-        setDraft("");
-        setManualImage(false);
+        return committedTurnState;
       } catch (error) {
         const message = error instanceof Error ? error.message : "시뮬레이션 턴 실행 중 알 수 없는 오류가 발생했습니다.";
         showRuntimeNotice(`시뮬레이션 진행 실패: ${message}`);
+        return null;
       } finally {
         setPendingUserText("");
         setIsSending(false);
+        setTurnPhase(undefined);
       }
     },
-    [draft, isResetting, isSending, manualImage, planAndQueueImageForTurn, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
+    [dispatchEarlyTurnImages, planTurnImagesWithExpansion, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
   );
+
+  const handleSubmit = useCallback(
+    async (event: FormEvent) => {
+      event.preventDefault();
+      if (isSending || isResetting || isAutoProgressing) {
+        return;
+      }
+      const text = createTurnSubmissionText(draft);
+      const committed = await runTurnFromText(text, { manualImage });
+      if (committed) {
+        setDraft("");
+        setManualImage(false);
+      }
+    },
+    [draft, isAutoProgressing, isResetting, isSending, manualImage, runTurnFromText]
+  );
+
+  // Auto-progress: run N consecutive turns where the LLM continues the narrative on its own (using the same empty-input
+  // "이어서 진행" continuation the composer uses). Each turn builds on the previous turn's committed state. Stoppable.
+  const startAutoProgress = useCallback(
+    async (turns: number) => {
+      if (isSending || isResetting || autoProgressActiveRef.current) {
+        return;
+      }
+      const total = Math.max(1, Math.min(100, Math.round(Number(turns) || 0)));
+      autoProgressStopRef.current = false;
+      autoProgressActiveRef.current = true;
+      setIsAutoProgressing(true);
+      setAutoProgressTotal(total);
+      setAutoProgressRemaining(total);
+      showRuntimeNotice(`자동 진행을 시작합니다 (${total}턴). 중지 버튼으로 멈출 수 있습니다.`);
+      // Persist the "keep going" intent so a page refresh mid-run resumes instead of silently dropping the
+      // remaining turns. Keyed to the live run (sim/session/progress run) it is progressing.
+      const persistIntent = (referenceState: AppState, remaining: number) => {
+        if (remaining <= 0) {
+          clearAutoProgressIntent();
+          return;
+        }
+        saveAutoProgressIntent({
+          simulationId: referenceState.simulation.id,
+          activeSessionId: referenceState.simulation.activeSessionId,
+          activeProgressRunId: referenceState.activeProgressRunId,
+          remaining,
+          total
+        });
+      };
+      let workingState: AppState | undefined;
+      let completed = 0;
+      persistIntent(state, total);
+      try {
+        for (let index = 0; index < total; index += 1) {
+          if (autoProgressStopRef.current) {
+            break;
+          }
+          const committed = await runTurnFromText(AUTO_CONTINUE_TURN_TEXT, {
+            baseState: workingState,
+            awaitImages: true,
+            suppressAutoReset: true
+          });
+          if (!committed) {
+            break;
+          }
+          workingState = committed;
+          completed += 1;
+          setAutoProgressRemaining(total - completed);
+          persistIntent(committed, total - completed);
+        }
+      } finally {
+        const stopped = autoProgressStopRef.current;
+        autoProgressActiveRef.current = false;
+        setIsAutoProgressing(false);
+        setAutoProgressRemaining(0);
+        setAutoProgressTotal(0);
+        // The run reached its planned end (or was stopped/aborted); never auto-resume it after the next reload.
+        clearAutoProgressIntent();
+        showRuntimeNotice(
+          stopped ? `자동 진행을 중지했습니다 (${completed}턴 진행).` : `자동 진행을 완료했습니다 (${completed}턴).`
+        );
+      }
+    },
+    [isResetting, isSending, runTurnFromText, showRuntimeNotice, state]
+  );
+
+  const stopAutoProgress = useCallback(() => {
+    if (!autoProgressActiveRef.current) {
+      return;
+    }
+    autoProgressStopRef.current = true;
+    // Clear the persisted intent right away so refreshing before the in-flight turn settles does not resume a
+    // run the user just asked to stop.
+    clearAutoProgressIntent();
+    showRuntimeNotice("자동 진행 중지 요청됨. 현재 턴을 마치면 멈춥니다.");
+  }, [showRuntimeNotice]);
+
+  // Resume auto-progress after a page refresh/reload. Once storage has been restored, if a persisted intent
+  // still points at the now-active simulation/session/progress run, relaunch the loop for the remaining turns so
+  // the user does not have to babysit the tab. Matching all three ids keeps a resume from leaking into a
+  // different run or a sim the user switched to. Runs at most once per mount.
+  useEffect(() => {
+    if (!storageReady || autoProgressResumeAttemptedRef.current) {
+      return;
+    }
+    if (isSending || isResetting || autoProgressActiveRef.current) {
+      return;
+    }
+    const intent = loadAutoProgressIntent();
+    if (!intent) {
+      autoProgressResumeAttemptedRef.current = true;
+      return;
+    }
+    if (!autoProgressIntentMatchesState(intent, state)) {
+      // The restored active simulation is not the one that was progressing yet; wait for the matching state
+      // (e.g. user opens it) rather than discarding the intent.
+      return;
+    }
+    autoProgressResumeAttemptedRef.current = true;
+    showRuntimeNotice(`이전 자동 진행을 이어갑니다 (남은 ${intent.remaining}턴).`);
+    void startAutoProgress(intent.remaining);
+  }, [storageReady, state, isSending, isResetting, startAutoProgress, showRuntimeNotice]);
 
   const regenerateAssistantResponse = useCallback(
     async (assistantMessageId: string) => {
@@ -5184,25 +6326,39 @@ function App() {
           ? await createResetSessionState(runtimeBaseState)
           : runtimeBaseState;
         const autoResetApplied = turnBaseState.simulation.activeSessionId !== runtimeBaseState.simulation.activeSessionId;
+        // Same simulation-id guard as runTurnFromText: drop these updates if the user switched simulations
+        // mid-regeneration so the regenerated turn never bleeds into another simulation.
+        const turnSimulationId = turnBaseState.simulation.id;
         const result = await runSimulationTurn(turnBaseState, regeneration.userMessage.content, regeneration.manualImage, {
           deferImagePlanning: true,
           deferMemoryIngest: true,
           onAssistantText: ({ userMessage, assistantMessage }) => {
             setState((current) => {
+              if (current.simulation.id !== turnSimulationId) {
+                return current;
+              }
               const baseState =
                 autoResetApplied && current.simulation.activeSessionId !== turnBaseState.simulation.activeSessionId
-                  ? turnBaseState
+                  ? layerSessionResetOntoLiveState(current, turnBaseState)
                   : current;
               return upsertStreamingTurnMessages(baseState, userMessage, assistantMessage);
             });
           },
           onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
-            setState((current) => applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs));
+            setState((current) =>
+              current.simulation.id !== turnSimulationId
+                ? current
+                : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
+            );
           }
         });
         const committedTurnState = applyTurnResultToState(turnBaseState, result);
-        setState((current) => applyTurnResultToState(autoResetApplied ? turnBaseState : current, result));
-        runAfterNextPaint(() => void planAndQueueImageForTurn(result, committedTurnState, regeneration.manualImage));
+        setState((current) =>
+          current.simulation.id !== turnSimulationId
+            ? current
+            : applyTurnResultToState(autoResetApplied ? layerSessionResetOntoLiveState(current, turnBaseState) : current, result)
+        );
+        void planTurnImagesWithExpansion(result, committedTurnState, regeneration.manualImage, committedTurnState);
 
         if (autoResetApplied) {
           showRuntimeNotice(`재생성 자동 handoff: ${resetDecision.reason}.`);
@@ -5224,7 +6380,7 @@ function App() {
         setIsSending(false);
       }
     },
-    [isResetting, isSending, planAndQueueImageForTurn, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
+    [dispatchEarlyTurnImages, isResetting, isSending, planTurnImagesWithExpansion, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
   );
 
   const resetSession = useCallback(async () => {
@@ -5373,13 +6529,25 @@ function App() {
 
   const openSimulation = useCallback(
     (simulationId: string) => {
+      // Re-opening the simulation that is ALREADY active (e.g. peeking at the home/library view while
+      // auto-progress runs, then coming back) must not disturb the live run: keep the in-memory state and the
+      // running loop intact. Reloading from the library snapshot here would both stop auto-progress and roll the
+      // chat back to the last library sync, which looked like "progress disappeared" after navigating away.
+      if (simulationId === state.simulation.id) {
+        setView("simulation");
+        return;
+      }
+      // Switching to a DIFFERENT simulation: stop any in-flight auto-progress before swapping the active
+      // simulation, otherwise the loop keeps running on the previous simulation's threaded state and its turns
+      // land in the one just opened.
+      autoProgressStopRef.current = true;
       const selected = simulationLibrary.find((item) => item.simulation.id === simulationId);
       if (selected) {
         setState(applyPersonalApiVault(hydrateState(selected), getActivePersonalApiVault()));
       }
       setView("simulation");
     },
-    [getActivePersonalApiVault, simulationLibrary]
+    [getActivePersonalApiVault, simulationLibrary, state.simulation.id]
   );
 
   const editSimulation = useCallback(
@@ -5517,6 +6685,7 @@ function App() {
             onImageFeedback={updateImageFeedback}
             onImageProfileChange={updateImageProfile}
             onLlmChange={updateLlmSettings}
+            onImageTagLlmChange={updateImageTagLlmSettings}
             onNovelAiChange={updateNovelAiSettings}
             onNotify={showRuntimeNotice}
             onDeleteProgressRun={deleteProgressRun}
@@ -5533,6 +6702,12 @@ function App() {
             onStateChange={setState}
             onSubmit={handleSubmit}
             onToggleManualImage={setManualImage}
+            isAutoProgressing={isAutoProgressing}
+            autoProgressRemaining={autoProgressRemaining}
+            autoProgressTotal={autoProgressTotal}
+            turnPhase={turnPhase}
+            onStartAutoProgress={startAutoProgress}
+            onStopAutoProgress={stopAutoProgress}
           />
         </SimulationRunErrorBoundary>
       )}
@@ -5587,6 +6762,194 @@ function RuntimeNoticeToast({ notice }: { notice?: RuntimeNotice }) {
   );
 }
 
+function ReaderSettingsControl({
+  settings,
+  onChange
+}: {
+  settings: ReaderSettings;
+  onChange: (next: ReaderSettings) => void;
+}) {
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const close = () => {
+      if (detailsRef.current) {
+        detailsRef.current.open = false;
+      }
+      setOpen(false);
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      if (detailsRef.current && !detailsRef.current.contains(event.target as Node)) {
+        close();
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        close();
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+  const update = (patch: Partial<ReaderSettings>) => onChange({ ...settings, ...patch });
+  const atDefault =
+    settings.fontKey === DEFAULT_READER_SETTINGS.fontKey &&
+    settings.fontSize === DEFAULT_READER_SETTINGS.fontSize &&
+    settings.lineHeight === DEFAULT_READER_SETTINGS.lineHeight &&
+    settings.width === DEFAULT_READER_SETTINGS.width &&
+    settings.theme === DEFAULT_READER_SETTINGS.theme &&
+    settings.dialogueEmphasis === DEFAULT_READER_SETTINGS.dialogueEmphasis;
+
+  return (
+    <details
+      ref={detailsRef}
+      className="crack-more-menu reader-menu"
+      onToggle={(event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
+    >
+      <summary className="reader-trigger" aria-label="읽기 설정">
+        <TypeIcon size={16} />
+        <span>Aa</span>
+      </summary>
+      <div className="crack-more-popover reader-popover" role="group" aria-label="읽기 설정">
+        <div className="reader-popover-head">
+          <strong>읽기 설정</strong>
+          <button
+            type="button"
+            className="reader-reset"
+            onClick={() => onChange({ ...DEFAULT_READER_SETTINGS })}
+            disabled={atDefault}
+          >
+            <RotateCcw size={13} />
+            기본값
+          </button>
+        </div>
+
+        <section className="reader-section">
+          <span className="reader-label">본문 글꼴</span>
+          <div className="reader-font-grid">
+            {READER_FONT_OPTIONS.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className={`reader-font-chip ${settings.fontKey === option.key ? "active" : ""}`}
+                onClick={() => update({ fontKey: option.key })}
+                aria-pressed={settings.fontKey === option.key}
+              >
+                <span className="reader-font-name" style={{ fontFamily: option.stack }}>
+                  {option.label}
+                </span>
+                <small>{option.hint}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="reader-section">
+          <div className="reader-stepper">
+            <span className="reader-label">글자 크기</span>
+            <div className="reader-stepper-controls">
+              <button
+                type="button"
+                onClick={() => update({ fontSize: Math.max(READER_FONT_SIZE_MIN, settings.fontSize - 1) })}
+                disabled={settings.fontSize <= READER_FONT_SIZE_MIN}
+                aria-label="글자 크기 줄이기"
+              >
+                <Minus size={14} />
+              </button>
+              <output>{settings.fontSize}px</output>
+              <button
+                type="button"
+                onClick={() => update({ fontSize: Math.min(READER_FONT_SIZE_MAX, settings.fontSize + 1) })}
+                disabled={settings.fontSize >= READER_FONT_SIZE_MAX}
+                aria-label="글자 크기 키우기"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+          </div>
+          <div className="reader-stepper">
+            <span className="reader-label">줄 간격</span>
+            <div className="reader-stepper-controls">
+              <button
+                type="button"
+                onClick={() => update({ lineHeight: Math.round((settings.lineHeight - 0.1) * 10) / 10 })}
+                disabled={settings.lineHeight <= READER_LINE_HEIGHT_MIN + 0.001}
+                aria-label="줄 간격 줄이기"
+              >
+                <Minus size={14} />
+              </button>
+              <output>{settings.lineHeight.toFixed(1)}</output>
+              <button
+                type="button"
+                onClick={() => update({ lineHeight: Math.round((settings.lineHeight + 0.1) * 10) / 10 })}
+                disabled={settings.lineHeight >= READER_LINE_HEIGHT_MAX - 0.001}
+                aria-label="줄 간격 키우기"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section className="reader-section">
+          <span className="reader-label">본문 너비</span>
+          <div className="reader-segment">
+            {READER_WIDTH_OPTIONS.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className={settings.width === option.key ? "active" : ""}
+                onClick={() => update({ width: option.key })}
+                aria-pressed={settings.width === option.key}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="reader-section">
+          <span className="reader-label">테마</span>
+          <div className="reader-segment reader-theme-segment">
+            {READER_THEME_OPTIONS.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className={`reader-theme-${option.key} ${settings.theme === option.key ? "active" : ""}`}
+                onClick={() => update({ theme: option.key })}
+                aria-pressed={settings.theme === option.key}
+              >
+                {option.key === "night" ? <Moon size={13} /> : <Sun size={13} />}
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <button
+          type="button"
+          className={`reader-toggle ${settings.dialogueEmphasis ? "active" : ""}`}
+          onClick={() => update({ dialogueEmphasis: !settings.dialogueEmphasis })}
+          aria-pressed={settings.dialogueEmphasis}
+        >
+          <span>
+            <strong>대사 강조</strong>
+            <small>따옴표로 묶인 대사를 또렷한 색으로 표시</small>
+          </span>
+          <span className="reader-switch" aria-hidden="true" />
+        </button>
+      </div>
+    </details>
+  );
+}
+
 function CrackSimulationRunPage({
   state,
   latestAssets,
@@ -5603,6 +6966,7 @@ function CrackSimulationRunPage({
   onImageFeedback,
   onImageProfileChange,
   onLlmChange,
+  onImageTagLlmChange,
   onNovelAiChange,
   onNotify,
   onDeleteProgressRun,
@@ -5618,7 +6982,13 @@ function CrackSimulationRunPage({
   onRightPanelChange,
   onStateChange,
   onSubmit,
-  onToggleManualImage
+  onToggleManualImage,
+  isAutoProgressing,
+  autoProgressRemaining,
+  autoProgressTotal,
+  turnPhase,
+  onStartAutoProgress,
+  onStopAutoProgress
 }: {
   state: AppState;
   latestAssets: ImageAsset[];
@@ -5628,6 +6998,12 @@ function CrackSimulationRunPage({
   isResetting: boolean;
   manualImage: boolean;
   rightPanel: RightPanel;
+  isAutoProgressing: boolean;
+  autoProgressRemaining: number;
+  autoProgressTotal: number;
+  turnPhase?: TurnPhase;
+  onStartAutoProgress: (turns: number) => void;
+  onStopAutoProgress: () => void;
   onCancelImageJob: (jobId: string) => void;
   onDeleteImageAsset: (assetId: string) => void;
   onDraftChange: (value: string) => void;
@@ -5635,6 +7011,7 @@ function CrackSimulationRunPage({
   onImageFeedback: (assetId: string, rating: ImageFeedbackRating) => void;
   onImageProfileChange: (patch: Partial<ImageGenerationProfile>) => void;
   onLlmChange: (patch: Partial<LlmApiSettings>) => void;
+  onImageTagLlmChange: (patch: Partial<LlmApiSettings>) => void;
   onNovelAiChange: (patch: Partial<NovelAiApiSettings>) => void;
   onNotify: (message: string) => void;
   onDeleteProgressRun: (progressRunId: string) => void;
@@ -5653,9 +7030,15 @@ function CrackSimulationRunPage({
   onToggleManualImage: (value: boolean) => void;
 }) {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [autoProgressTurns, setAutoProgressTurns] = useState(10);
   const [mobilePanelOpen, setMobilePanelOpen] = useState(false);
   const [opsRailWidth, setOpsRailWidth] = useState(loadOpsRailWidth);
   const [opsRailResizing, setOpsRailResizing] = useState(false);
+  const [readerSettings, setReaderSettings] = useState(loadReaderSettings);
+  const handleReaderSettingsChange = useCallback((next: ReaderSettings) => {
+    setReaderSettings(next);
+    saveReaderSettings(next);
+  }, []);
   const storyScrollRef = useRef<HTMLDivElement>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const assetsById = useMemo(() => new Map(state.imageAssets.map((asset) => [asset.id, asset])), [state.imageAssets]);
@@ -5848,6 +7231,7 @@ function CrackSimulationRunPage({
           <ChevronRight size={15} />
         </button>
         <div className="crack-episode-actions">
+          <ReaderSettingsControl settings={readerSettings} onChange={handleReaderSettingsChange} />
           <button
             className={`crack-square-select ${manualImage ? "active" : ""}`}
             type="button"
@@ -5932,7 +7316,13 @@ function CrackSimulationRunPage({
           </div>
         </aside>
 
-        <section className="crack-story-stage" aria-label="시뮬레이션 진행">
+        <section
+          className="crack-story-stage"
+          aria-label="시뮬레이션 진행"
+          data-reader-theme={readerSettings.theme}
+          data-reader-dialogue={readerSettings.dialogueEmphasis ? "on" : "off"}
+          style={readerStageStyle(readerSettings)}
+        >
           <div className="crack-story-scroll" ref={storyScrollRef} onScroll={handleStoryScroll}>
             <header className="crack-story-title">
               <h1>{state.simulation.title}</h1>
@@ -5961,14 +7351,14 @@ function CrackSimulationRunPage({
                 regenerationDisabled={isSending || isResetting}
               />
             ))}
-            {isSending ? <CrackPendingTurn userText={activePendingUserText} state={state} manualImage={manualImage} /> : null}
+            {isSending ? <CrackPendingTurn userText={activePendingUserText} state={state} manualImage={manualImage} turnPhase={turnPhase} /> : null}
           </div>
 
           <form className="crack-composer" onSubmit={onSubmit}>
             <textarea
               ref={composerTextareaRef}
               aria-label="메시지 보내기"
-              disabled={isSending || isResetting}
+              disabled={isSending || isResetting || isAutoProgressing}
               value={draft}
               onChange={(event) => onDraftChange(event.target.value)}
               onKeyDown={(event) => {
@@ -5977,7 +7367,15 @@ function CrackSimulationRunPage({
                   event.currentTarget.form?.requestSubmit();
                 }
               }}
-              placeholder={isResetting ? "handoff를 생성하는 중입니다" : isSending ? "응답을 생성하는 중입니다" : "메시지 보내기"}
+              placeholder={
+                isResetting
+                  ? "handoff를 생성하는 중입니다"
+                  : isAutoProgressing
+                    ? `자동 진행 중입니다 (${autoProgressTotal - autoProgressRemaining}/${autoProgressTotal})`
+                    : isSending
+                      ? "응답을 생성하는 중입니다"
+                      : "메시지 보내기"
+              }
             />
             {suggestionsOpen ? (
               <div className="crack-suggestion-menu">
@@ -6014,15 +7412,46 @@ function CrackSimulationRunPage({
                   type="button"
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={handleInsertActionNotation}
-                  disabled={isSending || isResetting}
+                  disabled={isSending || isResetting || isAutoProgressing}
                   aria-label="행동 입력 괄호 삽입"
                   title="행동 입력 *()* 삽입"
                 >
                   <Parentheses size={16} />
                 </button>
+                {isAutoProgressing ? (
+                  <button
+                    className="crack-auto-progress-control active"
+                    type="button"
+                    onClick={onStopAutoProgress}
+                    title="자동 진행 중지"
+                  >
+                    <Square size={14} fill="currentColor" />
+                    중지 {autoProgressTotal - autoProgressRemaining}/{autoProgressTotal}
+                  </button>
+                ) : (
+                  <div className="crack-auto-progress-control" title="자동 진행할 턴 수만큼 LLM이 알아서 서사를 이어갑니다">
+                    <RefreshCcw size={14} />
+                    <input
+                      aria-label="자동 진행 턴 수"
+                      type="number"
+                      min="1"
+                      max="100"
+                      value={autoProgressTurns}
+                      disabled={isSending || isResetting}
+                      onChange={(event) => setAutoProgressTurns(Math.max(1, Math.min(100, Number(event.target.value) || 1)))}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => onStartAutoProgress(autoProgressTurns)}
+                      disabled={isSending || isResetting}
+                    >
+                      자동진행
+                    </button>
+                  </div>
+                )}
               </div>
-              <button className="crack-send-button" disabled={isSending || isResetting} type="submit" aria-label="전송">
-                {isSending || isResetting ? <Activity size={18} /> : <Play size={18} fill="currentColor" />}
+              <button className="crack-send-button" disabled={isSending || isResetting || isAutoProgressing} type="submit" aria-label="전송">
+                {isSending || isResetting || isAutoProgressing ? <Activity size={18} /> : <Play size={18} fill="currentColor" />}
               </button>
             </div>
           </form>
@@ -6056,6 +7485,7 @@ function CrackSimulationRunPage({
             onImageFeedback={onImageFeedback}
             onImageProfileChange={onImageProfileChange}
             onLlmChange={onLlmChange}
+            onImageTagLlmChange={onImageTagLlmChange}
             onNovelAiChange={onNovelAiChange}
             onNotify={onNotify}
             onOpenPersonalSettings={onOpenPersonalSettings}
@@ -6080,6 +7510,7 @@ function CrackSimulationRunPage({
           onImageFeedback={onImageFeedback}
           onImageProfileChange={onImageProfileChange}
           onLlmChange={onLlmChange}
+          onImageTagLlmChange={onImageTagLlmChange}
           onNovelAiChange={onNovelAiChange}
           onNotify={onNotify}
           onOpenPersonalSettings={onOpenPersonalSettings}
@@ -6106,6 +7537,7 @@ function RuntimePanelContent({
   onImageFeedback,
   onImageProfileChange,
   onLlmChange,
+  onImageTagLlmChange,
   onNovelAiChange,
   onNotify,
   onOpenPersonalSettings,
@@ -6126,6 +7558,7 @@ function RuntimePanelContent({
   onImageFeedback: (assetId: string, rating: ImageFeedbackRating) => void;
   onImageProfileChange: (patch: Partial<ImageGenerationProfile>) => void;
   onLlmChange: (patch: Partial<LlmApiSettings>) => void;
+  onImageTagLlmChange: (patch: Partial<LlmApiSettings>) => void;
   onNovelAiChange: (patch: Partial<NovelAiApiSettings>) => void;
   onNotify: (message: string) => void;
   onOpenPersonalSettings: () => void;
@@ -6156,7 +7589,7 @@ function RuntimePanelContent({
   }
 
   if (panel === "relationship") {
-    return <RelationshipMapPanel state={state} />;
+    return <RelationshipMapPanel state={state} onStateChange={onStateChange} />;
   }
 
   if (panel === "neuralmap") {
@@ -6176,6 +7609,7 @@ function RuntimePanelContent({
       state={state}
       onImageProfileChange={onImageProfileChange}
       onLlmChange={onLlmChange}
+      onImageTagLlmChange={onImageTagLlmChange}
       onNovelAiChange={onNovelAiChange}
       onNotify={onNotify}
       onOpenPersonalSettings={onOpenPersonalSettings}
@@ -6240,10 +7674,48 @@ function MobileOpsDock({
   );
 }
 
-function CrackPendingTurn({ userText, state, manualImage }: { userText: string; state: AppState; manualImage: boolean }) {
+function CrackPendingTurn({
+  userText,
+  state,
+  manualImage,
+  turnPhase
+}: {
+  userText: string;
+  state: AppState;
+  manualImage: boolean;
+  turnPhase?: TurnPhase;
+}) {
   const enabledModuleCount = state.modules.filter((module) => module.enabled && module.tokenPolicy !== "disabled").length;
   const referenceLabel = state.neuralMap.enabled ? "NeuralMap 참조" : "로컬 참조";
-  const imageLabel = manualImage || state.imageProfile.triggerMode !== "stored_only" ? "이미지 cue 준비" : "저장 이미지 탐색";
+  const imageExpected = manualImage || state.imageProfile.triggerMode !== "stored_only";
+  // Live image-job progress for the current turn (jobs update in React state during generation).
+  const activeImageJobs = state.imageJobs.filter(
+    (job) => job.status === "queued" || job.status === "planning" || job.status === "generating"
+  ).length;
+  const renderedImageAssets = state.imageJobs
+    .filter((job) => job.status === "generating" || job.status === "completed")
+    .reduce((sum, job) => sum + job.assetIds.length, 0);
+
+  // Phase ordering: retrieving → generating → images. Each step shows done / active / pending.
+  const phase: TurnPhase = turnPhase ?? "retrieving";
+  const order: Record<TurnPhase, number> = { retrieving: 0, generating: 1, images: 2 };
+  const stepClass = (step: TurnPhase): string =>
+    order[phase] > order[step] ? "done" : order[phase] === order[step] ? "active" : "";
+
+  const headline =
+    phase === "retrieving"
+      ? "필요한 설정과 문맥을 검색하는 중"
+      : phase === "generating"
+        ? "응답과 Image Cue를 생성하는 중"
+        : "이미지를 생성하는 중";
+  const detail =
+    phase === "retrieving"
+      ? `${referenceLabel}로 활성 모듈 ${enabledModuleCount}개 중 이번 장면에 필요한 설정만 꺼내고 있습니다.`
+      : phase === "generating"
+        ? "대화 흐름을 쓰면서 이미지 컷 계획을 함께 정리하고 있습니다. 응답은 생성되는 대로 위에 나타납니다."
+        : activeImageJobs > 0
+          ? `NovelAI 이미지 작업 ${activeImageJobs}개 진행 중${renderedImageAssets > 0 ? ` · ${renderedImageAssets}장 완료` : ""}.`
+          : "이미지 작업을 마무리하는 중입니다.";
 
   return (
     <>
@@ -6260,21 +7732,25 @@ function CrackPendingTurn({ userText, state, manualImage }: { userText: string; 
           <span />
         </div>
         <div>
-          <strong>DynamicChat이 다음 턴을 조립하는 중</strong>
-          <p>{referenceLabel}로 필요한 설정만 꺼내고, 대화 흐름과 Image Cue를 함께 정리하고 있습니다.</p>
+          <strong>{headline}</strong>
+          <p>{detail}</p>
         </div>
         <div className="crack-generation-steps">
-          <span className="active">
+          <span className={stepClass("retrieving")}>
             <Brain size={13} />
-            모듈 {enabledModuleCount}개
+            문맥 검색
           </span>
-          <span className="active">
+          <span className={stepClass("generating")}>
             <Sparkles size={13} />
-            문맥 조립
+            응답 생성
           </span>
-          <span>
+          <span className={stepClass("images")}>
             <ImageIcon size={13} />
-            {imageLabel}
+            {phase === "images" && activeImageJobs > 0
+              ? `이미지 ${renderedImageAssets > 0 ? `${renderedImageAssets}장` : `${activeImageJobs}작업`}`
+              : imageExpected
+                ? "이미지 생성"
+                : "저장 이미지"}
           </span>
         </div>
       </article>
@@ -6308,13 +7784,16 @@ const MarkdownStageText = memo(function MarkdownStageText({ content }: { content
   );
 });
 
-const DynamicTextEffectBlock = memo(function DynamicTextEffectBlock({ content, kind }: { content: string; kind: DynamicTextBlockKind }) {
+const DynamicTextEffectBlock = memo(function DynamicTextEffectBlock({ content, kind: _kind }: { content: string; kind: DynamicTextBlockKind }) {
+  // Blocks are unwrapped to plain prose — no aside chrome, no per-kind visual treatment.
+  // The component still exists so the fence parser can route ```status / ```impact fences
+  // here instead of falling through to the <pre.rich-code-block> renderer.
   return (
-    <aside className={`dynamic-text-block ${kind}`} aria-label={dynamicTextBlockLabels[kind]}>
+    <div className="dynamic-text-block">
       <div className="dynamic-text-content">
         <MarkdownStageText content={content} />
       </div>
-    </aside>
+    </div>
   );
 });
 
@@ -6412,29 +7891,35 @@ function CrackTimelineMessage({
     );
   }
 
-  const flow = useMemo(() => createNarrationFlow(message.content, assets, jobs), [assets, jobs, message.content]);
+  const narration = useMemo(() => createNarrationFlow(message.content, assets, jobs), [assets, jobs, message.content]);
+  const narrationMedia = useMemo<NarrationMediaContextValue>(
+    () => ({ slots: narration.markerSlots, onFeedback }),
+    [narration.markerSlots, onFeedback]
+  );
 
   return (
     <article className="crack-narration-block">
-      {flow.map((item) =>
-        item.kind === "markdown" ? (
-          <div className="crack-markdown" key={item.id}>
-            <MarkdownStageText content={item.content} />
-          </div>
-        ) : item.kind === "dynamic" ? (
-          <DynamicTextEffectBlock content={item.content} kind={item.blockKind} key={item.id} />
-        ) : item.kind === "image" ? (
-          <CrackInlineImage asset={item.asset} key={item.id} onFeedback={onFeedback} />
-        ) : (
-          <CrackInlineImageJob
-            job={item.job}
-            key={item.id}
-            onCancel={onCancelJob}
-            onRegenerate={onRegenerateImageJob}
-            onRun={onRunJob}
-          />
-        )
-      )}
+      <NarrationMediaContext.Provider value={narrationMedia}>
+        {narration.items.map((item) =>
+          item.kind === "markdown" ? (
+            <div className="crack-markdown" key={item.id}>
+              <MarkdownStageText content={item.content} />
+            </div>
+          ) : item.kind === "dynamic" ? (
+            <DynamicTextEffectBlock content={item.content} kind={item.blockKind} key={item.id} />
+          ) : item.kind === "image" ? (
+            <CrackInlineImage asset={item.asset} key={item.id} onFeedback={onFeedback} />
+          ) : (
+            <CrackInlineImageJob
+              job={item.job}
+              key={item.id}
+              onCancel={onCancelJob}
+              onRegenerate={onRegenerateImageJob}
+              onRun={onRunJob}
+            />
+          )
+        )}
+      </NarrationMediaContext.Provider>
       <div className="crack-message-controls">
         <span>{evidenceCount > 0 ? `근거 ${evidenceCount}개` : "문맥 준비됨"}</span>
         <button type="button" onClick={regenerateResponse} disabled={regenerationDisabled} aria-label="응답 재생성">
@@ -6471,17 +7956,27 @@ function CrackTimelineMessage({
 }
 
 const CrackInlineImage = memo(function CrackInlineImage({ asset, onFeedback }: { asset: ImageAsset; onFeedback: (assetId: string, rating: ImageFeedbackRating) => void }) {
+  // Prefer the decoded image's real dimensions so the frame matches the actual output instead of falling back to a
+  // square frame when providerMetadata lacks width/height (which would crop a portrait/landscape image into a square).
+  const [measuredSize, setMeasuredSize] = useState<{ width: number; height: number }>();
   const style = {
     "--tone-a": asset.palette[0],
     "--tone-b": asset.palette[1],
     "--tone-c": asset.palette[2],
-    "--image-aspect-ratio": createImageAssetAspectRatio(asset)
+    "--image-aspect-ratio": measuredSize ? `${measuredSize.width} / ${measuredSize.height}` : createImageAssetAspectRatio(asset),
+    // Numeric width/height ratio so CSS can size the frame as (height cap × ratio) and preserve the real
+    // aspect ratio instead of collapsing a portrait image into a square when the column is widened.
+    "--image-aspect-ratio-num": measuredSize ? measuredSize.width / measuredSize.height : createImageAssetAspectRatioNumber(asset)
   } as CSSProperties;
 
   return (
     <figure className="crack-inline-image" style={style}>
       <div className="crack-inline-image-frame">
-        <AssetImage src={createImageAssetSrc(asset)} alt={asset.title} />
+        <AssetImage
+          src={createImageAssetSrc(asset)}
+          alt={asset.title}
+          onNaturalSize={(width, height) => setMeasuredSize({ width, height })}
+        />
       </div>
       <figcaption>
         <span>{asset.title}</span>
@@ -6502,6 +7997,12 @@ function createImageAssetAspectRatio(asset: ImageAsset): string {
   const width = asset.providerMetadata ? readProviderPayloadNumber(asset.providerMetadata, "width") : undefined;
   const height = asset.providerMetadata ? readProviderPayloadNumber(asset.providerMetadata, "height") : undefined;
   return width && height ? `${Math.round(width)} / ${Math.round(height)}` : "1 / 1";
+}
+
+function createImageAssetAspectRatioNumber(asset: ImageAsset): number {
+  const width = asset.providerMetadata ? readProviderPayloadNumber(asset.providerMetadata, "width") : undefined;
+  const height = asset.providerMetadata ? readProviderPayloadNumber(asset.providerMetadata, "height") : undefined;
+  return width && height ? width / height : 1;
 }
 
 const CrackInlineImageJob = memo(function CrackInlineImageJob({
@@ -6573,6 +8074,7 @@ function SimulationRunPage({
   onImageFeedback,
   onImageProfileChange,
   onLlmChange,
+  onImageTagLlmChange,
   onNovelAiChange,
   onResetDemo,
   onResetSession,
@@ -6597,6 +8099,7 @@ function SimulationRunPage({
   onImageFeedback: (assetId: string, rating: ImageFeedbackRating) => void;
   onImageProfileChange: (patch: Partial<ImageGenerationProfile>) => void;
   onLlmChange: (patch: Partial<LlmApiSettings>) => void;
+  onImageTagLlmChange: (patch: Partial<LlmApiSettings>) => void;
   onNovelAiChange: (patch: Partial<NovelAiApiSettings>) => void;
   onResetDemo: () => void;
   onResetSession: () => void;
@@ -6773,7 +8276,7 @@ function SimulationRunPage({
         ) : rightPanel === "memory" ? (
           <MemoryPanel state={state} selectedContextPackId={selectedContextPack?.id} onRedactMemory={onRedactMemory} />
         ) : rightPanel === "relationship" ? (
-          <RelationshipMapPanel state={state} />
+          <RelationshipMapPanel state={state} onStateChange={onStateChange as Dispatch<SetStateAction<AppState>>} />
         ) : rightPanel === "neuralmap" ? (
           <NeuralMapPanel
             state={state}
@@ -6794,6 +8297,7 @@ function SimulationRunPage({
             state={state}
             onImageProfileChange={onImageProfileChange}
             onLlmChange={onLlmChange}
+            onImageTagLlmChange={onImageTagLlmChange}
             onNovelAiChange={onNovelAiChange}
             onOpenPersonalSettings={() => undefined}
             onStateChange={onStateChange}
@@ -7120,12 +8624,14 @@ function GuidedFieldLabel({
   title,
   badge,
   guide,
-  icon
+  icon,
+  charCount
 }: {
   title: string;
   badge?: string;
   guide: string;
   icon?: React.ReactNode;
+  charCount?: React.ReactNode;
 }) {
   return (
     <span className="guided-label">
@@ -7134,7 +8640,25 @@ function GuidedFieldLabel({
         <strong>{title}</strong>
         {badge ? <em>{badge}</em> : null}
       </span>
+      {charCount}
       <GuideIcon label={`${title} 가이드`} detail={guide} />
+    </span>
+  );
+}
+
+// Shows the current character count for a prompt field, and — when a soft excerpt budget applies to that field
+// — the budget as its maximum. A body past the budget is not rejected; each turn only the scene-relevant
+// windows are excerpted into the prompt, which the overflow note makes explicit.
+function PromptCharCount({ value, limit }: { value: string; limit?: number | null }) {
+  const count = value.length;
+  if (limit == null) {
+    return <span className="prompt-char-count">{count.toLocaleString()}자</span>;
+  }
+  const over = count > limit;
+  return (
+    <span className={`prompt-char-count${over ? " over" : ""}`}>
+      {count.toLocaleString()} / {limit.toLocaleString()}자
+      {over ? <em>초과분은 턴마다 발췌 적용</em> : null}
     </span>
   );
 }
@@ -7158,9 +8682,11 @@ function PromptAuthoringField({
   value: string;
   onChange: (value: string) => void;
 }) {
+  // The main-prompt field maps to the main_prompt module budget, the world field to the world_lore budget.
+  const limit = tone === "main" ? MAX_MAIN_PROMPT_BODY_CHARS : MAX_FOUNDATION_MODULE_BODY_CHARS;
   return (
     <label className={`prompt-authoring-field ${tone}`}>
-      <GuidedFieldLabel badge={badge} guide={guide} icon={icon} title={title} />
+      <GuidedFieldLabel badge={badge} guide={guide} icon={icon} title={title} charCount={<PromptCharCount value={value} limit={limit} />} />
       <textarea placeholder={placeholder} value={value} onChange={(event) => onChange(event.target.value)} />
     </label>
   );
@@ -7405,6 +8931,30 @@ const SceneTagPresetNodeEditor = memo(function SceneTagPresetNodeEditor({
   ]
     .filter(Boolean)
     .join(" ");
+  const exampleFiles = node.exampleFiles ?? [];
+  const updateExampleFiles = (files: ImageScenePresetExampleFile[]) => onChange(node.id, { exampleFiles: files });
+  const addExampleFile = () =>
+    updateExampleFiles([...exampleFiles, { id: createId("scene_example_file"), label: "", prompts: [] }]);
+  const patchExampleFile = (fileId: string, patch: Partial<ImageScenePresetExampleFile>) =>
+    updateExampleFiles(exampleFiles.map((file) => (file.id === fileId ? { ...file, ...patch } : file)));
+  const removeExampleFile = (fileId: string) =>
+    updateExampleFiles(exampleFiles.filter((file) => file.id !== fileId));
+  const importExampleFile = (fileId: string, text: string) => {
+    const existing = exampleFiles.find((file) => file.id === fileId)?.prompts ?? [];
+    const imported = text.split(/\r?\n/u);
+    const seen = new Set<string>();
+    const merged = [...existing, ...imported]
+      .map((line) => line.trim())
+      .filter((line) => {
+        const key = line.toLowerCase();
+        if (!line || seen.has(key)) {
+          return false;
+        }
+        seen.add(key);
+        return true;
+      });
+    patchExampleFile(fileId, { prompts: merged });
+  };
   return (
     <div
       className={className}
@@ -7461,7 +9011,7 @@ const SceneTagPresetNodeEditor = memo(function SceneTagPresetNodeEditor({
         </div>
         {collapsed ? (
           <div className="scene-tag-preset-collapsed-summary">
-            {[node.tags.length > 0 ? `태그 ${node.tags.length}개` : undefined, node.note.trim() ? "메모 있음" : undefined, children.length > 0 ? `하위 ${children.length}개 숨김` : undefined]
+            {[node.tags.length > 0 ? `태그 ${node.tags.length}개` : undefined, (node.exampleFiles ?? []).length > 0 ? `예시파일 ${(node.exampleFiles ?? []).length}개` : undefined, node.note.trim() ? "메모 있음" : undefined, children.length > 0 ? `하위 ${children.length}개 숨김` : undefined]
               .filter(Boolean)
               .join(" · ") || "접힌 키워드"}
           </div>
@@ -7501,6 +9051,54 @@ const SceneTagPresetNodeEditor = memo(function SceneTagPresetNodeEditor({
                 placeholder="활용 방식, 추천 변형, 와일드카드 규칙, 함께 쓰면 좋은 태그"
               />
             </label>
+            <div className="scene-tag-preset-examples">
+              <div className="scene-tag-preset-examples-head">
+                <span>예시 프롬프트 파일 (한 키워드에 여러 개 가능 — 예: 여성/남성)</span>
+                <button type="button" className="icon-text-button subtle" onClick={addExampleFile}>
+                  파일 추가
+                </button>
+              </div>
+              {exampleFiles.length === 0 ? (
+                <p className="scene-tag-preset-examples-empty">예시가 없어도 됩니다. 있으면 LLM이 스타일 참고용으로만 사용합니다.</p>
+              ) : null}
+              {exampleFiles.map((file) => (
+                <div className="scene-tag-preset-example-file" key={file.id}>
+                  <div className="scene-tag-preset-example-file-head">
+                    <input
+                      value={file.label}
+                      placeholder="라벨 (예: 여성, 남성, 장면)"
+                      onChange={(event) => patchExampleFile(file.id, { label: event.target.value })}
+                    />
+                    <label className="scene-tag-preset-example-import">
+                      .txt
+                      <input
+                        type="file"
+                        accept=".txt,text/plain"
+                        onChange={(event) => {
+                          const picked = event.target.files?.[0];
+                          if (!picked) {
+                            return;
+                          }
+                          const reader = new FileReader();
+                          reader.onload = () => importExampleFile(file.id, typeof reader.result === "string" ? reader.result : "");
+                          reader.readAsText(picked);
+                          event.target.value = "";
+                        }}
+                      />
+                    </label>
+                    <button type="button" className="icon-text-button subtle" onClick={() => removeExampleFile(file.id)}>
+                      삭제
+                    </button>
+                  </div>
+                  <textarea
+                    rows={4}
+                    value={file.prompts.join("\n")}
+                    onChange={(event) => patchExampleFile(file.id, { prompts: event.target.value.split(/\r?\n/u) })}
+                    placeholder={"설명 없이 완성 프롬프트만, 줄바꿈으로 구분\nmissionary position, spread legs, ...\nfrom front, lying on back, ..."}
+                  />
+                </div>
+              ))}
+            </div>
           </>
         )}
       </div>
@@ -8244,6 +9842,7 @@ function CreateSimulationPage({
                   guide={startSituationGuide}
                   icon={<Play size={15} />}
                   title="시작상황 지정 프롬프트"
+                  charCount={<PromptCharCount value={draft.startSituationPrompt} />}
                 />
                 <textarea
                   value={draft.startSituationPrompt}
@@ -8982,7 +10581,7 @@ function createInitialSimulationDraft(runtimeSource?: AppState): SimulationDraft
       ...seedState.imageProfile,
       id: "draft_image_profile",
       simulationId: "draft_simulation",
-      model: "nai-diffusion-4-5-curated",
+      model: "nai-diffusion-4-5-full",
       width: 1024,
       height: 1024,
       steps: 28,
@@ -9429,7 +11028,12 @@ function ModuleEditor({
       </label>
       {module.kind === "character_prompt" || module.kind === "image_prompt_profile" ? null : (
         <label>
-          <GuidedFieldLabel badge={moduleGuide.policy} guide={moduleGuide.detail} title="본문" />
+          <GuidedFieldLabel
+            badge={moduleGuide.policy}
+            guide={moduleGuide.detail}
+            title="본문"
+            charCount={<PromptCharCount value={module.body} limit={promptModuleBodyCharLimit(module.kind, module.tokenPolicy)} />}
+          />
           <textarea
             placeholder={moduleGuide.placeholder}
             value={module.body}
@@ -9925,6 +11529,7 @@ type RelationshipStatusSection = {
   source: "profile" | "memory" | "parameter";
   empty?: boolean;
   updatedAt?: string;
+  userEdited?: boolean;
 };
 type RelationshipMapEdge = {
   id: string;
@@ -9963,9 +11568,17 @@ type RelationshipProgressSync = {
   sourceCount: number;
 };
 
-function RelationshipMapPanel({ state }: { state: AppState }) {
+function RelationshipMapPanel({
+  state,
+  onStateChange
+}: {
+  state: AppState;
+  onStateChange: Dispatch<SetStateAction<AppState>>;
+}) {
   const view = useMemo(() => createRelationshipMapView(state), [state]);
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
+  const [editingKey, setEditingKey] = useState<string>();
+  const [editingValue, setEditingValue] = useState("");
 
   useEffect(() => {
     setSelectedNodeId((current) => {
@@ -9978,6 +11591,35 @@ function RelationshipMapPanel({ state }: { state: AppState }) {
   }, [view.nodes]);
 
   const selectedNode = view.nodes.find((node) => node.id === selectedNodeId) ?? view.nodes[0];
+
+  const beginStatusEdit = useCallback((node: RelationshipMapNode, section: RelationshipStatusSection) => {
+    setEditingKey(relationshipStatusOverrideKey(node.id, section.title));
+    setEditingValue(section.value);
+  }, []);
+
+  const cancelStatusEdit = useCallback(() => {
+    setEditingKey(undefined);
+    setEditingValue("");
+  }, []);
+
+  const saveStatusEdit = useCallback(
+    (node: RelationshipMapNode, section: RelationshipStatusSection) => {
+      const value = editingValue;
+      onStateChange((current) => upsertRelationshipStatusOverride(current, node.id, section.title, value));
+      setEditingKey(undefined);
+      setEditingValue("");
+    },
+    [editingValue, onStateChange]
+  );
+
+  const resetStatusEdit = useCallback(
+    (node: RelationshipMapNode, section: RelationshipStatusSection) => {
+      onStateChange((current) => removeRelationshipStatusOverride(current, node.id, section.title));
+      setEditingKey(undefined);
+      setEditingValue("");
+    },
+    [onStateChange]
+  );
   const selectedEdges = view.edges.filter((edge) => edge.from === selectedNode?.id || edge.to === selectedNode?.id);
   const latestRecords = view.records.slice(-5).reverse();
   const selectedStatusUpdatedAt = selectedNode?.statusSections
@@ -10058,16 +11700,55 @@ function RelationshipMapPanel({ state }: { state: AppState }) {
 
             <div className="relationship-status-board">
               {selectedNode.statusSections.length > 0 ? (
-                selectedNode.statusSections.map((section) => (
-                  <section className={`relationship-status-card ${section.empty ? "empty" : ""} source-${section.source}`} key={section.id}>
-                    <div>
-                      <strong>{section.title}</strong>
-                      <span>{formatRelationshipStatusSource(section)}</span>
-                    </div>
-                    <p>{section.value}</p>
-                    {section.rule ? <small>{section.rule}</small> : null}
-                  </section>
-                ))
+                selectedNode.statusSections.map((section) => {
+                  const cardKey = relationshipStatusOverrideKey(selectedNode.id, section.title);
+                  const isEditing = editingKey === cardKey;
+                  return (
+                    <section
+                      className={`relationship-status-card ${section.empty ? "empty" : ""} source-${section.source} ${section.userEdited ? "user-edited" : ""}`}
+                      key={section.id}
+                    >
+                      <div>
+                        <strong>{section.title}</strong>
+                        <span>{section.userEdited ? "직접 입력" : formatRelationshipStatusSource(section)}</span>
+                      </div>
+                      {isEditing ? (
+                        <div className="relationship-status-editor">
+                          <textarea
+                            value={editingValue}
+                            rows={3}
+                            autoFocus
+                            onChange={(event) => setEditingValue(event.target.value)}
+                            aria-label={`${section.title} 직접 입력`}
+                          />
+                          <div className="relationship-status-actions">
+                            <button type="button" className="ghost" onClick={cancelStatusEdit}>
+                              취소
+                            </button>
+                            <button type="button" onClick={() => saveStatusEdit(selectedNode, section)}>
+                              저장
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <p>{section.value}</p>
+                          <div className="relationship-status-actions">
+                            <button type="button" className="ghost" onClick={() => beginStatusEdit(selectedNode, section)}>
+                              편집
+                            </button>
+                            {section.userEdited ? (
+                              <button type="button" className="ghost" onClick={() => resetStatusEdit(selectedNode, section)}>
+                                자동값으로
+                              </button>
+                            ) : null}
+                          </div>
+                        </>
+                      )}
+                      {section.rule ? <small>{section.rule}</small> : null}
+                    </section>
+                  );
+                })
               ) : (
                 <section className="relationship-status-card empty">
                   <div>
@@ -10500,9 +12181,77 @@ function createRelationshipStatusSections(state: AppState, node: RelationshipMap
       updatedAt: record.createdAt
     }));
 
-  return uniqueRelationshipStatusSections([...parameterSections, ...extraStateSections, ...profileSections])
+  const sections = uniqueRelationshipStatusSections([...parameterSections, ...extraStateSections, ...profileSections])
     .filter((section) => section.value.trim())
     .slice(0, 18);
+  return sections.map((section) => applyRelationshipStatusOverride(state, node, section));
+}
+
+function relationshipStatusOverrideKey(nodeId: string, title: string): string {
+  return `${nodeId}::${normalizeRelationshipStatusKey(title)}`;
+}
+
+function findRelationshipStatusOverride(state: AppState, nodeId: string, title: string) {
+  const statusKey = normalizeRelationshipStatusKey(title);
+  return state.relationshipStatusOverrides.find(
+    (override) => override.nodeId === nodeId && override.statusKey === statusKey
+  );
+}
+
+function applyRelationshipStatusOverride(
+  state: AppState,
+  node: RelationshipMapNode,
+  section: RelationshipStatusSection
+): RelationshipStatusSection {
+  const override = findRelationshipStatusOverride(state, node.id, section.title);
+  if (!override) {
+    return section;
+  }
+
+  return {
+    ...section,
+    value: override.value,
+    userEdited: true,
+    empty: false,
+    updatedAt: override.updatedAt ?? section.updatedAt
+  };
+}
+
+function upsertRelationshipStatusOverride(state: AppState, nodeId: string, title: string, value: string): AppState {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return removeRelationshipStatusOverride(state, nodeId, title);
+  }
+
+  const statusKey = normalizeRelationshipStatusKey(title);
+  const next: AppState["relationshipStatusOverrides"][number] = {
+    nodeId,
+    statusKey,
+    title,
+    value: trimmed,
+    updatedAt: new Date().toISOString()
+  };
+  const others = state.relationshipStatusOverrides.filter(
+    (override) => relationshipStatusOverrideKey(override.nodeId, override.title) !== relationshipStatusOverrideKey(nodeId, title)
+  );
+  return {
+    ...state,
+    relationshipStatusOverrides: [...others, next]
+  };
+}
+
+function removeRelationshipStatusOverride(state: AppState, nodeId: string, title: string): AppState {
+  const targetKey = relationshipStatusOverrideKey(nodeId, title);
+  const filtered = state.relationshipStatusOverrides.filter(
+    (override) => relationshipStatusOverrideKey(override.nodeId, override.title) !== targetKey
+  );
+  if (filtered.length === state.relationshipStatusOverrides.length) {
+    return state;
+  }
+  return {
+    ...state,
+    relationshipStatusOverrides: filtered
+  };
 }
 
 function getRelationshipRecordStatusKey(record: RelationshipMemoryRecord): string {
@@ -10960,7 +12709,13 @@ function NeuralMapPanel({
         if (state.neuralMap.enabled) {
           const client = new NeuralMapClient(state.neuralMap);
           if (result.syncTarget.kind === "prompt_module") {
-            onNotify?.("프롬프트 모듈은 NeuralMap에 저장하지 않고 로컬 설정만 업데이트되었습니다.");
+            const editedModule = result.syncTarget.module;
+            if (isSemanticRetrievalModule(editedModule)) {
+              await client.syncPromptModuleDocuments(result.state, new Set([editedModule.id]));
+              onNotify?.("서브 프롬프트를 NeuralMap에 의미 검색용으로 인덱싱했습니다.");
+            } else {
+              onNotify?.("프롬프트 모듈 로컬 설정이 업데이트되었습니다.");
+            }
           } else if (result.syncTarget.kind === "memory_event") {
             const memoryTarget = result.syncTarget.event;
             const neuralMapNodeId = await client.ingestEvent(memoryTarget, result.state);
@@ -12204,7 +13959,13 @@ function PersonalSettingsDialog({
             ) : (
               <div className="readonly-field">
                 <span>엔드포인트</span>
-                <strong>{llmDraft.provider === "mock" ? "로컬 대체 응답" : llmProvider.baseUrl}</strong>
+                <strong>
+                  {llmDraft.provider === "mock"
+                    ? "로컬 대체 응답"
+                    : isCliAgentLlmProvider(llmDraft.provider)
+                      ? "로컬 구독 CLI 브리지 (DynamicChat 서버 실행 필요)"
+                      : llmProvider.baseUrl}
+                </strong>
               </div>
             )}
             <label>
@@ -12214,7 +13975,7 @@ function PersonalSettingsDialog({
                 value={llmDraft.apiKey}
                 onChange={(event) => setLlmDraft((current) => ({ ...current, apiKey: event.target.value, registrationStatus: "idle", verificationMessage: "" }))}
                 placeholder={llmProvider.keyPlaceholder}
-                disabled={llmDraft.provider === "mock"}
+                disabled={llmDraft.provider === "mock" || isCliAgentLlmProvider(llmDraft.provider)}
               />
             </label>
             <div className="two-fields">
@@ -12525,6 +14286,7 @@ function SettingsPanel({
   state,
   onImageProfileChange,
   onLlmChange,
+  onImageTagLlmChange,
   onNovelAiChange,
   onNotify,
   onOpenPersonalSettings,
@@ -12534,6 +14296,7 @@ function SettingsPanel({
   state: AppState;
   onImageProfileChange: (patch: Partial<ImageGenerationProfile>) => void;
   onLlmChange: (patch: Partial<LlmApiSettings>) => void;
+  onImageTagLlmChange: (patch: Partial<LlmApiSettings>) => void;
   onNovelAiChange: (patch: Partial<NovelAiApiSettings>) => void;
   onNotify?: (message: string) => void;
   onOpenPersonalSettings: () => void;
@@ -12542,10 +14305,14 @@ function SettingsPanel({
 }) {
   const [isRuntimeVerifying, setIsRuntimeVerifying] = useState(false);
   const [runtimeCheck, setRuntimeCheck] = useState("");
+  const [vibeEncodeStatus, setVibeEncodeStatus] = useState<Record<string, { state: "encoding" | "error"; message?: string }>>({});
   const [dynamicChatApiBaseUrl, setDynamicChatApiBaseUrl] = useState(() => getConfiguredDynamicChatApiBaseUrl());
   const llmProvider = getLlmProviderOption(state.llm.provider);
   const availableLlmModels = llmProvider.models.filter((model) => model !== "custom");
   const selectedLlmModel = availableLlmModels.includes(state.llm.model) ? state.llm.model : "custom";
+  const imageTagLlmProvider = getLlmProviderOption(state.imageTagLlm.provider);
+  const availableImageTagLlmModels = imageTagLlmProvider.models.filter((model) => model !== "custom");
+  const selectedImageTagLlmModel = availableImageTagLlmModels.includes(state.imageTagLlm.model) ? state.imageTagLlm.model : "custom";
   const activeRuntimeResolution = resolutionPresets.some((preset) => preset.width === state.imageProfile.width && preset.height === state.imageProfile.height)
     ? `${state.imageProfile.width}x${state.imageProfile.height}`
     : "custom";
@@ -12562,6 +14329,9 @@ function SettingsPanel({
   const llmNeedsSecret = state.llm.provider !== "mock" && !llmHasSecret;
   const novelAiHasSecret = hasStoredSecret(state.novelAi);
   const novelAiNeedsSecret = state.novelAi.enabled && state.novelAi.requestMode !== "mock" && !novelAiHasSecret;
+  // v4/v4.5는 generate 전에 참조 이미지를 encode-vibe로 인코딩해야 한다. v3는 원본 이미지를 직접 전송한다.
+  const requiresVibeEncoding = state.novelAi.modelPreset.startsWith("NAID4");
+  const canEncodeVibe = state.novelAi.requestMode !== "mock" && novelAiHasSecret;
   const llmStatusLabel = state.llm.provider === "mock" ? "mock" : llmHasSecret ? "키 등록됨" : "키 필요";
   const novelAiStatusLabel = !state.novelAi.enabled ? "비활성" : state.novelAi.requestMode === "mock" ? "mock" : novelAiHasSecret ? "토큰 등록됨" : "토큰 필요";
   const activeContentRatingOption = contentRatingOptions.find((option) => option.value === state.simulation.contentRating) ?? contentRatingOptions[0];
@@ -12593,6 +14363,120 @@ function SettingsPanel({
       notifyApplied(message);
     },
     [notifyApplied, onStateChange]
+  );
+  const addVibeTransferReferences = useCallback(
+    (files: FileList | null) => {
+      const picked = Array.from(files ?? []).filter((file) => file.type.startsWith("image/"));
+      if (picked.length === 0) {
+        return;
+      }
+      Promise.all(
+        picked.map(
+          (file) =>
+            new Promise<{ name: string; image: string } | null>((resolve) => {
+              const reader = new FileReader();
+              reader.onload = () => {
+                if (typeof reader.result !== "string") {
+                  resolve(null);
+                  return;
+                }
+                // Downscale to 448 px on the long edge before storing; avoids blowing
+                // the ~5 MB localStorage quota with raw multi-MB base64 payloads.
+                downscaleImageToDataUrl(reader.result).then((image) => resolve({ name: file.name, image }));
+              };
+              reader.onerror = () => resolve(null);
+              reader.readAsDataURL(file);
+            })
+        )
+      ).then((loaded) => {
+        const additions: NovelAiVibeTransferReference[] = loaded
+          .filter((item): item is { name: string; image: string } => Boolean(item))
+          .map((item) => ({
+            id: createId("vibe_ref"),
+            name: item.name,
+            image: item.image,
+            referenceStrength: 0.6,
+            informationExtracted: 1
+          }));
+        if (additions.length === 0) {
+          return;
+        }
+        onNovelAiChange({ vibeTransferReferences: [...state.novelAi.vibeTransferReferences, ...additions] });
+        notifyApplied(`Vibe Transfer 참조 이미지 ${additions.length}개가 추가되었습니다.`);
+      });
+    },
+    [notifyApplied, onNovelAiChange, state.novelAi.vibeTransferReferences]
+  );
+  const updateVibeTransferReference = useCallback(
+    (id: string, patch: Partial<NovelAiVibeTransferReference>) => {
+      onNovelAiChange({
+        vibeTransferReferences: state.novelAi.vibeTransferReferences.map((reference) =>
+          reference.id === id ? { ...reference, ...patch } : reference
+        )
+      });
+    },
+    [onNovelAiChange, state.novelAi.vibeTransferReferences]
+  );
+  const removeVibeTransferReference = useCallback(
+    (id: string) => {
+      onNovelAiChange({
+        vibeTransferReferences: state.novelAi.vibeTransferReferences.filter((reference) => reference.id !== id)
+      });
+      notifyApplied("Vibe Transfer 참조 이미지가 제거되었습니다.");
+    },
+    [notifyApplied, onNovelAiChange, state.novelAi.vibeTransferReferences]
+  );
+  const clearVibeTransferEncoding = useCallback(
+    (id: string) => {
+      onNovelAiChange({
+        vibeTransferReferences: state.novelAi.vibeTransferReferences.map((reference) =>
+          reference.id === id
+            ? { ...reference, encodedVibe: undefined, encodedModel: undefined, encodedInformationExtracted: undefined }
+            : reference
+        )
+      });
+      notifyApplied("Vibe Transfer 인코딩이 해제되었습니다.");
+    },
+    [notifyApplied, onNovelAiChange, state.novelAi.vibeTransferReferences]
+  );
+  const encodeVibeTransferReference = useCallback(
+    async (reference: NovelAiVibeTransferReference) => {
+      setVibeEncodeStatus((current) => ({ ...current, [reference.id]: { state: "encoding" } }));
+      try {
+        const encodedVibe = await encodeNovelAiVibe({
+          state,
+          image: reference.image,
+          informationExtracted: reference.informationExtracted
+        });
+        // Persist the encoding through onNovelAiChange so it lands in the GLOBAL vibe vault (not just the
+        // per-simulation state, which applyPersonalApiVault would otherwise overwrite on the next sim
+        // switch — losing the encoding). Map off the freshest references via a microtask snapshot.
+        onNovelAiChange({
+          vibeTransferReferences: state.novelAi.vibeTransferReferences.map((item) =>
+            item.id === reference.id
+              ? {
+                  ...item,
+                  encodedVibe,
+                  encodedModel: state.novelAi.modelPreset,
+                  encodedInformationExtracted: reference.informationExtracted
+                }
+              : item
+          )
+        });
+        setVibeEncodeStatus((current) => {
+          const next = { ...current };
+          delete next[reference.id];
+          return next;
+        });
+        notifyApplied("Vibe Transfer 인코딩이 완료되었습니다.");
+      } catch (error) {
+        setVibeEncodeStatus((current) => ({
+          ...current,
+          [reference.id]: { state: "error", message: error instanceof Error ? error.message : "인코딩에 실패했습니다." }
+        }));
+      }
+    },
+    [notifyApplied, onNovelAiChange, state]
   );
   const applyContentRatingChange = useCallback(
     (contentRating: ContentRating) => {
@@ -12712,7 +14596,7 @@ function SettingsPanel({
       <label>
         기본 URL
         <input
-          placeholder="http://127.0.0.1:4318"
+          placeholder="http://127.0.0.1:8788"
           value={dynamicChatApiBaseUrl}
           onChange={(event) => {
             setDynamicChatApiBaseUrl(event.target.value);
@@ -12934,6 +14818,114 @@ function SettingsPanel({
           <KeyRound size={16} />
           개인 설정에서 LLM 키 관리
         </button>
+      </div>
+
+      <SectionTitle icon={<Bot size={17} />} title="이미지 태그 전용 LLM" />
+      <div className="runtime-model-card">
+        <p className="settings-note">내러티브 모델과 분리되어 더 저렴한 모델로 이미지 태그(NovelAI 태그)를 생성할 수 있습니다. 비활성화하면 메인 LLM을 사용합니다.</p>
+        <label className="checkline">
+          <input
+            type="checkbox"
+            checked={state.imageTagLlm.enabled}
+            onChange={(event) => onImageTagLlmChange({ enabled: event.target.checked })}
+          />
+          별도 모델로 이미지 태그 생성
+        </label>
+        {state.imageTagLlm.enabled ? (
+          <>
+            <label>
+              공급자
+              <select
+                value={state.imageTagLlm.provider}
+                onChange={(event) => {
+                  const provider = event.target.value as LlmApiSettings["provider"];
+                  onImageTagLlmChange(createLlmProviderPatch(provider));
+                }}
+              >
+                {llmProviderOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {imageTagLlmProvider.advancedBaseUrl ? (
+              <label>
+                기본 URL
+                <input
+                  value={state.imageTagLlm.baseUrl}
+                  onChange={(event) => onImageTagLlmChange({ baseUrl: event.target.value })}
+                />
+              </label>
+            ) : null}
+            <div className="runtime-model-grid">
+              <label>
+                사용 가능 모델
+                <select
+                  value={selectedImageTagLlmModel}
+                  onChange={(event) => {
+                    if (event.target.value === "custom") {
+                      onImageTagLlmChange({ model: "" });
+                      return;
+                    }
+                    onImageTagLlmChange({ model: event.target.value });
+                  }}
+                >
+                  {availableImageTagLlmModels.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                  <option value="custom">직접 입력</option>
+                </select>
+              </label>
+              <label>
+                직접 입력
+                <input
+                  value={state.imageTagLlm.model}
+                  placeholder={imageTagLlmProvider.defaultModel}
+                  onChange={(event) => onImageTagLlmChange({ model: event.target.value })}
+                />
+              </label>
+            </div>
+            <label>
+              API 키
+              <input
+                type="password"
+                value={state.imageTagLlm.apiKey}
+                onChange={(event) => onImageTagLlmChange({ apiKey: event.target.value, registrationStatus: "idle", verificationMessage: "" })}
+                placeholder={imageTagLlmProvider.keyPlaceholder}
+                disabled={state.imageTagLlm.provider === "mock" || isCliAgentLlmProvider(state.imageTagLlm.provider)}
+              />
+            </label>
+            <div className="runtime-model-grid compact">
+              <label>
+                응답 출력 토큰 <span className="inline-value">{state.imageTagLlm.maxTokens}</span>
+                <input
+                  type="number"
+                  min="256"
+                  max="4000"
+                  step="100"
+                  value={state.imageTagLlm.maxTokens}
+                  onChange={(event) => onImageTagLlmChange({ maxTokens: Number(event.target.value) })}
+                />
+              </label>
+              <label>
+                온도 <span className="inline-value">{state.imageTagLlm.temperature.toFixed(2)}</span>
+                <input
+                  type="range"
+                  min="0"
+                  max="1.5"
+                  step="0.05"
+                  value={state.imageTagLlm.temperature}
+                  onChange={(event) => onImageTagLlmChange({ temperature: Number(event.target.value) })}
+                />
+              </label>
+            </div>
+          </>
+        ) : (
+          <p className="settings-note">메인 LLM을 사용합니다.</p>
+        )}
       </div>
 
       <SectionTitle icon={<Sparkles size={17} />} title="NovelAI 런타임" />
@@ -13172,6 +15164,120 @@ function SettingsPanel({
 
       <div className="runtime-parameter-card">
         <div className="runtime-card-subhead">
+          <strong>Vibe Transfer</strong>
+          <span>{state.novelAi.vibeTransferEnabled ? `${state.novelAi.vibeTransferReferences.length}장` : "off"}</span>
+        </div>
+        <label className="checkline">
+          <input
+            checked={state.novelAi.vibeTransferEnabled}
+            type="checkbox"
+            onChange={(event) => applyNovelAiChange({ vibeTransferEnabled: event.target.checked }, event.target.checked ? "Vibe Transfer가 활성화되었습니다." : "Vibe Transfer가 비활성화되었습니다.")}
+          />
+          Vibe Transfer 사용
+        </label>
+        <p className="settings-note">참조 이미지를 첨부하면 NovelAI 이미지 생성 요청에 함께 전송됩니다. 이미지마다 reference strength와 information extracted를 조절할 수 있습니다.{requiresVibeEncoding ? " v4/v4.5 모델은 생성 전에 각 이미지를 한 번 인코딩해야 하며(1회 2 Anlas), 모델이나 information extracted를 바꾸면 다시 인코딩하세요." : ""}</p>
+        <label className="vibe-transfer-import icon-text-button full">
+          <ImagePlus size={16} />
+          참조 이미지 추가
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            style={{ display: "none" }}
+            onChange={(event) => {
+              addVibeTransferReferences(event.target.files);
+              event.target.value = "";
+            }}
+          />
+        </label>
+        {state.novelAi.vibeTransferReferences.length === 0 ? (
+          <p className="settings-note muted">아직 추가된 참조 이미지가 없습니다.</p>
+        ) : (
+          <div className="vibe-transfer-list">
+            {state.novelAi.vibeTransferReferences.map((reference) => {
+              const encodeStatus = vibeEncodeStatus[reference.id];
+              const isEncoding = encodeStatus?.state === "encoding";
+              const isEncoded =
+                Boolean(reference.encodedVibe) &&
+                reference.encodedModel === state.novelAi.modelPreset &&
+                reference.encodedInformationExtracted === reference.informationExtracted;
+              const isStale = Boolean(reference.encodedVibe) && !isEncoded;
+              return (
+                <div className="vibe-transfer-item" key={reference.id}>
+                  <div className="vibe-transfer-item-head">
+                    <img className="vibe-transfer-thumb" src={reference.image} alt={reference.name || "vibe reference"} />
+                    <div className="vibe-transfer-item-meta">
+                      <strong title={reference.name}>{reference.name || "참조 이미지"}</strong>
+                      <button type="button" className="icon-text-button subtle" onClick={() => removeVibeTransferReference(reference.id)}>
+                        제거
+                      </button>
+                    </div>
+                  </div>
+                  <label>
+                    Reference strength <span className="inline-value">{reference.referenceStrength.toFixed(2)}</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={reference.referenceStrength}
+                      onChange={(event) => updateVibeTransferReference(reference.id, { referenceStrength: Number(event.target.value) })}
+                      onMouseUp={() => notifyApplied("Vibe Transfer reference strength가 적용되었습니다.")}
+                      onTouchEnd={() => notifyApplied("Vibe Transfer reference strength가 적용되었습니다.")}
+                    />
+                  </label>
+                  <label>
+                    Information extracted <span className="inline-value">{reference.informationExtracted.toFixed(2)}</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={reference.informationExtracted}
+                      onChange={(event) => updateVibeTransferReference(reference.id, { informationExtracted: Number(event.target.value) })}
+                      onMouseUp={() => notifyApplied("Vibe Transfer information extracted가 적용되었습니다.")}
+                      onTouchEnd={() => notifyApplied("Vibe Transfer information extracted가 적용되었습니다.")}
+                    />
+                  </label>
+                  {requiresVibeEncoding ? (
+                    <div className="vibe-transfer-encode-row">
+                      <span className={`vibe-encode-state ${isEncoded ? "ok" : isStale ? "stale" : "pending"}`}>
+                        {isEncoding ? "인코딩 중…" : isEncoded ? "인코딩됨" : isStale ? "재인코딩 필요" : "미인코딩"}
+                      </span>
+                      <button
+                        type="button"
+                        className="icon-text-button subtle"
+                        disabled={!canEncodeVibe || isEncoding}
+                        onClick={() => encodeVibeTransferReference(reference)}
+                      >
+                        <WandSparkles size={14} />
+                        {isEncoded ? "다시 인코딩" : "인코딩"}
+                      </button>
+                      {reference.encodedVibe ? (
+                        <button
+                          type="button"
+                          className="icon-text-button subtle"
+                          disabled={isEncoding}
+                          onClick={() => clearVibeTransferEncoding(reference.id)}
+                        >
+                          인코딩 해제
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {requiresVibeEncoding && !canEncodeVibe ? (
+                    <p className="settings-note muted">인코딩하려면 개인 설정에서 NovelAI 토큰을 먼저 등록하세요.</p>
+                  ) : null}
+                  {encodeStatus?.state === "error" ? <p className="settings-note warning">{encodeStatus.message}</p> : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
           <strong>자동 생성</strong>
           <span>{state.novelAi.automationTermination}</span>
         </div>
@@ -13315,7 +15421,15 @@ function createImageAssetSrc(asset?: ImageAsset): string | undefined {
     : undefined;
 }
 
-function AssetImage({ src, alt }: { src?: string; alt: string }) {
+function AssetImage({
+  src,
+  alt,
+  onNaturalSize
+}: {
+  src?: string;
+  alt: string;
+  onNaturalSize?: (width: number, height: number) => void;
+}) {
   const [failedSrc, setFailedSrc] = useState<string>();
   const failed = Boolean(src && failedSrc === src);
 
@@ -13335,7 +15449,24 @@ function AssetImage({ src, alt }: { src?: string; alt: string }) {
     return <FallbackSceneArt />;
   }
 
-  return <img src={src} alt={alt} loading="lazy" onError={() => setFailedSrc(src)} />;
+  return (
+    <img
+      src={src}
+      alt={alt}
+      loading="lazy"
+      onError={() => setFailedSrc(src)}
+      onLoad={
+        onNaturalSize
+          ? (event) => {
+              const image = event.currentTarget;
+              if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+                onNaturalSize(image.naturalWidth, image.naturalHeight);
+              }
+            }
+          : undefined
+      }
+    />
+  );
 }
 
 function FallbackSceneArt() {

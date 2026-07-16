@@ -5,6 +5,7 @@ import type {
   ContentRating,
   EvaluationScenario,
   ImageGenerationProfile,
+  ImageScenePresetExampleFile,
   ImageSceneTagPreset,
   ImageSceneTagPresetNode,
   LlmApiSettings,
@@ -17,6 +18,7 @@ import type {
   Simulation,
   UserPersona
 } from "../types";
+import { createId } from "../lib/id";
 import { createSecuritySettings, normalizeSecuritySettings } from "../services/security";
 import { toShareableLlmSettings, toShareableNovelAiSettings } from "../services/runtimeApiSettings";
 import { createDefaultProgressRunId, normalizeProgressRuns } from "../services/progressRuns";
@@ -33,6 +35,17 @@ const defaultImageScenePresets: ImageSceneTagPreset[] = [
     keyword: "archive library",
     tags: ["archive library", "bookshelf", "old books", "wooden table", "paper stack", "warm lamplight", "dust particles"],
     note: "기록 보관소, 사서, 단서 조사 장면용. 캐릭터 외형 태그는 포함하지 않는다.",
+    exampleFiles: [
+      {
+        id: "scene_preset_archive_file_scene",
+        label: "scene",
+        prompts: [
+          "archive library, tall bookshelves, warm lamplight, dust particles, wooden ladder, from above, wide shot",
+          "narrow library aisle, old books, paper stack, dim light, depth of field, over the shoulder",
+          "reading desk, open book, ink bottle, candle, close-up, soft shadows"
+        ]
+      }
+    ],
     enabled: true,
     priority: 84,
     updatedAt: now,
@@ -388,6 +401,7 @@ export const seedState: AppState = {
   relationshipMap: {
     ...defaultRelationshipMapSettings
   },
+  relationshipStatusOverrides: [],
   llm: {
     enabled: false,
     provider: "mock",
@@ -400,15 +414,27 @@ export const seedState: AppState = {
       "You are the narrative engine for DynamicChat. Continue the simulation using retrieved prompt modules, context evidence, and user action. Respond in Korean unless the user asks otherwise.",
     registrationStatus: "idle"
   },
+  imageTagLlm: {
+    // enabled=false → the image-cue call reuses the main `llm` config. Turn it on to use a separate (cheaper) model.
+    enabled: false,
+    provider: "mock",
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "",
+    model: "gpt-4.1-mini",
+    temperature: 0.3,
+    maxTokens: 900,
+    systemPrompt: "",
+    registrationStatus: "idle"
+  },
   novelAi: {
     enabled: false,
     requestMode: "proxy",
     endpoint: "https://image.novelai.net/ai/generate-image",
     apiKey: "",
-    proxyUrl: "http://127.0.0.1:4318/novelai/generate-image",
+    proxyUrl: "http://127.0.0.1:8788/novelai/generate-image",
     accountLabel: "Main NAI account",
     roundRobinEnabled: false,
-    modelPreset: "NAID4.5C",
+    modelPreset: "NAID4.5F",
     ucPreset: 0,
     sampler: "k_euler_ancestral",
     noiseSchedule: "karras",
@@ -421,7 +447,9 @@ export const seedState: AppState = {
     automationTermination: "unlimited",
     timerMinutes: 30,
     countLimit: 30,
-    registrationStatus: "idle"
+    registrationStatus: "idle",
+    vibeTransferEnabled: false,
+    vibeTransferReferences: []
   },
   selectedModuleId: "module_main",
   selectedContextPackId: "ctx_seed"
@@ -993,7 +1021,7 @@ export const sunnyLineSeedState: AppState = {
   },
   novelAi: {
     ...seedState.novelAi,
-    modelPreset: "NAID4.5C",
+    modelPreset: "NAID4.5F",
     countLimit: 60
   },
   selectedModuleId: "sunny_module_main",
@@ -1052,11 +1080,54 @@ function normalizeRelationshipStatusParameters(candidate: unknown): Relationship
     (parameter) => !existingTitles.has(normalizeRelationshipParameterTitle(parameter.title))
   );
 
-  return [...missingDefaults, ...merged];
+  // Guarantee unique ids. Duplicate ids (e.g. a default id re-added by missingDefaults after a
+  // title rename, accumulated across reloads) make the editor treat several rows as one: editing
+  // one row's title/priority writes to every row that shares the id. Regenerate on collision.
+  const seenIds = new Set<string>();
+  return [...missingDefaults, ...merged].map((parameter) => {
+    if (seenIds.has(parameter.id)) {
+      const id = createId("rel_param");
+      seenIds.add(id);
+      return { ...parameter, id };
+    }
+    seenIds.add(parameter.id);
+    return parameter;
+  });
 }
 
 function normalizeRelationshipParameterTitle(value: string): string {
   return value.toLowerCase().replace(/\s+/gu, "").replace(/[^\p{L}\p{N}_:-]+/gu, "");
+}
+
+function normalizeRelationshipStatusOverrides(candidate: unknown): AppState["relationshipStatusOverrides"] {
+  if (!Array.isArray(candidate)) {
+    return [];
+  }
+
+  return candidate
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return undefined;
+      }
+
+      const override = item as Partial<AppState["relationshipStatusOverrides"][number]>;
+      const nodeId = typeof override.nodeId === "string" ? override.nodeId.trim() : "";
+      const statusKey = typeof override.statusKey === "string" ? override.statusKey.trim() : "";
+      const title = typeof override.title === "string" ? override.title.trim() : "";
+      const value = typeof override.value === "string" ? override.value : "";
+      if (!nodeId || !statusKey || !value.trim()) {
+        return undefined;
+      }
+
+      return {
+        nodeId,
+        statusKey,
+        title: title || statusKey,
+        value,
+        updatedAt: typeof override.updatedAt === "string" && override.updatedAt ? override.updatedAt : new Date().toISOString()
+      };
+    })
+    .filter((item): item is AppState["relationshipStatusOverrides"][number] => Boolean(item));
 }
 
 export function hydrateState(candidate: AppState | undefined): AppState {
@@ -1085,12 +1156,19 @@ export function hydrateState(candidate: AppState | undefined): AppState {
   const imageJobs = normalizeImageJobs(candidate.imageJobs);
   const novelAi = {
     ...seedState.novelAi,
-    ...candidate.novelAi
+    ...candidate.novelAi,
+    vibeTransferReferences: Array.isArray(candidate.novelAi?.vibeTransferReferences)
+      ? candidate.novelAi.vibeTransferReferences
+      : seedState.novelAi.vibeTransferReferences
   };
   const imageProfile = {
     ...seedState.imageProfile,
     ...candidate.imageProfile,
     model: resolveNovelAiModelName(novelAi.modelPreset, candidate.imageProfile?.model ?? seedState.imageProfile.model)
+  };
+  const imageTagLlm = {
+    ...seedState.imageTagLlm,
+    ...candidate.imageTagLlm
   };
   const activeProgressRunId =
     candidate.activeProgressRunId ??
@@ -1123,6 +1201,7 @@ export function hydrateState(candidate: AppState | undefined): AppState {
     imageAssets,
     imageJobs,
     imageProfile,
+    imageTagLlm,
     userPersona: normalizeUserPersona(candidate.userPersona),
     neuralMap: {
       ...seedState.neuralMap,
@@ -1135,6 +1214,7 @@ export function hydrateState(candidate: AppState | undefined): AppState {
       parameters: normalizeRelationshipStatusParameters(candidate.relationshipMap?.parameters),
       updatedAt: candidate.relationshipMap?.updatedAt ?? defaultRelationshipMapSettings.updatedAt
     },
+    relationshipStatusOverrides: normalizeRelationshipStatusOverrides(candidate.relationshipStatusOverrides),
     llm: {
       ...seedState.llm,
       ...candidate.llm
@@ -1389,21 +1469,79 @@ function normalizeImageScenePresetNode(candidate: unknown, index: number, path: 
     ? preset.tags.map((tag) => String(tag).trim()).filter(Boolean)
     : [];
   const note = typeof preset.note === "string" ? preset.note.trim() : "";
-  const children = normalizeImageScenePresetNodes(preset.children, `${path}_${index + 1}`);
-  if (!keyword && tags.length === 0 && !note && children.length === 0) {
+  const nodePath = `${path}_${index + 1}`;
+  const exampleFiles = normalizeScenePresetExampleFiles(
+    preset.exampleFiles,
+    (preset as { examplePrompts?: unknown }).examplePrompts,
+    nodePath
+  );
+  const children = normalizeImageScenePresetNodes(preset.children, nodePath);
+  if (!keyword && tags.length === 0 && !note && exampleFiles.length === 0 && children.length === 0) {
     return undefined;
   }
 
   return {
-    id: typeof preset.id === "string" && preset.id.trim() ? preset.id : `${path}_${index + 1}`,
+    id: typeof preset.id === "string" && preset.id.trim() ? preset.id : nodePath,
     keyword: keyword || `scene-${index + 1}`,
     tags,
     note,
+    exampleFiles,
     enabled: preset.enabled !== false,
     priority: Number.isFinite(preset.priority) ? Math.min(120, Math.max(0, Number(preset.priority))) : 70,
     updatedAt: preset.updatedAt ?? now,
     children
   };
+}
+
+function normalizeScenePresetPromptLines(value: unknown): string[] {
+  const lines = Array.isArray(value)
+    ? value.flatMap((entry) => String(entry).split(/\r?\n/u))
+    : typeof value === "string"
+      ? value.split(/\r?\n/u)
+      : [];
+  const seen = new Set<string>();
+  return lines
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (!line || seen.has(line.toLowerCase())) {
+        return false;
+      }
+      seen.add(line.toLowerCase());
+      return true;
+    })
+    .slice(0, 200);
+}
+
+function normalizeScenePresetExampleFiles(value: unknown, legacy: unknown, path: string): ImageScenePresetExampleFile[] {
+  // Legacy migration: a flat string[]/string of example prompts becomes a single unlabeled file.
+  if ((value === undefined || value === null) && legacy !== undefined && legacy !== null) {
+    const prompts = normalizeScenePresetPromptLines(legacy);
+    return prompts.length > 0 ? [{ id: `${path}_file_1`, label: "", prompts }] : [];
+  }
+
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry, index): ImageScenePresetExampleFile | undefined => {
+      if (!entry || typeof entry !== "object") {
+        return undefined;
+      }
+      const file = entry as Partial<ImageScenePresetExampleFile>;
+      const prompts = normalizeScenePresetPromptLines(file.prompts);
+      const label = typeof file.label === "string" ? file.label.trim() : "";
+      if (prompts.length === 0 && !label) {
+        return undefined;
+      }
+      return {
+        id: typeof file.id === "string" && file.id.trim() ? file.id : `${path}_file_${index + 1}`,
+        label,
+        prompts
+      };
+    })
+    .filter((file): file is ImageScenePresetExampleFile => Boolean(file))
+    .slice(0, 12);
 }
 
 function normalizeImageJobs(jobs: AppState["imageJobs"] | undefined): AppState["imageJobs"] {
@@ -1645,7 +1783,14 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
             updatedAt: createdAt
           },
         ];
-  const moduleIdMap = new Map(sourceModules.map((module, index) => [module.id, index === 0 ? "module_main" : `module_${Date.now().toString(36)}_${index}`]));
+  // Per-simulation unique module ids. Previously the main module was always the constant "module_main", so two
+  // simulations (e.g. a copy and its source) shared the same bare id. Any id-based attribution that does not also
+  // compare simulationId (e.g. NeuralMap's bare `nodeId === module.id` checks) could then cross-link them. Deriving
+  // the ids from the already-unique simulationId keeps each simulation's modules fully separated.
+  const moduleIdSuffix = simulationId.replace(/^sim_/u, "") || Date.now().toString(36);
+  const moduleIdMap = new Map(sourceModules.map((module, index) => [module.id, index === 0 ? `module_main_${moduleIdSuffix}` : `module_${moduleIdSuffix}_${index}`]));
+  const mainModuleId = moduleIdMap.get(sourceModules[0]?.id ?? "") ?? `module_main_${moduleIdSuffix}`;
+  const characterModuleId = sourceModules[1] ? moduleIdMap.get(sourceModules[1].id) : undefined;
   const modules: PromptModule[] = sourceModules.map((module) => ({
     ...module,
     id: moduleIdMap.get(module.id) ?? module.id,
@@ -1667,7 +1812,7 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
     const mappedCharacterId = characterIdMap.get(character.id) ?? mainCharacterId;
     return [
       {
-        id: `visual_${index}_default`,
+        id: `visual_${moduleIdSuffix}_${index}`,
         simulationId,
         characterId: mappedCharacterId,
         displayName: character.name || "Character",
@@ -1684,7 +1829,7 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
   const imageProfile: ImageGenerationProfile = {
     ...seedState.imageProfile,
     ...draft.imageProfile,
-    id: "img_profile_default",
+    id: `img_profile_${moduleIdSuffix}`,
     simulationId,
     safetyLevel: draft.contentRating === "adult_19" ? "explicit" : draft.imageProfile.safetyLevel
   };
@@ -1729,7 +1874,7 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
         role: "assistant",
         content: openingContent,
         createdAt,
-        referencedNodeIds: ["module_main", "module_character"],
+        referencedNodeIds: [mainModuleId, ...(characterModuleId ? [characterModuleId] : [])],
         imageAssetIds: []
       }
     ],
@@ -1749,7 +1894,7 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
     relationshipMap: draft.relationshipMap ?? defaultRelationshipMapSettings,
     llm: toShareableLlmSettings(draft.llm),
     novelAi: toShareableNovelAiSettings(draft.novelAi),
-    selectedModuleId: "module_main",
+    selectedModuleId: mainModuleId,
     selectedContextPackId: undefined
   });
 }

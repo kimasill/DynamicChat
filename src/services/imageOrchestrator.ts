@@ -14,7 +14,13 @@ import {
   createImageUserRulesForContentRating,
   isAdultContentMode
 } from "./contentRating";
-
+import {
+  canonicalizeStateType,
+  classifyImageStateTags,
+  readStateMemoryOwnerId,
+  readStateMemoryStateType,
+  readStateMemoryValue
+} from "./stateMemory";
 interface ImagePolicyResult {
   allowed: boolean;
   warnings: string[];
@@ -624,7 +630,10 @@ export function findReusableImageAsset(
       asset.simulationId === state.simulation.id &&
       asset.source === "generated" &&
       !excludedIds.has(asset.id) &&
-      asset.feedback?.rating !== "rejected"
+      asset.feedback?.rating !== "rejected" &&
+      // Only reuse an asset whose rendered size matches the currently configured resolution; otherwise reusing an older
+      // asset would silently ignore a changed width/height (e.g. serving a square 1024² image after switching to 832×1216).
+      assetMatchesConfiguredResolution(asset, state)
     )
     .map((asset) => scoreReusableImageAsset(asset, cue, targetTags))
     .filter((match): match is ImageReuseMatch => match !== undefined && match.score >= threshold)
@@ -640,6 +649,52 @@ export function findReusableImageAsset(
     });
 
   return candidates[0];
+}
+
+function assetMatchesConfiguredResolution(asset: ImageAsset, state: AppState): boolean {
+  const targetWidth = Math.round(Number(state.imageProfile.width));
+  const targetHeight = Math.round(Number(state.imageProfile.height));
+  if (!Number.isFinite(targetWidth) || !Number.isFinite(targetHeight) || targetWidth <= 0 || targetHeight <= 0) {
+    return true;
+  }
+
+  const dimensions = readAssetDimensions(asset);
+  if (dimensions.width === undefined || dimensions.height === undefined) {
+    // Unknown asset size: allow reuse and let the semantic match decide. Real generated assets always carry their
+    // rendered size (so a genuine resolution change is still caught below); only legacy/dimensionless assets land
+    // here, and blocking them would silently defeat reuse for the common case.
+    return true;
+  }
+
+  return Math.round(dimensions.width) === targetWidth && Math.round(dimensions.height) === targetHeight;
+}
+
+function readAssetDimensions(asset: ImageAsset): { width?: number; height?: number } {
+  const metadata = asset.providerMetadata;
+  if (!metadata) {
+    return {};
+  }
+  return {
+    width: readProviderMetadataNumber(metadata, "width"),
+    height: readProviderMetadataNumber(metadata, "height")
+  };
+}
+
+function readProviderMetadataNumber(payload: Record<string, unknown>, key: string): number | undefined {
+  const direct = payload[key];
+  if (typeof direct === "number" && Number.isFinite(direct)) {
+    return direct;
+  }
+
+  const parameters = payload.parameters;
+  if (parameters && typeof parameters === "object" && !Array.isArray(parameters)) {
+    const nested = (parameters as Record<string, unknown>)[key];
+    if (typeof nested === "number" && Number.isFinite(nested)) {
+      return nested;
+    }
+  }
+
+  return undefined;
 }
 
 function shouldBypassImageReuse(state: AppState, job: ImageGenerationJob): boolean {
@@ -1198,22 +1253,201 @@ function createCueCharacterPrompts(state: AppState, cue: ImageCue): ImageCueChar
     .map((prompt, index) => normalizeCueCharacterPrompt(prompt, index))
     .filter((prompt): prompt is ImageCueCharacterPrompt => Boolean(prompt));
   const legacyCharacterTags = uniqueStrings(cue.tags.flatMap((tag) => promptToTags(tag)).filter(isCharacterPromptTag));
+
   if (explicitPrompts.length > 0) {
-    return explicitPrompts.map((prompt, index) => ({
-      ...prompt,
-      prompt: uniqueStrings([...promptToTags(prompt.prompt), ...(index === 0 ? legacyCharacterTags : [])]).join(", ")
-    }));
+    // The LLM authors each character's action/expression/pose and identifies the character by id; DynamicChat
+    // injects that registered character's stored appearance + current outfit so the saved identity is always present.
+    // Identity (hair/eyes/face/body) is ALWAYS injected so a visible character stays the right character. Only the
+    // stored OUTFIT is conditionally skipped, and only when this character's own tags assert explicit full nudity.
+    const composed = explicitPrompts.map((prompt, index) =>
+      composeCharacterPrompt(state, prompt, index === 0 ? legacyCharacterTags : [])
+    );
+    const coveredIds = new Set(composed.map((prompt) => prompt.characterId).filter((id): id is string => Boolean(id)));
+    const missingRegistered = cue.characters.filter(
+      (characterId) => !coveredIds.has(characterId) && hasRegisteredVisualProfile(state, characterId)
+    );
+    const supplemental = missingRegistered.map((characterId) =>
+      composeCharacterPrompt(state, { characterId, prompt: "" }, [])
+    );
+    const all = [...composed, ...supplemental].filter((prompt) => prompt.prompt.trim());
+    return rebalanceCharacterCenters(all);
   }
 
   if (legacyCharacterTags.length === 0) {
     return [];
   }
 
+  // Legacy fallback (no LLM-authored character_prompts): keep the flat tags only, with no local profile injection.
   const characterIds = cue.characters.length > 0 ? cue.characters : [undefined];
   return characterIds.map((characterId, index) => ({
     characterId,
     prompt: legacyCharacterTags.join(", "),
     center: createDefaultCharacterCenter(index, characterIds.length)
+  }));
+}
+
+// Anti-runaway backstop only. The LLM is the tag author and the prompt instructions own focus/background
+// tiering; this cap exists solely so a single pathological caption cannot balloon to the point that NovelAI
+// drops or smears the subject. It is set well above any healthy caption (a detailed focus subject runs
+// ~25-35 authored tags before local outfit/identity injection), trims from the TAIL (the contract orders the
+// defining action/pose/expression tags first, so overflow is the least important), and never merges or drops
+// a character. Injected outfit/identity tags are added after this and are never trimmed.
+const MAX_AUTHORED_CHARACTER_PROMPT_TAGS = 45;
+
+function composeCharacterPrompt(
+  state: AppState,
+  prompt: ImageCueCharacterPrompt,
+  extraLeadingTags: string[]
+): ImageCueCharacterPrompt {
+  const llmTags = promptToTags(prompt.prompt).slice(0, MAX_AUTHORED_CHARACTER_PROMPT_TAGS);
+  // Only the saved IDENTITY (hair/eyes/face/body) is locally injected so the visible character stays the
+  // right person. Outfit/exposure tags are authored by the LLM based on composition and current action —
+  // the stored default outfit and outfit_keyword_mappings are surfaced to the LLM as reference only, never
+  // re-injected here, because forced injection conflicted with action-specific framing (e.g. the saved
+  // garment leaking into a fully nude close-up, or a default uniform overriding a state-changed outfit).
+  const { identity } = resolveRegisteredCharacterTags(state, prompt.characterId);
+
+  // Cross-gender subject identity guard: the image-cue LLM sometimes mis-attaches a registered
+  // character's id to an UNREGISTERED figure of the opposite gender — most commonly a male NPC
+  // (enemy, aggressor, bystander) described with male-subject tags while the attached character_id
+  // belongs to a registered female/futanari character. When that happens, injecting the saved
+  // female identity (1girl, hair colour, futanari, etc.) and outfit onto the male NPC's caption
+  // produces a garbled cross-gender image. Guard: if llmTags carry a clear male-subject assertion
+  // AND the registered identity carries a clear female-subject assertion (or vice versa), the LLM
+  // effectively described a different, unregistered person — skip identity, outfit, and continuity
+  // injection entirely so llmTags alone reach NovelAI and the unregistered figure renders correctly.
+  // The guard fires only when BOTH sides carry an explicit gendered signal; neutral or ambiguous
+  // captions (no gender signal on either side) fall through to the normal injection path.
+  if (
+    (hasMaleSubjectAssertion(llmTags) && hasFemaleSubjectAssertion(identity)) ||
+    (hasFemaleSubjectAssertion(llmTags) && hasMaleSubjectAssertion(identity))
+  ) {
+    const composedTags = uniqueStrings([...llmTags, ...extraLeadingTags]);
+    return { ...prompt, prompt: composedTags.join(", ") };
+  }
+
+  // Position + physical-detail continuity: fill the persisted ongoing posture (pose/action/interaction) and physical
+  // details (injury, blood, bodily fluids, sweat/wetness, held prop) that this cut omitted, so the figure keeps
+  // performing the scene's action and keeps its established body/clothing-damage state instead of silently resetting.
+  // Any explicit posture or per-detail tag the LLM wrote always wins (see resolvePersistedCharacterContinuityTags).
+  const continuityTags = prompt.characterId
+    ? resolvePersistedCharacterContinuityTags(state, prompt.characterId, llmTags)
+    : [];
+  // Outfit continuity: inject the character's CURRENT outfit (latest Wearing state, falling back to the saved
+  // default outfit) so clothing stays the same across turns instead of drifting whenever the LLM re-describes it.
+  // Skipped only when this cut is explicitly fully nude. Wins of state-changed outfits are preserved because the
+  // current Wearing memory — not the static default — is the source. uniqueStrings dedups any overlap with llmTags.
+  const outfit =
+    prompt.characterId && !assertsFullNudity(llmTags)
+      ? resolveCurrentCharacterOutfit(state, prompt.characterId)
+      : [];
+  const composedTags = uniqueStrings([...llmTags, ...continuityTags, ...extraLeadingTags, ...outfit, ...identity]);
+  return {
+    ...prompt,
+    prompt: composedTags.join(", ")
+  };
+}
+
+function resolveCurrentCharacterOutfit(state: AppState, characterId: string): string[] {
+  // Latest in-scene Wearing state wins; fall back to the registered default outfit so a registered character
+  // is never rendered in a random or missing outfit.
+  for (let index = state.memoryEvents.length - 1; index >= 0; index -= 1) {
+    const event = state.memoryEvents[index];
+    if (readStateMemoryOwnerId(event) !== characterId) {
+      continue;
+    }
+    if (canonicalizeStateType(readStateMemoryStateType(event)) !== "Wearing") {
+      continue;
+    }
+    const value = readStateMemoryValue(event);
+    if (value) {
+      return promptToTags(value);
+    }
+    break;
+  }
+  const profile = state.visualProfiles.find((candidate) => candidate.characterId === characterId);
+  return profile?.defaultOutfitPrompt ? promptToTags(profile.defaultOutfitPrompt) : [];
+}
+
+function assertsFullNudity(tags: string[]): boolean {
+  return tags.some((tag) =>
+    /\b(?:completely nude|fully nude|stark naked|totally naked|naked|nude|nakedness|bare body|no clothes|undressed|nothing)\b/iu.test(
+      stripNovelAiTagWeight(tag)
+    )
+  );
+}
+
+/**
+ * Extracts individual lowercase text fragments from a single tag, stripping NAI weight syntax
+ * and splitting composite weighted bodies so that checks can operate on bare terms.
+ * Examples:
+ *   "male soldier"      → ["male soldier"]
+ *   "1.5::futanari::"   → ["futanari"]
+ *   "3::slender, skinny::" → ["slender", "skinny"]
+ */
+function extractInnerTagTexts(tag: string): string[] {
+  const inner = stripNovelAiTagWeight(tag); // already lowercased by stripNovelAiTagWeight
+  return inner
+    .split(/[,;]\s*/u)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Returns true when the given tags carry a clear male-subject assertion.
+ * Uses word-boundary matching so "female" is never mis-detected as a male signal.
+ * Handles both plain tags ("male soldier") and NAI-weighted tags ("1.5::1boy::").
+ */
+function hasMaleSubjectAssertion(tags: string[]): boolean {
+  return tags.some((tag) =>
+    extractInnerTagTexts(tag).some((text) =>
+      /\b(?:male|1boy|2boys|3boys|4boys|boys?|man|men|male\s+focus|male\s+reader|bishounen|guy)\b/iu.test(text)
+    )
+  );
+}
+
+/**
+ * Returns true when the given tags carry a clear female-subject assertion, including futanari
+ * (treated as female body per the image-pipeline identity rules).
+ * Handles both plain tags and NAI-weighted tags.
+ */
+function hasFemaleSubjectAssertion(tags: string[]): boolean {
+  return tags.some((tag) =>
+    extractInnerTagTexts(tag).some((text) =>
+      /\b(?:1girl|2girls|3girls|4girls|girls?|woman|women|female|futanari|futa)\b/iu.test(text)
+    )
+  );
+}
+
+function resolveRegisteredCharacterTags(
+  state: AppState,
+  characterId?: string
+): { identity: string[] } {
+  if (!characterId) {
+    return { identity: [] };
+  }
+
+  const profile = state.visualProfiles.find((candidate) => candidate.characterId === characterId);
+  if (!profile) {
+    return { identity: [] };
+  }
+
+  return { identity: promptToTags(profile.positivePrompt) };
+}
+
+function hasRegisteredVisualProfile(state: AppState, characterId: string): boolean {
+  const profile = state.visualProfiles.find((candidate) => candidate.characterId === characterId);
+  return Boolean(profile && (profile.positivePrompt.trim() || profile.defaultOutfitPrompt.trim()));
+}
+
+function rebalanceCharacterCenters(prompts: ImageCueCharacterPrompt[]): ImageCueCharacterPrompt[] {
+  if (prompts.length <= 1) {
+    return prompts;
+  }
+
+  return prompts.map((prompt, index) => ({
+    ...prompt,
+    center: prompt.center ?? createDefaultCharacterCenter(index, prompts.length)
   }));
 }
 
@@ -1239,11 +1473,90 @@ function createDefaultCharacterCenter(index: number, total: number): { x: number
 }
 
 function createContextTags(state: AppState, cue: ImageCue, hasCharacterPrompts = false): string[] {
-  void state;
   const baseSource = cue.baseTags && cue.baseTags.length > 0 ? cue.baseTags : cue.tags;
-  return uniqueStrings(baseSource.flatMap((tag) => promptToTags(tag)))
+  const contextTags = uniqueStrings(baseSource.flatMap((tag) => promptToTags(tag)))
     .filter((tag) => !shouldRouteToNegativePrompt(tag))
     .filter((tag) => !hasCharacterPrompts || !isCharacterPromptTag(tag));
+
+  // Scene continuity: only when this cut establishes NO scene/place itself, fall back to the last persisted
+  // scene/location/environment so the established setting carries instead of silently resetting. An explicit
+  // scene in the cut always wins, so a real scene change is never blocked.
+  const groups = classifyImageStateTags(contextTags);
+  const cutEstablishesScene = Boolean(groups.SceneTags?.length || groups.EnvironmentTags?.length || groups.Location?.length);
+  if (cutEstablishesScene) {
+    return contextTags;
+  }
+
+  const persistedScene = resolvePersistedSceneTags(state);
+  return persistedScene.length > 0 ? uniqueStrings([...contextTags, ...persistedScene]) : contextTags;
+}
+
+// Last persisted scene-owned scene/location/environment tags, newest first per type. Used only as a fallback when a
+// cut does not establish its own scene, so an ongoing setting persists across cuts/turns.
+function resolvePersistedSceneTags(state: AppState): string[] {
+  const wanted = new Set(["SceneTags", "EnvironmentTags", "Location"]);
+  const found = new Map<string, string[]>();
+  for (let index = state.memoryEvents.length - 1; index >= 0 && found.size < wanted.size; index -= 1) {
+    const event = state.memoryEvents[index];
+    if (readStateMemoryOwnerId(event)) {
+      continue;
+    }
+    const stateType = canonicalizeStateType(readStateMemoryStateType(event));
+    if (!stateType || !wanted.has(stateType) || found.has(stateType)) {
+      continue;
+    }
+    const value = readStateMemoryValue(event);
+    if (value) {
+      found.set(stateType, promptToTags(value));
+    }
+  }
+  return uniqueStrings([...found.values()].flat());
+}
+
+// Posture state types describe a single, mutually-exclusive body position. If THIS cut authored any posture tag
+// (pose / action / interaction) the figure's position is being set explicitly, so none of the persisted posture is
+// re-injected and a real position change is never overridden.
+const POSTURE_CONTINUITY_STATE_TYPES = ["InteractionTags", "ActionTags", "PoseTags"] as const;
+// Detail state types are additive, independent ongoing physical facts — an injury, blood, bodily fluids, sweat/wetness,
+// or a held prop. Each persists on its own across cuts/turns until the scene changes it, so each is carried per-type and
+// only when this cut authored no tag of that same type (an explicit change to one detail never drops the others).
+const DETAIL_CONTINUITY_STATE_TYPES = ["PhysicalStateTags", "BodyStateTags", "HeldItemTags"] as const;
+
+// Persisted ongoing posture + physical-detail tags for one character, used to fill a cut that omits them so the figure
+// keeps the scene's established position and visible body/clothing-damage details (the "floating body part on a neutral
+// standing figure", or "the bleeding lip vanished in the close-up" cases). Explicit cut tags always win: posture is
+// skipped entirely when the cut authored any posture; each detail type is skipped when the cut authored that type.
+function resolvePersistedCharacterContinuityTags(state: AppState, characterId: string, cutTags: string[]): string[] {
+  const cutGroups = classifyImageStateTags(cutTags);
+  const cutHasPosture = POSTURE_CONTINUITY_STATE_TYPES.some((stateType) => (cutGroups[stateType]?.length ?? 0) > 0);
+  const wanted = new Set<string>([
+    ...(cutHasPosture ? [] : POSTURE_CONTINUITY_STATE_TYPES),
+    ...DETAIL_CONTINUITY_STATE_TYPES.filter((stateType) => (cutGroups[stateType]?.length ?? 0) === 0)
+  ]);
+  if (wanted.size === 0) {
+    return [];
+  }
+  return resolvePersistedCharacterStateTags(state, characterId, wanted);
+}
+
+// Last persisted value of each wanted state type for one character, newest first per type.
+function resolvePersistedCharacterStateTags(state: AppState, characterId: string, wanted: Set<string>): string[] {
+  const found = new Map<string, string[]>();
+  for (let index = state.memoryEvents.length - 1; index >= 0 && found.size < wanted.size; index -= 1) {
+    const event = state.memoryEvents[index];
+    if (readStateMemoryOwnerId(event) !== characterId) {
+      continue;
+    }
+    const stateType = canonicalizeStateType(readStateMemoryStateType(event));
+    if (!stateType || !wanted.has(stateType) || found.has(stateType)) {
+      continue;
+    }
+    const value = readStateMemoryValue(event);
+    if (value) {
+      found.set(stateType, promptToTags(value));
+    }
+  }
+  return uniqueStrings([...found.values()].flat());
 }
 
 function isCharacterPromptTag(tag: string): boolean {
@@ -1707,9 +2020,16 @@ function createGeneratedAsset(
 }
 
 function createGeneratedAssetTitle(cue: ImageCue, index: number): string {
-  const scene = cue.scene && !/^(?:current|generated|simulation|safe) scene/iu.test(cue.scene)
-    ? cue.scene.replace(/\s+/gu, " ").trim()
-    : "Generated image";
+  const normalized = (cue.scene ?? "").replace(/\s+/gu, " ").trim();
+  // Treat DynamicChat's internal placeholder scene labels as "no real scene name" so they never leak into a
+  // visible caption. The old regex only caught "current scene" and missed "current simulation scene" (the
+  // actual default), so titles surfaced as "current simulation scene #1" in the chat.
+  const isPlaceholder =
+    !normalized ||
+    /^(?:(?:current|generated|safe)(?:\s+simulation)?\s+scene|simulation\s+scene|generated\s+image|scene)$/iu.test(
+      normalized
+    );
+  const scene = isPlaceholder ? "Generated image" : normalized;
   return `${scene} #${index + 1}`;
 }
 

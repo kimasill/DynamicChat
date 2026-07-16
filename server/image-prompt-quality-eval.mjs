@@ -35,11 +35,14 @@ try {
   await evaluateStructuredCueDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn);
   await evaluatePersonaCharacterImageCueScoping(seedState, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateLlmImageStateTagCarryover(seedState, planImageJob, planImageJobForCompletedTurn, generateNovelAiImages);
+  await evaluateImageDetailStateContinuity(seedState, planImageJobForCompletedTurn);
   await evaluateLlmNaiTagPreservation(seedState, planImageJob, generateNovelAiImages);
   evaluateNameAndBodyInventoryCleanup(seedState, planImageJob);
   await evaluateActorTargetCharacterDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn);
   await evaluateFallbackImageCueSuppression(seedState, runSimulationTurn);
   await evaluateNovelAiV4Payload(seedState, planImageJob, generateNovelAiImages);
+  await evaluateRegisteredCharacterPromptInjection(seedState, planImageJob, generateNovelAiImages);
+  await evaluateNovelAiVibeTransferPayload(seedState, planImageJob, generateNovelAiImages);
 } finally {
   await vite.close();
 }
@@ -88,6 +91,9 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
       qualityPrompt: "masterpiece, best quality, highly detailed skin"
     }
   });
+  // Real generated assets carry their rendered size; reuse is gated on the asset size matching the configured
+  // resolution (assetMatchesConfiguredResolution), so stamp the seed resolution onto every reuse fixture.
+  const reuseDims = { width: state.imageProfile.width, height: state.imageProfile.height };
   const cue = createCue(state, {
     scene: "archive library",
     tags: ["archive library", "bookshelf", "silver hair", "brass key"],
@@ -108,6 +114,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
       createdAt: new Date().toISOString(),
       palette: ["#213547", "#d5e1e8", "#f2b84b"],
       dataUrl: "data:image/png;base64,AA==",
+      providerMetadata: { ...reuseDims },
       representative: true
     },
     {
@@ -123,7 +130,8 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
       reuseTags: ["stage", "stage lights", "dancing"],
       createdAt: new Date(Date.now() + 1).toISOString(),
       palette: ["#213547", "#d5e1e8", "#f2b84b"],
-      dataUrl: "data:image/png;base64,AA=="
+      dataUrl: "data:image/png;base64,AA==",
+      providerMetadata: { ...reuseDims }
     }
   ];
   const reuseState = { ...state, imageAssets };
@@ -179,6 +187,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
     tags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
     reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
     providerMetadata: {
+      ...reuseDims,
       cue: {
         characters: actionCue.characters,
         scene: "archive library",
@@ -204,6 +213,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
           tags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
           reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
           providerMetadata: {
+            ...reuseDims,
             cue: {
               characters: countedActionCue.characters,
               scene: "archive library",
@@ -226,6 +236,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
           tags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "smile"],
           reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "smile"],
           providerMetadata: {
+            ...reuseDims,
             cue: {
               characters: countedActionCue.characters,
               scene: "archive library",
@@ -249,6 +260,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
           reuseTags: ["2girls", "archive library", "bookshelf", "silver hair", "standing", "holding key", "worried expression"],
           characterIds: countedActionCue.characters,
           providerMetadata: {
+            ...reuseDims,
             cue: {
               characters: countedActionCue.characters,
               scene: "archive library",
@@ -271,6 +283,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
           tags: ["1girl", "archive library", "bookshelf", "black hair", "standing", "holding key", "worried expression"],
           reuseTags: ["1girl", "archive library", "bookshelf", "black hair", "standing", "holding key", "worried expression"],
           providerMetadata: {
+            ...reuseDims,
             cue: {
               characters: countedActionCue.characters,
               scene: "archive library",
@@ -293,6 +306,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
           tags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "holding phone", "worried expression"],
           reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "standing", "holding key", "holding phone", "worried expression"],
           providerMetadata: {
+            ...reuseDims,
             cue: {
               characters: countedActionCue.characters,
               scene: "archive library",
@@ -313,6 +327,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
           ...actionReusableAsset,
           id: "asset_reuse_metadata_character_mismatch",
           providerMetadata: {
+            ...reuseDims,
             cue: {
               characters: ["char_not_in_cue"],
               scene: "archive library",
@@ -337,6 +352,7 @@ async function evaluateReusableImageMatching(seedState, planImageJob, findReusab
     tags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
     reuseTags: ["1girl", "archive library", "bookshelf", "silver hair", "sitting", "holding key", "worried expression"],
     providerMetadata: {
+      ...reuseDims,
       cue: {
         characters: countedActionCue.characters,
         scene: "archive library",
@@ -1561,6 +1577,65 @@ function evaluateWearingStateDetailPreservation(seedState, compileSimulationMemo
   const keywordValue = memoryDeltaToEvents(keywordState, keywordDelta)[0]?.metadata?.value ?? "";
   assertCheck("memory.wearing", /school uniform/iu.test(String(keywordValue)), "Wearing keyword labels expand to mapped outfit prompts.");
   assertCheck("memory.wearing", /dark grey pencil skirt/iu.test(String(keywordValue)) && /necktie/iu.test(String(keywordValue)), "Wearing keyword expansion keeps mapped detail tags.");
+
+  const removalState = createPlayableState(seedState, {
+    characters: [
+      {
+        id: "char_uniform",
+        simulationId: seedState.simulation.id,
+        name: "Mira",
+        role: "officer",
+        summary: "uniformed protagonist",
+        relationship: "player-facing cast",
+        currentMood: "tense"
+      }
+    ],
+    visualProfiles: [
+      {
+        id: "visual_uniform",
+        simulationId: seedState.simulation.id,
+        characterId: "char_uniform",
+        displayName: "Mira",
+        positivePrompt: "black hair, gray eyes, girl",
+        negativePrompt: "",
+        defaultOutfitPrompt: "police uniform, navy short dress, mini skirt, metal chastity cage",
+        outfitPrompts: {},
+        expressionPrompts: {},
+        referenceImageAssetIds: [],
+        defaultSafetyLevel: "safe"
+      }
+    ],
+    memoryEvents: [
+      createStateMemoryEvent(seedState, "char_uniform", "Wearing", "police uniform, navy short dress, mini skirt, metal chastity cage")
+    ]
+  });
+  const removalDelta = compileSimulationMemoryDelta({
+    state: removalState,
+    userText: "케이지를 벗긴다",
+    assistantText: "미라의 다리 사이에서 metal chastity cage를 벗겨 바닥에 내려놓는다.",
+    sourceTurnId: "turn_eval_wearing_removal",
+    sidecar: {
+      assistantText: "미라의 다리 사이에서 metal chastity cage를 벗겨 바닥에 내려놓는다.",
+      imageCue: createCue(removalState, { shouldGenerate: false, tags: [], characters: [] }),
+      imageCues: [],
+      memoryEvents: [
+        {
+          memoryKind: "state",
+          stateType: "Wearing",
+          stateValue: "police uniform, navy short dress, mini skirt",
+          content: "The metal chastity cage is removed from Mira.",
+          importance: 0.88,
+          confidence: 0.9,
+          tags: ["outfit"],
+          actorId: "char_uniform",
+          actorName: "Mira"
+        }
+      ]
+    }
+  });
+  const removalValue = memoryDeltaToEvents(removalState, removalDelta)[0]?.metadata?.value ?? "";
+  assertCheck("memory.wearing", !/chastity cage/iu.test(String(removalValue)), "Removed garment drops out of the Wearing state instead of being re-merged from the base.");
+  assertCheck("memory.wearing", /police uniform/iu.test(String(removalValue)) && /mini skirt/iu.test(String(removalValue)), "Removal keeps the remaining outfit the LLM still lists.");
 }
 
 async function evaluateActorTargetCharacterDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn) {
@@ -2206,6 +2281,128 @@ async function evaluateLlmImageStateTagCarryover(seedState, planImageJob, planIm
   assertCheck("context.image_state", !blankPlan.imageJob, "Parsed LLM cue with no tags and no image state is suppressed instead of generating a generic image.");
 }
 
+async function evaluateImageDetailStateContinuity(seedState, planImageJobForCompletedTurn) {
+  const characters = [
+    {
+      id: "char_detail",
+      simulationId: seedState.simulation.id,
+      name: "Mei",
+      role: "heroine",
+      summary: "lead",
+      relationship: "",
+      currentMood: "tense"
+    }
+  ];
+  const visualProfiles = [
+    {
+      id: "visual_detail",
+      simulationId: seedState.simulation.id,
+      characterId: "char_detail",
+      displayName: "Mei",
+      positivePrompt: "black hair, red eyes, girl",
+      negativePrompt: "low quality",
+      defaultOutfitPrompt: "white blouse, blue skirt",
+      outfitPrompts: {},
+      expressionPrompts: {},
+      referenceImageAssetIds: [],
+      defaultSafetyLevel: "safe"
+    }
+  ];
+  const baseOverrides = {
+    imageProfile: { ...seedState.imageProfile, triggerMode: "realtime_auto", cooldownTurns: 0 },
+    relationshipMap: { ...seedState.relationshipMap, enabled: true },
+    characters,
+    visualProfiles
+  };
+  const state = createPlayableState(seedState, {
+    ...baseOverrides,
+    memoryEvents: [
+      createStateMemoryEvent({ ...seedState, characters }, "char_detail", "InteractionTags", "straddling another"),
+      createStateMemoryEvent({ ...seedState, characters }, "char_detail", "PhysicalStateTags", "bloody lip, bruised cheek"),
+      createStateMemoryEvent({ ...seedState, characters }, "char_detail", "HeldItemTags", "holding notebook")
+    ]
+  });
+
+  const userMessage = createUserMessage(state, "그 순간을 클로즈업으로 보여줘");
+  const assistantMessage = createAssistantMessage(state, "메이가 입을 벌리며 얼굴을 붉힌다.");
+  const composedFor = (plan, jobIndex = 0) => {
+    const job = jobIndex === 0 ? plan.imageJob : plan.imageJobs[jobIndex];
+    return job?.providerPayload?.characterPrompts?.find((entry) => entry.characterId === "char_detail")?.prompt ?? "";
+  };
+  const planTurn = (cues, planState) =>
+    planImageJobForCompletedTurn(
+      { ...planState, messages: [...planState.messages, userMessage, assistantMessage] },
+      {
+        userMessage,
+        assistantMessage,
+        contextPack: createContextPack(planState),
+        promptModuleUsages: [],
+        sidecar: {
+          assistantText: assistantMessage.content,
+          memoryEvents: [],
+          imageCue: cues[0],
+          imageCues: cues
+        },
+        sidecarTrace: createParsedLlmSidecarTrace(planState, userMessage.id),
+        manualImage: false
+      }
+    );
+
+  const closeUpCue = {
+    shouldGenerate: true,
+    reason: "close-up beat",
+    characters: ["char_detail"],
+    tags: [],
+    baseTags: ["close-up", "indoors"],
+    characterPrompts: [{ characterId: "char_detail", prompt: "blush, open mouth, face focus" }],
+    scene: "current simulation scene",
+    visualContext: ""
+  };
+  const plan = await planTurn([closeUpCue], state);
+  const composed = composedFor(plan);
+  assertCheck("context.detail_continuity", /bloody lip/iu.test(composed), "Persisted physical-detail tags carry into a close-up cut that omitted them.");
+  assertCheck("context.detail_continuity", /bruised cheek/iu.test(composed), "All persisted physical-detail tags carry, not just the first one.");
+  assertCheck("context.detail_continuity", /holding notebook/iu.test(composed), "Persisted held-item tags carry into a cut that omitted them.");
+  assertCheck("context.detail_continuity", /straddling/iu.test(composed), "Persisted interaction posture carries into a cut with no posture of its own.");
+
+  const changedCue = {
+    ...closeUpCue,
+    characterPrompts: [{ characterId: "char_detail", prompt: "blood on arm, gritting teeth, face focus" }]
+  };
+  const changedPlan = await planTurn([changedCue], state);
+  const changedComposed = composedFor(changedPlan);
+  assertCheck("context.detail_continuity", /blood on arm/iu.test(changedComposed), "Explicitly authored new physical detail is kept on the cut.");
+  assertCheck("context.detail_continuity", !/bloody lip/iu.test(changedComposed), "A cut that authors its own physical detail does not re-inject the stale persisted physical detail.");
+
+  const progressionState = createPlayableState(seedState, { ...baseOverrides, memoryEvents: [] });
+  const cutOne = {
+    shouldGenerate: true,
+    reason: "establishing cut",
+    characters: ["char_detail"],
+    tags: [],
+    baseTags: ["medium shot", "indoors"],
+    characterPrompts: [{ characterId: "char_detail", prompt: "torn blouse, blood on lip, straddling another" }],
+    scene: "current simulation scene",
+    visualContext: ""
+  };
+  const cutTwo = {
+    shouldGenerate: true,
+    reason: "close-up cut",
+    characters: ["char_detail"],
+    tags: [],
+    baseTags: ["close-up", "indoors"],
+    characterPrompts: [{ characterId: "char_detail", prompt: "open mouth, face focus" }],
+    scene: "current simulation scene",
+    visualContext: ""
+  };
+  const progressionPlan = await planTurn([cutOne, cutTwo], progressionState);
+  const secondComposed = composedFor(progressionPlan, 1);
+  assertCheck("context.detail_continuity", progressionPlan.imageJobs.length === 2, "Both cuts in one output are planned as separate jobs.");
+  assertCheck("context.detail_continuity", /blood on lip/iu.test(secondComposed), "A detail introduced in an earlier cut carries into a later cut in the same output.");
+  assertCheck("context.detail_continuity", /torn blouse/iu.test(secondComposed), "An outfit change in an earlier cut carries into a later cut in the same output.");
+  assertCheck("context.detail_continuity", /straddling/iu.test(secondComposed), "A posture established in an earlier cut carries into a later cut in the same output.");
+}
+
 async function evaluateFallbackImageCueSuppression(seedState, runSimulationTurn) {
   const visualState = createPlayableState(seedState, {
     imageProfile: {
@@ -2329,6 +2526,181 @@ async function evaluateNovelAiV4Payload(seedState, planImageJob, generateNovelAi
       !job.providerPayload.promptLayers.characters.some((tag) => /red academy blazer|navy academy blazer/iu.test(String(tag))),
     "Character outfit mappings are not locally recorded in prompt layers."
   );
+}
+
+async function evaluateNovelAiVibeTransferPayload(seedState, planImageJob, generateNovelAiImages) {
+  const encodedVibe = "ENCODEDVIBEDATA==";
+  const rawImage = "data:image/png;base64,QUJD"; // stripped -> "QUJD"
+
+  // --- v4/v4.5: encode된 vibe만 reference_image_multiple로 전송 ---
+  const v4State = createPlayableState(seedState, {
+    novelAi: {
+      ...seedState.novelAi,
+      enabled: false,
+      modelPreset: "NAID4.5F",
+      vibeTransferEnabled: true,
+      vibeTransferReferences: [
+        {
+          id: "vibe_ref_1",
+          name: "ref-1.png",
+          image: rawImage,
+          referenceStrength: 0.6,
+          informationExtracted: 1,
+          encodedVibe,
+          encodedModel: "NAID4.5F",
+          encodedInformationExtracted: 1
+        }
+      ]
+    }
+  });
+  const v4Cue = createCue(v4State, { tags: ["smile"], scene: "studio" });
+  const v4Job = planImageJob(v4State, "turn_vibe_v4", v4Cue, [], true);
+  const v4Payload = (await generateNovelAiImages({ state: v4State, prompt: v4Job.prompt, negativePrompt: v4Job.negativePrompt, cue: v4Cue, count: 1 })).payload;
+  const v4Params = v4Payload.parameters ?? {};
+
+  assertCheck(
+    "nai.vibe",
+    Array.isArray(v4Params.reference_image_multiple) && v4Params.reference_image_multiple[0] === encodedVibe,
+    "V4 vibe transfer sends the encoded vibe in parameters.reference_image_multiple."
+  );
+  assertCheck(
+    "nai.vibe",
+    Array.isArray(v4Params.reference_strength_multiple) && v4Params.reference_strength_multiple[0] === 0.6,
+    "V4 vibe transfer sends reference_strength_multiple parallel to the encoded vibe."
+  );
+  assertCheck(
+    "nai.vibe",
+    v4Params.reference_information_extracted_multiple === undefined,
+    "V4 vibe transfer omits reference_information_extracted_multiple (baked into the encode step)."
+  );
+
+  // --- v4: 아직 인코딩되지 않은 참조는 전송하지 않음 (raw 이미지로 NAI가 거부되는 것을 방지) ---
+  const v4Unencoded = createPlayableState(seedState, {
+    novelAi: {
+      ...seedState.novelAi,
+      enabled: false,
+      modelPreset: "NAID4.5F",
+      vibeTransferEnabled: true,
+      vibeTransferReferences: [
+        { id: "vibe_ref_2", name: "ref-2.png", image: rawImage, referenceStrength: 0.6, informationExtracted: 1 }
+      ]
+    }
+  });
+  const v4UnencodedCue = createCue(v4Unencoded, { tags: ["smile"] });
+  const v4UnencodedJob = planImageJob(v4Unencoded, "turn_vibe_v4_raw", v4UnencodedCue, [], true);
+  const v4UnencodedParams =
+    (await generateNovelAiImages({ state: v4Unencoded, prompt: v4UnencodedJob.prompt, negativePrompt: v4UnencodedJob.negativePrompt, cue: v4UnencodedCue, count: 1 })).payload.parameters ?? {};
+  assertCheck(
+    "nai.vibe",
+    v4UnencodedParams.reference_image_multiple === undefined,
+    "V4 vibe transfer does not send un-encoded references (encode required before generation)."
+  );
+
+  // --- v3: 원본 이미지 base64 + information extracted 직접 전송 ---
+  const v3State = createPlayableState(seedState, {
+    novelAi: {
+      ...seedState.novelAi,
+      enabled: false,
+      modelPreset: "NAID3",
+      vibeTransferEnabled: true,
+      vibeTransferReferences: [
+        { id: "vibe_ref_3", name: "ref-3.png", image: rawImage, referenceStrength: 0.5, informationExtracted: 0.8 }
+      ]
+    }
+  });
+  const v3Cue = createCue(v3State, { tags: ["smile"] });
+  const v3Job = planImageJob(v3State, "turn_vibe_v3", v3Cue, [], true);
+  const v3Params = (await generateNovelAiImages({ state: v3State, prompt: v3Job.prompt, negativePrompt: v3Job.negativePrompt, cue: v3Cue, count: 1 })).payload.parameters ?? {};
+  assertCheck(
+    "nai.vibe",
+    Array.isArray(v3Params.reference_image_multiple) && v3Params.reference_image_multiple[0] === "QUJD",
+    "V3 vibe transfer sends the raw image base64 (data URL prefix stripped) in reference_image_multiple."
+  );
+  assertCheck(
+    "nai.vibe",
+    Array.isArray(v3Params.reference_information_extracted_multiple) && v3Params.reference_information_extracted_multiple[0] === 0.8,
+    "V3 vibe transfer sends reference_information_extracted_multiple."
+  );
+
+  // --- vibe transfer 비활성 시 어떤 reference 파라미터도 추가하지 않음 ---
+  const offState = createPlayableState(seedState, {
+    novelAi: {
+      ...seedState.novelAi,
+      enabled: false,
+      modelPreset: "NAID4.5F",
+      vibeTransferEnabled: false,
+      vibeTransferReferences: [
+        { id: "vibe_ref_4", name: "ref-4.png", image: rawImage, referenceStrength: 0.6, informationExtracted: 1, encodedVibe }
+      ]
+    }
+  });
+  const offCue = createCue(offState, { tags: ["smile"] });
+  const offJob = planImageJob(offState, "turn_vibe_off", offCue, [], true);
+  const offParams = (await generateNovelAiImages({ state: offState, prompt: offJob.prompt, negativePrompt: offJob.negativePrompt, cue: offCue, count: 1 })).payload.parameters ?? {};
+  assertCheck(
+    "nai.vibe",
+    offParams.reference_image_multiple === undefined,
+    "Disabled vibe transfer adds no reference image parameters even when an encoded reference exists."
+  );
+}
+
+async function evaluateRegisteredCharacterPromptInjection(seedState, planImageJob, generateNovelAiImages) {
+  const state = createPlayableState(seedState, {
+    characters: [
+      {
+        id: "char_f",
+        simulationId: seedState.simulation.id,
+        name: "Mira",
+        role: "girl protagonist",
+        summary: "registered female lead",
+        relationship: "",
+        currentMood: "tense"
+      }
+    ],
+    visualProfiles: [
+      {
+        id: "visual_f",
+        simulationId: seedState.simulation.id,
+        characterId: "char_f",
+        displayName: "Mira",
+        positivePrompt: "pink rolled long hair, police style, futanari",
+        negativePrompt: "bad hands",
+        defaultOutfitPrompt: "navy crop top, peaked cap",
+        outfitPrompts: {},
+        expressionPrompts: {},
+        referenceImageAssetIds: [],
+        defaultSafetyLevel: "explicit"
+      }
+    ],
+    memoryEvents: [createStateMemoryEvent({ characters: [{ id: "char_f", name: "Mira" }], simulation: seedState.simulation }, "char_f", "Wearing", "torn police uniform, navy short dress")]
+  });
+  const cue = createCue(state, {
+    characters: ["char_f"],
+    tags: ["bedroom", "indoors"],
+    scene: "bedroom",
+    visualContext: "bedroom, indoors",
+    characterPrompts: [
+      { characterId: "char_f", prompt: "missionary position, tears, wide eyed" },
+      { prompt: "muscular man, brute, smashing" }
+    ]
+  });
+  const job = planImageJob(state, "turn_inject", cue, [], true);
+  const composed = Array.isArray(job.providerPayload.characterPrompts) ? job.providerPayload.characterPrompts : [];
+  const female = composed[0]?.prompt ?? "";
+  const male = composed[1]?.prompt ?? "";
+
+  assertCheck("context.inject", composed.length === 2, "Each visible character (registered + unregistered) gets its own separate character prompt entry.");
+  assertCheck("context.inject", /missionary position/iu.test(female) && /pink rolled long hair/iu.test(female), "Registered character caption injects the saved base appearance alongside the LLM action.");
+  assertCheck("context.inject", female.indexOf("missionary position") < female.indexOf("pink rolled long hair"), "LLM action/expression tags are ordered before the injected saved appearance.");
+  assertCheck("context.inject", /torn police uniform/iu.test(female) && !/navy crop top/iu.test(female), "Current stored Wearing outfit is injected and overrides the default outfit.");
+  assertCheck("context.inject", /muscular man/iu.test(male) && !/pink rolled long hair/iu.test(male), "Unregistered second character keeps its own caption and never borrows another character's appearance.");
+  assertCheck("context.inject", !/muscular man|pink rolled long hair/iu.test(job.prompt), "Per-character tags stay out of the base prompt.");
+
+  const payloadCue = { ...cue, characterPrompts: job.providerPayload.cue?.characterPrompts ?? composed };
+  const result = await generateNovelAiImages({ state, prompt: job.prompt, negativePrompt: job.negativePrompt, cue: payloadCue, count: 1 });
+  const charCaptions = result.payload.parameters?.v4_prompt?.caption?.char_captions ?? [];
+  assertCheck("context.inject", charCaptions.length === 2, "NovelAI V4 payload carries one char_caption per visible character including the injected registered character.");
+  assertCheck("context.inject", /pink rolled long hair/iu.test(charCaptions[0]?.char_caption ?? "") && /torn police uniform/iu.test(charCaptions[0]?.char_caption ?? ""), "NovelAI V4 char_caption includes the injected saved appearance and current outfit.");
 }
 
 function createPlayableState(seedState, overrides = {}) {

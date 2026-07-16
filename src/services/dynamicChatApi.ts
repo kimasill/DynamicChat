@@ -16,7 +16,7 @@ import { createScopeHeaders } from "./security";
 import { toShareableLlmSettings, toShareableNovelAiSettings } from "./runtimeApiSettings";
 
 const API_BASE_URL_STORAGE_KEY = "dynamicchat.apiBaseUrl";
-export const DEFAULT_DYNAMICCHAT_API_BASE_URL = "http://127.0.0.1:4318";
+export const DEFAULT_DYNAMICCHAT_API_BASE_URL = "http://127.0.0.1:8788";
 export const DEFAULT_NOVELAI_PROXY_URL = `${DEFAULT_DYNAMICCHAT_API_BASE_URL}/novelai/generate-image`;
 
 export const dynamicChatApiEndpoints = {
@@ -118,6 +118,14 @@ export function getNovelAiSubscriptionProxyUrl(): string {
 
 export function getNovelAiGenerateProxyUrl(): string {
   return `${readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL}/novelai/generate-image`;
+}
+
+export function getNovelAiEncodeVibeProxyUrl(): string {
+  return `${readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL}/novelai/encode-vibe`;
+}
+
+export function getLlmCliAgentProxyUrl(): string {
+  return `${readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL}/llm/cli-agent`;
 }
 
 export function createDynamicChatApiClient(baseUrl = readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL): DynamicChatApiClient {

@@ -23,6 +23,30 @@ export const IMAGE_STATE_TYPES = [
   "Emotion"
 ] as const;
 
+// Canonical state types used exclusively as NovelAI image-prompt machinery. These carry no narrative
+// value and must be filtered from the narrative LLM's context view — they induce annotation-mode prose.
+// Aliased spellings are caught automatically because callers canonicalise via canonicalizeStateType
+// before checking membership here.
+// NOT included (narratively load-bearing): Wearing, Location, PhysicalCondition, Emotion, Goal,
+// and creator-defined relationship-map parameter titles.
+export const IMAGE_MACHINERY_STATE_TYPES = new Set<string>([
+  "StatusTags",
+  "ExpressionTags",
+  "PoseTags",
+  "ActionTags",
+  "InteractionTags",
+  "InteractionPhaseTags",
+  "HeldItemTags",
+  "PhysicalStateTags",
+  "BodyStateTags",
+  "SceneTags",
+  "ScenePhaseTags",
+  "CompositionTags",
+  "CameraTags",
+  "LightingTags",
+  "EnvironmentTags"
+]);
+
 export type ImageStateType = (typeof IMAGE_STATE_TYPES)[number];
 
 type ImageStateTagGroups = Partial<Record<ImageStateType, string[]>>;
@@ -208,6 +232,9 @@ function classifyImageStateTag(tag: string): ImageStateType | undefined {
   if (isHeldItemStateTag(tag)) {
     return "HeldItemTags";
   }
+  if (isSexPositionStateTag(tag)) {
+    return "InteractionTags";
+  }
   if (isInteractionStateTag(tag)) {
     return "InteractionTags";
   }
@@ -301,11 +328,17 @@ function isPoseStateTag(tag: string): boolean {
 }
 
 function isActionStateTag(tag: string): boolean {
-  return /\b(?:walking|running|dancing|singing|training|practicing|reading|writing|eating|drinking|cooking|fighting|searching|opening door|entering|leaving|getting up|falling|jumping|waving)\b/iu.test(tag);
+  return /\b(?:walking|running|dancing|singing|training|practicing|reading|writing|eating|drinking|cooking|fighting|searching|opening door|entering|leaving|getting up|falling|jumping|waving|struggling|crawling|collapsing|stumbling|thrusting|grinding|kneeling over|bending over)\b/iu.test(tag);
 }
 
 function isInteractionStateTag(tag: string): boolean {
-  return /\b(?:hugging|holding hands|hand on|hands on|touching|grabbing|pulling|pushing|facing each other|talking|arguing|whispering|comforting|protecting|helping)\b/iu.test(tag);
+  return /\b(?:hugging|holding hands|hand on|hands on|touching|grabbing|pulling|pushing|facing each other|talking|arguing|whispering|comforting|protecting|helping|strangling|choking|chokehold|hand on another's neck|hands on another's neck|pinning|pinned|pinned down|restraining|straddling|wrestling|grappling|gripping|kissing|biting|licking|carrying|lifting)\b/iu.test(tag);
+}
+
+// Sexual position / coital posture tags. These describe an ongoing position that must stay stable across cuts and
+// turns until the scene changes it, so they are persisted as InteractionTags (the continuity-carried state group).
+function isSexPositionStateTag(tag: string): boolean {
+  return /\b(?:sex|vaginal|anal|oral|fellatio|cunnilingus|penetration|insertion|cowgirl position|reverse cowgirl|girl on top|missionary|doggystyle|doggy style|sex from behind|prone bone|mating press|spooning|spoons sex|standing sex|suspended congress|piledriver|full nelson|leg lock|leglock|face sitting|facesitting|lap sitting|lap pillow|all fours|on all fours|bent over|on back|on stomach|legs up|legs held open|spread legs|grinding|riding|cowgirl|deepthroat|paizuri|grabbing another's|hetero|doggy)\b/iu.test(tag);
 }
 
 function isHeldItemStateTag(tag: string): boolean {

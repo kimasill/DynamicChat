@@ -1,4 +1,4 @@
-import type { AppState, ChatMessage, SimulationProgressRun } from "../types";
+import type { AppState, ChatMessage, ImageGenerationJob, SimulationProgressRun } from "../types";
 
 type ProgressRunRuntime = Pick<
   AppState,
@@ -203,4 +203,31 @@ function compareProgressRunsByUpdatedAt(a: SimulationProgressRun, b: SimulationP
 
 function uniqueIds(values: Array<string | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value)))];
+}
+
+/**
+ * Returns a slimmed copy of a ProgressRun suitable for long-term storage.
+ *
+ * Removes heavy per-run data that accumulates rapidly (NAI provider metadata /
+ * request payloads) and clears debug-only trace arrays. Core content fields
+ * (messages, memoryEvents, handoffs, imageAssets with objectKey, imageJobs with
+ * assetIds, session IDs, timestamps) are preserved so the run remains usable
+ * for replay and continuity purposes.
+ */
+export function slimProgressRunForStorage(run: SimulationProgressRun): SimulationProgressRun {
+  return {
+    ...run,
+    // Debug / trace arrays — not needed in stored snapshots.
+    contextPacks: [],
+    continuityChecks: [],
+    sidecarTraces: [],
+    turnTraces: [],
+    promptModuleUsages: [],
+    // Strip NAI response metadata (~151 KB/asset). objectKey / mimeType / tags
+    // / palette etc. are preserved for image display and vibe reuse.
+    imageAssets: run.imageAssets.map(({ providerMetadata: _pm, ...rest }) => rest),
+    // Strip NAI request payload (~89 KB/job). assetIds / status / prompt etc.
+    // are preserved for asset linkage and display.
+    imageJobs: run.imageJobs.map((job): ImageGenerationJob => ({ ...job, providerPayload: {} }))
+  };
 }

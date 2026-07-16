@@ -22,7 +22,34 @@ export type ImageGenerationCadence = "sparse" | "balanced" | "rich" | "paragraph
 
 export type ImageJobStatus = "queued" | "planning" | "generating" | "completed" | "failed" | "canceled";
 
-export type LlmProvider = "mock" | "codex" | "gemini" | "claude" | "openai_compatible";
+export type LlmProvider =
+  | "mock"
+  | "codex"
+  | "gemini"
+  | "claude"
+  | "openai_compatible"
+  | "claude_cli"
+  | "codex_cli"
+  | "gemini_cli";
+
+export const CLI_AGENT_LLM_PROVIDERS: readonly LlmProvider[] = ["claude_cli", "codex_cli", "gemini_cli"];
+
+export function isCliAgentLlmProvider(provider: LlmProvider): boolean {
+  return CLI_AGENT_LLM_PROVIDERS.includes(provider);
+}
+
+export function cliAgentKindForProvider(provider: LlmProvider): "claude" | "codex" | "gemini" | undefined {
+  switch (provider) {
+    case "claude_cli":
+      return "claude";
+    case "codex_cli":
+      return "codex";
+    case "gemini_cli":
+      return "gemini";
+    default:
+      return undefined;
+  }
+}
 
 export type ApiRegistrationStatus = "idle" | "verifying" | "registered" | "failed";
 
@@ -175,11 +202,18 @@ export interface CharacterVisualProfile {
   defaultSafetyLevel: ImageSafetyLevel;
 }
 
+export interface ImageScenePresetExampleFile {
+  id: Id;
+  label: string;
+  prompts: string[];
+}
+
 export interface ImageSceneTagPresetNode {
   id: Id;
   keyword: string;
   tags: string[];
   note: string;
+  exampleFiles?: ImageScenePresetExampleFile[];
   enabled: boolean;
   priority: number;
   updatedAt: string;
@@ -537,6 +571,17 @@ export interface RelationshipMapSettings {
   updatedAt: string;
 }
 
+// A user-authored value for a relationship status card. The system keeps auto-computing the underlying status from
+// the profile/memory/parameters; when an override exists for the same node + status key, the override is shown instead
+// until the user resets it.
+export interface RelationshipStatusOverride {
+  nodeId: Id;
+  statusKey: string;
+  title: string;
+  value: string;
+  updatedAt: string;
+}
+
 export interface LlmApiSettings {
   enabled: boolean;
   provider: LlmProvider;
@@ -549,6 +594,23 @@ export interface LlmApiSettings {
   registrationStatus: ApiRegistrationStatus;
   verifiedAt?: string;
   verificationMessage?: string;
+}
+
+export interface NovelAiVibeTransferReference {
+  id: Id;
+  name: string;
+  /** 전체 data URL (data:image/...;base64,...). NovelAI 요청 시 prefix를 제거하고 전송한다. */
+  image: string;
+  /** Reference strength (0~1). 참조 이미지의 영향력. */
+  referenceStrength: number;
+  /** Information extracted (0~1). 참조 이미지에서 추출하는 정보량. */
+  informationExtracted: number;
+  /** v4/v4.5에서 encode-vibe로 사전 인코딩한 vibe 데이터 (base64). 인코딩 전에는 비어 있다. */
+  encodedVibe?: string;
+  /** encodedVibe를 만들 때 사용한 모델 프리셋. 현재 프리셋과 다르면 재인코딩이 필요하다. */
+  encodedModel?: NovelAiModelPreset;
+  /** encodedVibe를 만들 때 사용한 information extracted 값. */
+  encodedInformationExtracted?: number;
 }
 
 export interface NovelAiApiSettings {
@@ -577,6 +639,8 @@ export interface NovelAiApiSettings {
   verificationMessage?: string;
   subscriptionTier?: string;
   seed?: number;
+  vibeTransferEnabled: boolean;
+  vibeTransferReferences: NovelAiVibeTransferReference[];
 }
 
 export interface AppState {
@@ -605,7 +669,12 @@ export interface AppState {
   imageJobs: ImageGenerationJob[];
   neuralMap: NeuralMapSettings;
   relationshipMap: RelationshipMapSettings;
+  relationshipStatusOverrides: RelationshipStatusOverride[];
   llm: LlmApiSettings;
+  // Dedicated LLM for authoring image_cues / NovelAI tags, separated from the narrative LLM so the narrative model
+  // is never polluted by tag rules and can use a stronger model while image tags use a cheaper one. When
+  // `enabled` is false the image-cue call falls back to the main `llm` config.
+  imageTagLlm: LlmApiSettings;
   novelAi: NovelAiApiSettings;
   selectedModuleId?: Id;
   selectedContextPackId?: Id;
@@ -624,4 +693,7 @@ export interface TurnResult {
   imageJob?: ImageGenerationJob;
   imageJobs?: ImageGenerationJob[];
   imageAssets: ImageAsset[];
+  // Resolves with an expanded sidecar when image_cues are completed in the background
+  // (realtime image pipeline started generation with the initial cues for speed).
+  sidecarExpansion?: Promise<AssistantSidecar | undefined>;
 }

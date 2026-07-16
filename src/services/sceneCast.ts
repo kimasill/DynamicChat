@@ -16,6 +16,28 @@ interface InferSceneCastOptions {
 
 const DEFAULT_RECENT_MESSAGE_LIMIT = 6;
 
+// A scene has a handful of people in it; a character-select menu, cast list, or roster recap names most of
+// the roster at once. Those listings are reference data, so they must not put the whole roster on-stage —
+// that floods the turn prompt with every character's full profile and buries the actual scene.
+const ROSTER_LISTING_MIN_MENTIONS = 5;
+const ROSTER_LISTING_ROSTER_RATIO = 0.6;
+
+function messageLooksLikeRosterListing(state: SceneCastState, messageText: string): boolean {
+  const rosterSize = state.characters.length;
+  if (rosterSize < ROSTER_LISTING_MIN_MENTIONS) {
+    return false;
+  }
+
+  const mentioned = state.characters.filter((character) =>
+    characterIsReferencedInText(character, messageText)
+  ).length;
+
+  return (
+    mentioned >= ROSTER_LISTING_MIN_MENTIONS &&
+    mentioned >= Math.ceil(rosterSize * ROSTER_LISTING_ROSTER_RATIO)
+  );
+}
+
 export function inferCurrentSceneCharacterIds(
   state: SceneCastState,
   currentText = "",
@@ -23,10 +45,10 @@ export function inferCurrentSceneCharacterIds(
 ): Id[] {
   const recentMessageLimit = options.recentMessageLimit ?? DEFAULT_RECENT_MESSAGE_LIMIT;
   const recentMessages = state.messages.slice(-recentMessageLimit);
-  const text = [
-    sanitizeSceneCastEvidenceText(currentText),
-    ...recentMessages.map((message) => sanitizeSceneCastEvidenceText(message.content))
-  ].join("\n");
+  const sceneEvidenceTexts = recentMessages
+    .map((message) => sanitizeSceneCastEvidenceText(message.content))
+    .filter((messageText) => !messageLooksLikeRosterListing(state, messageText));
+  const text = [sanitizeSceneCastEvidenceText(currentText), ...sceneEvidenceTexts].join("\n");
   const currentTextMentionedIds = state.characters
     .filter((character) => characterIsReferencedInText(character, sanitizeSceneCastEvidenceText(currentText)))
     .map((character) => character.id);

@@ -4831,28 +4831,31 @@ function createOutputLengthInstruction(maxTokens: number, state?: AppState): str
     return `Output mode: image progression. Do not spend the budget on visible prose. assistant_text must be one compact Korean status line, while image_cues must carry exactly ${IMAGE_PROGRESSION_CUE_TARGET} ordered tag prompt groups.`;
   }
 
-  // The token setting is a CEILING and a rough target, NOT a quota to fill. Forcing length when the scene has
-  // run out of new content makes the model pad with repeated phrases/loops — so every tier caps the length but
-  // explicitly forbids padding/repetition and allows a clean early end when the beat is genuinely complete.
-  const noPadding =
-    " This is an UPPER bound and a rough target, not a quota to fill: write as much as the scene genuinely supports and end cleanly when the beat is complete. NEVER pad by repeating phrases or looping filler to reach the length. Padding means ECHOING wording — it does not mean atmosphere, sensory detail, or interiority: normal immersive prose in the creator's register is not padding.";
+  // The provider already truncates at the token budget, so this instruction does not need to enforce the
+  // ceiling — it only has to prevent the two ways length goes wrong: getting cut off mid-sentence on a small
+  // budget, and inflating a thin beat on a large one. A paragraph COUNT anchors the model into filling it,
+  // and the only material available to fill a finished beat with is atmosphere, interiority, and narrator
+  // asides — which reads as ornamental, roundabout prose rather than a scene. So a paragraph number appears
+  // only where truncation is a real risk, and always as a limit to stay under, never as a target to reach.
+  const discipline =
+    " The scene decides the length, not this number: write what the current beat genuinely supports and end cleanly when it is done — a short turn is correct when little happens. Do not reach for length with atmosphere, sensory description, interiority, or narrator asides, and never repeat or echo earlier wording to fill space.";
   if (maxTokens <= 1000) {
-    return "Output length target: compact — up to about 2-3 Korean paragraphs with concrete action, dialogue, and one clear consequence." + noPadding;
+    return "Output length: stay under roughly 3 Korean paragraphs so the turn is not cut off mid-sentence." + discipline;
   }
 
   if (maxTokens <= 1800) {
-    return "Output length target: balanced — up to about 4-6 Korean paragraphs with concrete action, dialogue, sensory detail, and visible consequences." + noPadding;
+    return "Output length: stay under roughly 6 Korean paragraphs so the turn is not cut off mid-sentence." + discipline;
   }
 
   if (maxTokens <= 3000) {
-    return "Output length target: long — up to about 7-10 Korean paragraphs developing the scene through multiple beats, dialogue, and state changes." + noPadding;
+    return "Output length: stay under roughly 10 Korean paragraphs." + discipline;
   }
 
   if (maxTokens <= 4500) {
-    return "Output length target: very long — up to about 10-14 Korean paragraphs with rich scene progression, character reaction, and state changes (plus a status/choice block when creator rules require it)." + noPadding;
+    return "Output length: stay under roughly 14 Korean paragraphs." + discipline;
   }
 
-  return "Output length target: extended — up to about 12-18 Korean paragraphs with substantial scene progression, dialogue, and consequences (plus any creator-required status/choice structure)." + noPadding;
+  return "Output length: no paragraph target — the budget is generous enough that length is never the constraint here." + discipline;
 }
 
 function truncatePromptText(value: string, maxChars: number, label: string): string {

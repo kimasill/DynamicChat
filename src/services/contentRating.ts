@@ -1,7 +1,14 @@
-import type { AppState } from "../types";
+import type { AppState, ImageSafetyLevel } from "../types";
 
 export function isAdultContentMode(state: AppState): boolean {
   return state.simulation.contentRating === "adult_19";
+}
+
+// Adult mode widens the image safety level to "explicit", but that widening is derived here at read
+// time rather than written into imageProfile.safetyLevel. Storing it would latch: lowering the rating
+// back to "general" could not restore the creator's original pick, because the original was gone.
+export function resolveEffectiveImageSafetyLevel(state: AppState): ImageSafetyLevel {
+  return isAdultContentMode(state) ? "explicit" : state.imageProfile.safetyLevel;
 }
 
 export function createImageUserRulesForContentRating(state: AppState): string {

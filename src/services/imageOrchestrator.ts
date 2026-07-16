@@ -12,7 +12,8 @@ import { generateNovelAiImages } from "./novelAiClient";
 import { resolveNovelAiModelName } from "./novelAiModels";
 import {
   createImageUserRulesForContentRating,
-  isAdultContentMode
+  isAdultContentMode,
+  resolveEffectiveImageSafetyLevel
 } from "./contentRating";
 import {
   canonicalizeStateType,
@@ -156,7 +157,7 @@ export function planImageJob(
     count,
     contentRating: state.simulation.contentRating,
     adultContentMode: isAdultContentMode(state),
-    safetyLevel: state.imageProfile.safetyLevel,
+    safetyLevel: resolveEffectiveImageSafetyLevel(state),
     triggerMode: state.imageProfile.triggerMode,
     generationCadence: state.imageProfile.generationCadence,
     requiresConfirmation,
@@ -2005,7 +2006,7 @@ function createGeneratedAsset(
     source: "generated",
     prompt,
     negativePrompt,
-    safetyLevel: state.imageProfile.safetyLevel,
+    safetyLevel: resolveEffectiveImageSafetyLevel(state),
     characterIds: cue.characters,
     tags: reuseTags.length > 0 ? reuseTags : cue.tags,
     createdAt: new Date().toISOString(),

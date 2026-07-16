@@ -1733,12 +1733,11 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
     createdAt,
     updatedAt: createdAt
   };
-  const draftRuntimeModules = draft.contentRating === "adult_19"
-    ? draft.modules.filter((module) => module.kind !== "safety_policy")
-    : draft.modules;
+  // safety_policy modules are kept in storage at every rating; the turn paths already filter them out
+  // at read time under adult mode, so dropping them at creation only lost creator-authored content.
   const sourceModules: PromptModule[] =
-    draftRuntimeModules.length > 0
-      ? draftRuntimeModules
+    draft.modules.length > 0
+      ? draft.modules
       : [
           {
             id: "module_main",
@@ -1831,7 +1830,7 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
     ...draft.imageProfile,
     id: `img_profile_${moduleIdSuffix}`,
     simulationId,
-    safetyLevel: draft.contentRating === "adult_19" ? "explicit" : draft.imageProfile.safetyLevel
+    safetyLevel: draft.imageProfile.safetyLevel
   };
   const scenePresetSeenIds = new Set<string>();
   const imageScenePresets: ImageSceneTagPreset[] = (draft.imageScenePresets ?? []).map((preset, index) => ({

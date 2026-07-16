@@ -78,7 +78,6 @@ import {
   type NeuralMapLiveNode
 } from "./services/neuralMapClient";
 import { toShareableLlmSettings, toShareableNovelAiSettings } from "./services/runtimeApiSettings";
-import { relaxImageUserRulesForAdultMode } from "./services/contentRating";
 import {
   readStateMemoryKind,
   readStateMemoryOwnerId,
@@ -3238,10 +3237,10 @@ function updateStateFromDraft(existing: AppState, draft: SimulationDraft): AppSt
     currentMood: character.currentMood || ""
   }));
   const characterIds = new Set(characters.map((character) => character.id));
-  const draftRuntimeModules = draft.contentRating === "adult_19"
-    ? draft.modules.filter((module) => module.kind !== "safety_policy")
-    : draft.modules;
-  const modules = draftRuntimeModules.map((module) => ({
+  // safety_policy modules stay stored regardless of rating. Adult mode already filters them out at
+  // read time on every turn path, so dropping them here only destroyed the creator's authored modules
+  // in a way that lowering the rating back to general could not undo.
+  const modules = draft.modules.map((module) => ({
     ...module,
     simulationId: existing.simulation.id,
     characterId: module.characterId && characterIds.has(module.characterId) ? module.characterId : undefined,
@@ -3322,7 +3321,7 @@ function updateStateFromDraft(existing: AppState, draft: SimulationDraft): AppSt
       ...existing.imageProfile,
       ...draft.imageProfile,
       simulationId: existing.simulation.id,
-      safetyLevel: draft.contentRating === "adult_19" ? "explicit" : draft.imageProfile.safetyLevel
+      safetyLevel: draft.imageProfile.safetyLevel
     },
     neuralMap: draft.neuralMap,
     relationshipMap: {
@@ -9254,12 +9253,7 @@ function CreateSimulationPage({
   const updateContentRating = useCallback((contentRating: ContentRating) => {
     setDraft((current) => ({
       ...current,
-      contentRating,
-      imageProfile: {
-        ...current.imageProfile,
-        safetyLevel: contentRating === "adult_19" ? "explicit" : current.imageProfile.safetyLevel,
-        userRules: contentRating === "adult_19" ? relaxImageUserRulesForAdultMode(current.imageProfile.userRules) : current.imageProfile.userRules
-      }
+      contentRating
     }));
   }, []);
 
@@ -14487,11 +14481,6 @@ function SettingsPanel({
             ...current.simulation,
             contentRating,
             updatedAt: new Date().toISOString()
-          },
-          imageProfile: {
-            ...current.imageProfile,
-            safetyLevel: contentRating === "adult_19" ? "explicit" : current.imageProfile.safetyLevel,
-            userRules: contentRating === "adult_19" ? relaxImageUserRulesForAdultMode(current.imageProfile.userRules) : current.imageProfile.userRules
           }
         }),
         contentRating === "adult_19"

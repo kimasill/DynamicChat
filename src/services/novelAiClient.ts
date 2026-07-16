@@ -2,7 +2,7 @@ import { unzip } from "fflate";
 
 import type { AppState, ImageCue, NovelAiModelPreset } from "../types";
 import { getNovelAiEncodeVibeProxyUrl, getNovelAiGenerateProxyUrl } from "./dynamicChatApi";
-import { createImageUserRulesForContentRating, isAdultContentMode } from "./contentRating";
+import { createImageUserRulesForContentRating, isAdultContentMode, resolveEffectiveImageSafetyLevel } from "./contentRating";
 import { resolveNovelAiModelName } from "./novelAiModels";
 
 interface NovelAiImageResult {
@@ -144,7 +144,7 @@ function createNovelAiPayload(input: {
     params_version: 3,
     legacy: false,
     legacy_v3_extend: false,
-    safety_level: state.imageProfile.safetyLevel,
+    safety_level: resolveEffectiveImageSafetyLevel(state),
     dynamicchat_scene: input.cue.scene,
     dynamicchat_tags: input.cue.tags,
     dynamicchat_visual_context: input.cue.visualContext,

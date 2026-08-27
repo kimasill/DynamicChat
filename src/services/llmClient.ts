@@ -23,6 +23,7 @@ import {
   readStateMemoryValue,
   splitImageStateTagValue
 } from "./stateMemory";
+import { MAX_FOUNDATION_MODULE_BODY_CHARS } from "../lib/promptLimits";
 
 interface OpenAiCompatibleChoice {
   message?: {
@@ -190,6 +191,10 @@ const IMAGE_PATTERN =
   /그려|보여|이미지|장면|모습|표정|빛|배경|의상|옷|복장|학교|교실|연습|훈련|무대|숙소|기숙|주방|거리|사무실|카페|병원|전투|여행/u;
 const IMAGE_PROGRESSION_CUE_TARGET = 10;
 const IMAGE_PROGRESSION_MIN_OUTPUT_TOKENS = 4200;
+// Registered characters the transcript name-match missed are still surfaced to the image-cue author as a
+// name + id + subject hint (a few tokens each) so it can attach an id the match could not. Capped only so a
+// very large roster cannot swamp the cut list; the overflow is stated in the prompt, never dropped silently.
+const OFF_LIST_ROSTER_HINT_LIMIT = 24;
 const IMAGE_SCENE_PRESET_PROMPT_LIMIT = 18;
 const IMAGE_SCENE_PRESET_PROMPT_MAX_DEPTH = 5;
 const IMAGE_SCENE_PRESET_SEARCH_NODE_LIMIT = 240;
@@ -314,8 +319,10 @@ export async function generateAssistantText(input: {
       // Local CLI agents (claude/codex/gemini) pay a fresh subprocess cold start + full
       // prompt re-processing on every call, so a prose-length repair/continuation is not a cheap
       // touch-up — it re-runs a full-budget generation and can double or triple turn latency.
-      // The primary streamed call already runs at the user's configured token budget, so skip the
-      // length-padding round-trips for these backends and let the single pass stand.
+      // Note that on these backends the /llm/cli-agent bridge cannot pass a token budget to the CLI at all
+      // (see requestProviderTextImmediate), so the configured budget reaches the model only as the output-length
+      // instruction tier. That makes createOutputLengthInstruction the sole length control here: when a turn
+      // comes back too short, fix that instruction rather than re-enabling these round-trips.
       const isCliAgentBackend = isCliAgentLlmProvider(state.llm.provider);
       const skipProseSupplementalLlmCalls = skipSupplementalLlmCalls || prioritizeImagePipeline || isCliAgentBackend;
       // The annotation call owns image_cues in this mode, so the narrative call is INSTRUCTED not to emit any —
@@ -1619,7 +1626,7 @@ function createImageCueCurrentStateBlock(state: AppState, currentUserText = ""):
 // still comes from the model + user rules + presets; this only surfaces existing persisted state.
 function createImageSceneBriefingBlock(state: AppState, currentUserText = ""): string {
   const presentIds = inferCurrentSceneCharacterIds(state, currentUserText);
-  if (presentIds.length === 0) {
+  if (presentIds.length === 0 && state.characters.length === 0) {
     return "";
   }
   const nameById = new Map(state.characters.map((character) => [character.id, character.name] as const));
@@ -1665,14 +1672,61 @@ function createImageSceneBriefingBlock(state: AppState, currentUserText = ""): s
     ].filter((segment): segment is string => Boolean(segment));
     return `- ${name} (character_id: ${id}) | ${segments.join(" | ")}`;
   });
+  // Off-list roster: DynamicChat resolves the cast above by matching character names/ids against the recent
+  // transcript, which misses anyone the narrative refers to only by pronoun, role, or title ("그는", "남자",
+  // "대장"). When that happens the character used to vanish from the prompt entirely, so the model could not
+  // attach a character_id and the locally injected identity — including the gender tag — never fired. The
+  // roster line below keeps every registered character reachable at a few tokens each; full appearance is
+  // injected locally from the id, so nothing more needs to be surfaced here.
+  const offListRoster = state.characters.filter((character) => !presentIds.includes(character.id));
+  const otherRosterLines = offListRoster
+    .slice(0, OFF_LIST_ROSTER_HINT_LIMIT)
+    .map((character) => {
+      const profile = state.visualProfiles.find((candidate) => candidate.characterId === character.id);
+      const subjectHint = profile ? readSubjectHintTags(profile.positivePrompt) : "";
+      return `- ${character.name} (character_id: ${character.id})${subjectHint ? ` | ${subjectHint}` : ""}`;
+    });
   const header =
-    `${presentIds.length} character(s) are present in the scene right now (listed below). These are CANDIDATES, not a mandatory cast for every cut. ` +
-    "For EACH cut, first decide the camera/framing, then emit one character_prompts entry ONLY for the characters whose body is actually visible inside that frame, and set the subject-count base tag to that VISIBLE count (e.g. 1girl / 1boy / 2girls / 1girl 1boy). " +
-    "A character who is present but NOT in the chosen frame must NOT get an entry in that cut — in particular the point-of-view/observer character whose eyes the shot looks through (e.g. when the cut shows what they are looking at) is usually off-frame, so do not add them just because they are on-stage. Match image_cues.characters to the entries you actually emit. " +
+    (presentIds.length > 0
+      ? `DynamicChat name-matched ${presentIds.length} registered character(s) in the recent transcript (listed below). That match is a HINT, not the cast: it cannot see characters the narrative refers to only by pronoun, role, or title, and it does not know who this turn actually shows. `
+      : "DynamicChat could not name-match any registered character in the recent transcript. That is a limitation of the match, not evidence that the scene is empty. ") +
+    "YOU decide, from the narrative and the current action, who is actually in this turn's scene and who is inside each cut's frame. " +
+    "For EACH cut, first decide the camera/framing, then emit one character_prompts entry for every person whose body is visible inside that frame — including people who are NOT in any list here (unnamed men, soldiers, bystanders, crowds), which you author in full yourself — and set the subject-count base tag to that VISIBLE count (e.g. 1girl / 1boy / 2girls / 1girl 1boy). " +
+    "A character who is on-stage but NOT in the chosen frame must NOT get an entry in that cut — in particular the point-of-view/observer character whose eyes the shot looks through is usually off-frame, so do not add them just because they are on-stage. Match image_cues.characters to the entries you actually emit; a listed id without an authored entry is NOT rendered. " +
+    "When a registered character IS in the frame, set their character_id so their saved appearance is injected — do this even if they are absent from the lists below, using the roster ids given. " +
     "For each character you DO render, reflect their listed current outfit, ongoing action/pose, expression, condition, and interaction target — keep them unless this turn explicitly changes them. " +
-    "Do not invent characters that are not listed and never merge two of them into one entry. When one character acts on another, " +
+    "Never merge two people into one entry. When one character acts on another, " +
     "render the interaction from both sides (the actor's pose/hands and the target's reaction/contact point).";
-  return [header, ...lines].join("\n");
+  return [
+    header,
+    ...lines,
+    otherRosterLines.length > 0
+      ? [
+          "Other registered characters (not name-matched this turn — use these ids if the narrative shows them):",
+          otherRosterLines.join("\n"),
+          offListRoster.length > otherRosterLines.length
+            ? `(+${offListRoster.length - otherRosterLines.length} more registered characters not listed here; if the narrative shows one of them, author them as an unregistered figure with full self-description.)`
+            : undefined
+        ]
+          .filter((item): item is string => Boolean(item))
+          .join("\n")
+      : undefined
+  ]
+    .filter((item): item is string => Boolean(item))
+    .join("\n");
+}
+
+// A few subject/gender tags from a saved visual profile, so an off-list roster entry still tells the model
+// whether that character is a man or a woman before it decides the cut's subject-count tag.
+function readSubjectHintTags(positivePrompt: string): string {
+  const tags = positivePrompt
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+  const subjectTags = tags.filter((tag) =>
+    /\b(?:1girl|1boy|2girls|2boys|girls?|boys?|male|female|man|men|woman|women|futanari|futa|otoko\s*no\s*ko)\b/iu.test(tag)
+  );
+  return (subjectTags.length > 0 ? subjectTags : tags.slice(0, 2)).slice(0, 3).join(", ");
 }
 
 function createImageSceneTagPresetBlock(state: AppState, currentUserText = ""): string {
@@ -2060,7 +2114,9 @@ function createContextBlock(
   options: { manualImage?: boolean; outputTokenBudget?: number; omitImageAuthoring?: boolean } = {}
 ): string {
   const creatorOutputFormat = analyzeCreatorOutputFormat(state, modules);
-  const foundationText = createSimulationFoundationBlock(state, currentUserText);
+  // The stable creator law (title/premise/main rules/world lore/always-on) has moved to the runtime (system) instruction
+  // so it can be prompt-cached. Only the volatile current-scene view is assembled here in the per-turn context.
+  const sceneFoundationText = createSceneFoundationBlock(state, currentUserText);
   const immediateContinuityText = createImmediateContinuityBlock(state);
   // Narrative audience: strips image-machinery state types and qualitatively bands relationship-map
   // values so the prose model never sees NovelAI tag vocabulary or raw numeric stat values.
@@ -2191,8 +2247,10 @@ function createContextBlock(
       : undefined,
     relationshipMapRulesText || undefined,
     // createCreatorOutputFormatInstruction is already emitted once in the runtime (system) instruction.
-    "Simulation foundation:",
-    foundationText,
+    // The stable Simulation foundation (title/premise/main rules/world lore/always-on) now lives at the head of the
+    // runtime (system) instruction for prompt-caching; only the volatile current-scene view is repeated here per turn.
+    "Current scene (who is on stage this turn):",
+    sceneFoundationText,
     "User persona:",
     personaText || "(none)",
     omit ? undefined : "Image prompt user rules:",
@@ -3175,37 +3233,46 @@ function createImageCueTagContractInstruction(state: AppState): string {
   const adultExplicitInstruction = isAdultContentMode(state)
     ? "In adult_19 mode, when the image prompt user rules or situational tag presets call for an explicit beat, emit the direct visual tags they describe; do not blank out image_cues merely because the scene is adult-only."
     : "Do not add sexual or explicit body-contact tags unless the active content mode and the user rules allow them.";
+  // One numbered rule per line. This block used to be ~20 long rules joined into a single run-on paragraph
+  // with the same point made three different ways (registered-vs-unregistered ×3, outfit ×3, framing ×2) —
+  // the exact shape a model skims instead of reads. Overlapping rules are merged; nothing structural is lost.
+  // Every rule here is about STRUCTURE. Which tags to use and how to phrase them belongs to the user rules
+  // and situational presets, and every judgment call (cast, framing, detail, continuity) belongs to you.
   return [
-    // Format skeleton: enough structure for the NovelAI pipeline to function, no creative tag opinions.
-    "Image cue tag format: image_cues.base_tags and every image_cues.character_prompts[].prompt must be final comma-separated English NovelAI tags, not prose, sentences, summaries, headings, or labels.",
-    "Keep each image_cue COMPACT to save generation time: emit ONLY kind, placement, anchor_text, should_generate, characters, base_tags, and character_prompts. Do NOT emit label, reason, priority, scene, visual_context, or the legacy flat `tags` field — DynamicChat does not need them and they only slow the response. Use base_tags + per-character character_prompts as the single source of tags (do not also duplicate them into a flat `tags` field). Add suppression_reason ONLY when should_generate=false.",
-    "Never emit should_generate=true with empty visual tags (empty base_tags and empty character_prompts). If you cannot produce concrete tags for a beat, set should_generate=false with a short suppression_reason.",
-    "Do not put artist, style, quality, resolution, or negative/undesired tags in image_cues; DynamicChat adds those separately. Exclude tags like highres, absurdres, masterpiece, best quality, lowres, watermark.",
-    // Structural V4 split + per-character separation (always enforced, even without user rules).
-    "NovelAI V4 prompt split: image_cues.base_tags carries ONLY non-character tags (scene, location, environment, camera/framing, composition, lighting, props, weather, and whole-cut shared staging). Every visible human subject goes in image_cues.character_prompts, one separate entry per character. Never put a person tag in base_tags: subject count (1girl, 1boy), gender/body type (muscular man), anatomy, pose, expression, clothing, or per-character action must never appear in base_tags.",
-    "One character_prompt per visible character: emit a separate entry for EACH human actually visible IN THIS CUT'S FRAME, including secondary, aggressor, background-but-visible, or unregistered characters. Never merge two characters into a single entry, and never describe a second character inside base_tags or inside another character's entry. List in image_cues.characters only the characters you render this cut (omit present-but-off-frame characters such as the observer the shot looks through), and include one matching character_prompts item for every id you list.",
-    "Focus vs. incidental detail (tag budget): a cut has 1-2 focus subjects — the figure(s) the framing and action are actually about — and sometimes additional incidental, background, or crowd figures. The focus subject gets detail, but ONLY about whatever the chosen crop actually reveals for it — 'full detail' means thorough about what is in frame, NOT the whole body, face, and outfit every time. Match the detail to the framing: a face/expression close-up gets gaze/mouth/expression detail and skips body/pose/full-outfit tags; a from-behind or body-region crop gets the back/region/pose detail and skips facing-camera face tags; only a full-body shot warrants pose plus body-state plus visible outfit. Render incidental/background/crowd figures COMPACTLY: a subject-count plus role plus only the few tags the shot needs (e.g. `multiple boys, soldiers, surrounding, leering`), not a full per-character breakdown for each one. Do not spend detailed tags on figures the cut does not center on, and do not pile every possible state tag onto the focus subject either — an over-stuffed prompt where everything is described in full dilutes the subject and breaks the image. Each character_prompt should carry only the tags the chosen crop reveals for that character, ordered most-defining-first.",
-    "Characters in physical contact STAY SEPARATE entries: two people touching, overlapping, grappling, embracing, carrying, pinning, or in a sexual position are still two character_prompts (char_caption[0], char_caption[1], ...), never one merged entry. Author the ACTIVE/doing participant's own body action in their entry (what their hands, hips, mouth, and body are doing) and the PASSIVE/receiving participant's own pose, body orientation, and reaction in THEIR entry — do not pack both characters' bodies and the whole interaction into a single character's entry and leave the other entry empty or appearance-only. The joint position/contact anchor (the tag naming the position itself) goes on each participant's entry per the user-rule subject/target convention so both figures actually perform the same interaction. If image_cues.characters lists two ids, image_cues.character_prompts MUST contain two non-empty matching entries; if you can only describe one body, fix the cue rather than merging.",
-    "Within each character_prompt, order that character's current action/pose/interaction/expression tags first.",
-    "Do NOT repeat injected or unchanged tags — this is the biggest token waste on multi-cut turns. DynamicChat already injects, into EVERY cut from saved state, each character's appearance/identity, current outfit, ongoing pose/action/interaction, and persisted physical condition (injuries, blood, bodily fluids, sweat, dirt, restraints). So a character_prompt must contain ONLY what is NEW or specific to THIS cut: the chosen framing/crop and this beat's changed action/expression/contact. Do not re-list the scene, the outfit, the wounds/blood/fluids, or the still-ongoing action that already holds — they are injected automatically. When a turn emits several cuts of the same ongoing scene, write each later cut as a SHORT delta from the previous one (only what the camera or the action changed), not a fresh full re-description; keep base_tags minimal and only restate a scene tag when that element actually changed. (New durable condition still goes into memory_events as PhysicalStateTags/Wearing so the next cut/turn keeps injecting it — record it once there, not in every cut.)",
-    "Composition-first authoring: before choosing tags, decide the camera/framing (e.g., close up, cowboy shot, full body, over-the-shoulder, pov) and what the cut actually shows. Only emit tags for what is visible in that frame. Do not add clothing, accessories, jewelry, or background props the chosen composition would not show, and do not paste the saved default outfit when the cut is a close-up of a specific region.",
-    "Framing is mandatory: every should_generate cue MUST commit to exactly one explicit shot/framing tag (e.g., close-up, face focus, upper body, cowboy shot, full body, wide shot, from behind, pov) so the crop is decided, not left ambiguous. Put the shared shot/framing in base_tags and any per-character viewpoint detail in that character's entry.",
-    "Face/expression coherence: decide framing, viewpoint, and whether the face is shown autonomously from each character's actual pose and orientation — there is no fixed 'always show expression or always crop' rule. When the cut genuinely shows a character's face toward the viewer, include a matching expression (eyes/mouth/emotion) so it is not blank. When the pose means the face is not meaningfully visible (turned around, from behind, looking away, head outside the chosen crop, or obscured), do not force an expression or facing-camera face tags — instead use the viewpoint tags that fit (from behind, facing away, etc.). Match the tags to what the chosen composition actually reveals.",
-    "Outfit follows context and composition, not chance: take the character's current Wearing state as the baseline and change it only when the narrative changed it (removed/added/torn/wet/displaced) or when the chosen crop only reveals part of it. Do not randomly swap, drop, or re-add garments between cuts that the story did not change; keep the established outfit stable turn to turn unless the scene altered it.",
-    "Whole-situation first, then the focus: before authoring any cut, recall the ongoing scene action/interaction from the ongoing scene/visual state and the recent transcript, and build the cut on top of it. A cut that narrows to a moment or a body region is still the SAME ongoing situation, not a fresh neutral pose. Always pair the narrow focus with the still-active action/position/interaction tags so the composition stays coherent and the image does not collapse into a character standing idle while a detail floats in isolation. This applies to every action, not only sexual ones. Example (non-sexual): if a man is strangling a character and the next beat focuses on her body/neck, the cut still needs the interaction tags (e.g., strangling, hands on another's neck, choking, struggling) on the appropriate character_prompts plus the matching position — never emit just the body-region focus on a calmly standing figure. Example (sexual): if the scene action is vaginal penetration and you emphasize the hips, the cut still needs the insertion/position tags (e.g., sex from behind, vaginal, penis, penetration, hetero). Do not strand a focus shot away from the action it belongs to.",
-    "Cross-turn action continuity: the situation does not reset between turns. Before writing this turn's cues, read the ongoing scene/visual state and the immediate continuity anchor for the action/position/interaction that was active at the END of the previous turn, and carry it into THIS turn's first cue unless the new assistant_text or current user action explicitly ends or changes it. A continuing physical action (e.g., still strangling, still pinned, still embracing, still running) must keep appearing in the tags across consecutive turns until it stops — do not silently drop it just because a new turn started. When such an ongoing physical action/interaction is present, also persist it as a memory_events state (state_type='ActionTags' or 'InteractionTags', state_value as the English action/interaction tags) so the next turn can continue it; do this even for actions whose wording is unusual, since only persisted state survives to the next turn.",
-    "Registered vs unregistered characters: for a registered character, set character_id and author ONLY that character's current action, pose, expression, interaction, and the cut's framing/visible body state. DynamicChat injects that character's saved base appearance and current outfit (hair/eyes/face/body plus the current Wearing garments) into the same entry, so do NOT reproduce identity tags and do NOT restate the established outfit — that is exactly what keeps the character looking like the same person in the same clothes turn after turn. Only write a clothing tag yourself when THIS turn's narrative changed it (removed/torn/wet/displaced/clothed sex) or when the chosen close-up reveals a specific region; if the cut is fully nude, write the explicit nudity tag (nude/completely nude) and DynamicChat will skip the outfit injection. For an unregistered visible subject, omit character_id and author its full description (appearance, body, outfit, action) yourself.",
-    "Unregistered NPC in interaction scenes: when an enemy, aggressor, bystander, crowd figure, or any person absent from the registered roster is physically interacting with a registered character (grabbing, restraining, attacking, embracing, penetrating, etc.), create two SEPARATE character_prompts entries — one entry for the registered character (carrying that character's character_id and describing only their own body/pose/reaction) and one entry for the unregistered participant (no character_id, full self-description: role, body, action). The registered character's entry must NOT be prefixed with the unregistered figure's role tags — each entry describes only its own subject. Never assign a registered character's id to the unregistered figure's entry, even when the unregistered figure is the active/doing participant.",
-    "Visible-only clothing: name only the garments and body state that the chosen composition actually shows. If the character is fully nude in this cut, write the explicit nudity tag (e.g., nude, completely nude). If only the SAME garment changes condition (torn, wet, lifted, aside, clothed sex), write the partial-clothing tag plus the garment that is still on. If the cut is a close-up where the saved default outfit is not in frame, do not paste it in just to fill space.",
-    "When the image prompt user rules define a subject/object action convention (for example a source/target/mutual scheme), apply it by writing each character's portion of the interaction inside that character's own character_prompt entry; keep a shared core pose/position tag only where the rules place it.",
-    // Structural identity correctness.
-    "Character identity lock: never mix one roster character's hair, eyes, outfit, or body tags into another character's entry, and do not borrow another character's required_identity_tags. Subject-count tags must match the visible subjects; a single character must not become 2girls/3girls.",
-    "Character ambiguity rule: when a pronoun or unnamed continuation could match more than one roster character and the current scene does not disambiguate, reuse the character already visible in the latest image/assistant beat, or set should_generate=false with a suppression_reason instead of guessing.",
-    // Content authority lives in user rules + situational presets, not in DynamicChat.
-    "For which tags to use and how to phrase them, follow the image prompt user rules and the situational tag keyword presets. DynamicChat does not impose its own tag vocabulary, tag ordering, scene styling, or example tags beyond this structural split.",
-    "Prefer concrete, render-able visual tags over abstract psychological or medical state words. NovelAI cannot draw a concept like `panic attack`, `hyperventilation`, or `anxiety`; express the same beat through the visible cues that show it (e.g. wide eyes, open mouth, gasping, trembling, tears, pale face, sweat). Name the abstract state only if the user rules or presets explicitly use it as a tag.",
-    adultExplicitInstruction
-  ].join(" ");
+    "IMAGE CUE TAG CONTRACT — structure only. You own every creative and compositional judgment below; DynamicChat imposes no tag vocabulary, ordering, or styling of its own.",
+
+    "1. FORMAT. base_tags and every character_prompts[].prompt are final comma-separated English NovelAI tags — never prose, sentences, summaries, headings, or labels. No artist, style, quality, resolution, or negative tags (DynamicChat adds those separately; exclude highres, absurdres, masterpiece, best quality, lowres, watermark). Never emit should_generate=true with both base_tags and character_prompts empty — if you cannot produce concrete tags for a beat, emit should_generate=false with a short suppression_reason.",
+
+    "2. FIELDS. Emit kind, placement, anchor_text, should_generate, characters, base_tags, character_prompts, and — when it helps you commit to a composition — one short `reason` naming who is in frame and the camera. Skip label, priority, scene, visual_context, and the legacy flat `tags` field; base_tags plus per-character character_prompts are the single source of tags.",
+
+    "3. COMPOSITION FIRST, AND IT IS YOUR CALL. Before choosing any tag, decide this cut's camera/framing and what it actually shows (close-up, face focus, upper body, cowboy shot, full body, wide shot, from behind, pov, over-the-shoulder…). Every should_generate cue must commit to exactly one explicit shot/framing tag so the crop is decided rather than ambiguous — shared framing in base_tags, per-character viewpoint detail in that character's entry. Emit tags only for what that frame reveals: no clothing, accessories, jewelry, or props the crop would not show.",
+
+    "4. WHO IS IN FRAME IS YOUR CALL. After framing, decide which people are inside it. Emit one character_prompts entry for EACH human visible in THIS cut's frame — focus subject, secondary, aggressor, background-but-visible, registered or not. Never merge two people into one entry and never describe a second person inside base_tags or inside another person's entry. image_cues.characters lists only the registered characters you actually author an entry for this cut; an id listed without a matching entry is NOT rendered, and a present-but-off-frame character (typically the observer the shot looks through) belongs in neither.",
+
+    "5. SUBJECT COUNT IS MANDATORY. base_tags carries the non-character tags (scene, location, environment, camera/framing, composition, lighting, props, weather, shared staging) PLUS exactly one subject-count tag naming the visible cast by gender — `1girl`, `1boy`, `2girls`, `1girl, 1boy`, `1girl, 2boys` — matching the character_prompts you emit. Without it NovelAI guesses and renders everyone as its default gender (typically all female): this is the single most common cause of a man being drawn as a second woman. Apart from that count tag, no per-person detail (gender/body descriptions, anatomy, pose, expression, clothing, per-character action) may sit in base_tags.",
+
+    "6. EVERY ENTRY'S GENDER MUST BE UNAMBIGUOUS. Each character_prompts entry must make its subject's gender explicit, and the base_tags count must agree (one man + one woman → `1girl, 1boy` plus one clearly male entry and one clearly female entry). For a person with NO character_id nothing whatsoever is injected, so author their full description yourself — explicit gender/subject tag first (`1boy`, `man`, `muscular man`, `1girl`…), then body, appearance, outfit, action — in EVERY cut they appear in. Never rely on injection for them.",
+
+    "7. REGISTERED CHARACTERS: SET THE ID, AUTHOR THE MOMENT. For a registered character, set character_id and write that character's own current action, pose, expression, interaction, and this cut's framing/visible body state. DynamicChat injects their saved appearance and current outfit into the same entry from stored state — that is what keeps them the same person in the same clothes turn after turn — so you need not restate identity or the established outfit. This is a licence to skip redundancy, NOT a reason to write a thin cut: every cut still re-decides its own framing and states the action, expression, contact, and visible body state that THIS cut shows. If a registered character is in the frame but was not listed for you this turn, still set their id using the roster ids you were given.",
+
+    "8. UNREGISTERED PARTICIPANTS STAY THEIR OWN ENTRY. When an enemy, aggressor, bystander, or crowd figure interacts with a registered character (grabbing, restraining, attacking, embracing, penetrating…), emit two SEPARATE entries: the registered character's (their id, only their own body/pose/reaction) and the unregistered participant's (no character_id, full self-description: gender, role, body, outfit, action). Never assign a registered character's id to a different person's entry — not even when that person is the active participant — and never prefix a registered character's entry with the other figure's role tags.",
+
+    "9. PEOPLE IN CONTACT STAY SEPARATE. Two people touching, overlapping, grappling, embracing, carrying, pinning, or in a sexual position are still two character_prompts (char_caption[0], char_caption[1]…), never one merged entry. Author the active participant's own body action (hands, hips, mouth, body) in their entry and the receiving participant's own pose, orientation, and reaction in theirs — do not pack the whole interaction into one entry and leave the other appearance-only. The joint position/contact anchor goes on each participant's entry per the user-rule subject/target convention so both figures actually perform the same interaction.",
+
+    "10. DETAIL FOLLOWS THE CROP. A cut has 1-2 focus subjects plus, sometimes, incidental or crowd figures. Give the focus subject thorough detail about WHAT THE CROP REVEALS — not the whole body, face, and outfit every time: a face close-up gets gaze/mouth/expression and skips body/pose/outfit; a from-behind or body-region crop gets back/region/pose and skips facing-camera face tags; only a full-body shot warrants pose plus body-state plus visible outfit. Render incidental/background figures compactly (count plus role plus the few tags the shot needs, e.g. `multiple boys, soldiers, surrounding, leering`). An over-stuffed entry where everything is described at once dilutes the subject and breaks the image. Order each entry most-defining-first: that character's current action/pose/interaction/expression lead.",
+
+    "11. FACE AND EXPRESSION FOLLOW THE POSE. There is no fixed 'always show expression' or 'always crop' rule — decide from each character's actual pose and orientation. When the cut genuinely shows a face toward the viewer, give it a matching expression (eyes/mouth/emotion) so it is not blank. When the pose means the face is not meaningfully visible (turned away, from behind, looking away, outside the crop, obscured), do not force an expression — use the viewpoint tags that fit instead.",
+
+    "12. OUTFIT FOLLOWS THE STORY AND THE CROP. Take the character's current Wearing state as the baseline. Change it only when the narrative changed it (removed/added/torn/wet/displaced) or when the crop reveals only part of it. Name only garments the composition actually shows; write a clothing tag yourself when this turn changed it or the close-up reveals a specific region; if the cut is fully nude, write the explicit nudity tag (nude / completely nude) and DynamicChat skips the outfit injection. Never randomly swap, drop, or re-add garments the story did not touch, and never paste the saved default outfit into a close-up just to fill space.",
+
+    "13. THE SITUATION DOES NOT RESET — WITHIN THE TURN OR BETWEEN TURNS. Build every cut on top of the ongoing scene action/interaction from the visual state and recent transcript. A cut that narrows to a moment or a body region is the SAME ongoing situation, not a fresh neutral pose: pair the narrow focus with the still-active action/position/interaction tags, or the image collapses into an idle figure with a detail floating beside it. Likewise carry the action that was active at the END of the previous turn into this turn's first cue unless the narrative or user action explicitly ends it — a continuing physical action (still strangling, still pinned, still embracing, still running) keeps appearing until it stops. Example (non-sexual): a beat focusing on her neck while a man strangles her still needs the interaction tags (strangling, hands on another's neck, choking, struggling) on the right entries. Example (sexual): emphasising the hips during penetration still needs the position/insertion tags (sex from behind, vaginal, penis, penetration, hetero). When such an ongoing action is present, persist it as a memory_events state (state_type='ActionTags' or 'InteractionTags', state_value = the English tags) — only persisted state survives to the next turn.",
+
+    "14. IDENTITY LOCK. Never mix one character's hair, eyes, outfit, or body tags into another's entry, and never borrow another character's required_identity_tags. A single character must never become 2girls/3girls. When a pronoun or unnamed continuation could match more than one roster character and the scene does not disambiguate, reuse the character already visible in the latest image/assistant beat, or set should_generate=false with a suppression_reason rather than guessing.",
+
+    "15. RENDER-ABLE OVER ABSTRACT. NovelAI cannot draw `panic attack`, `hyperventilation`, or `anxiety`; express the beat through the visible cues that show it (wide eyes, open mouth, gasping, trembling, tears, pale face, sweat). Name an abstract state only when the user rules or presets use it as a tag.",
+
+    `16. ${adultExplicitInstruction}`
+  ].join("\n");
 }
 
 async function requestProviderText(
@@ -3247,6 +3314,10 @@ async function requestProviderTextImmediate(
   });
 
   if (cliAgentKind) {
+    // maxTokens is sent for completeness but the bridge cannot honour it: the claude/codex/gemini CLIs expose
+    // no output-token flag, so /llm/cli-agent drops it. On these backends the configured budget influences the
+    // turn ONLY through createOutputLengthInstruction's tier — do not assume the provider enforces a ceiling
+    // or a floor here.
     const bridgeUrl = baseUrl || getLlmCliAgentProxyUrl();
     const wantStream = Boolean(options.onRawText);
     const response = await fetchWithTimeout(bridgeUrl, {
@@ -4000,6 +4071,29 @@ function resolveImageTagLlmState(state: AppState): AppState {
   return state.imageTagLlm?.enabled ? { ...state, llm: state.imageTagLlm } : state;
 }
 
+// Output budget for the separated annotation / image-cue call. This used to be
+// min(interactive prose budget, 1800), which tied the size of the CUT LIST to how long the user wants the
+// NARRATIVE to be. A paragraph-cadence turn asks for up to 8 cuts, each carrying base_tags plus two or three
+// character captions, and ran out of room partway: the tail cuts came back thin, or the JSON was truncated
+// and recovered as cues with missing character_prompts — which is precisely when the pipeline starts
+// rendering the wrong cast. The budget now follows how many cuts the cadence actually asks for.
+function resolveAnnotationOutputTokenBudget(state: AppState, includeImageCues: boolean): number {
+  if (!includeImageCues) {
+    return 1800;
+  }
+  const cadence = state.imageProfile.generationCadence ?? "balanced";
+  if (cadence === "image_progression") {
+    return Math.max(IMAGE_PROGRESSION_MIN_OUTPUT_TOKENS, 5200);
+  }
+  if (cadence === "paragraph") {
+    return 4200;
+  }
+  if (cadence === "rich") {
+    return 2800;
+  }
+  return 1800;
+}
+
 function createImageCueLlmInstruction(state: AppState, outputTokenBudget: number): string {
   return [
     "You are DynamicChat's image-cue planner. You are given the ALREADY-WRITTEN Korean narrative for this turn (assistant_text) plus the current visual state. Your only job is to output image_cues: the ordered list of NovelAI image cuts that illustrate that narrative.",
@@ -4110,7 +4204,7 @@ export async function requestTurnImageCues(
     });
     return [];
   }
-  const outputTokenBudget = Math.min(resolveInteractiveOutputTokenBudget(state), 1800);
+  const outputTokenBudget = resolveAnnotationOutputTokenBudget(state, true);
   const instruction = createImageCueLlmInstruction(state, outputTokenBudget);
   const context = createImageCueLlmContext(state, { ...input, outputTokenBudget });
   try {
@@ -4306,7 +4400,7 @@ export async function requestTurnAnnotations(
     return { stateEvents: [], imageCues: [] };
   }
   const includeImageCues = isTurnImageCueGenerationActive(state, Boolean(input.manualImage));
-  const outputTokenBudget = Math.min(resolveInteractiveOutputTokenBudget(state), 1800);
+  const outputTokenBudget = resolveAnnotationOutputTokenBudget(state, includeImageCues);
   const instruction = createAnnotationLlmInstruction(state, outputTokenBudget, includeImageCues);
   const context = createAnnotationLlmContext(state, { ...input, outputTokenBudget }, includeImageCues);
   try {
@@ -4339,7 +4433,10 @@ function createRuntimeInstruction(
   outputTokenBudget: number,
   options: { manualImage?: boolean; modules?: PromptModule[]; omitImageAuthoring?: boolean } = {}
 ): string {
-  const creatorOutputFormat = analyzeCreatorOutputFormat(state, options.modules ?? []);
+  // Compute the creator output-format contract from STABLE sources only (main prompt + always-on foundation), not the
+  // per-turn RAG module selection. The visible-format gate is a session-level creator contract; letting a transiently
+  // selected module flip it would also make this system-prompt instruction drift turn to turn and bust prompt caching.
+  const creatorOutputFormat = analyzeCreatorOutputFormat(state);
   const contentRatingInstruction = createContentRatingInstruction(state);
   const imageCadenceInstruction = createImageGenerationCadenceBlock(state, outputTokenBudget);
   const initialImageCueCountInstruction = createInitialImageCueCountInstruction(state, outputTokenBudget);
@@ -4387,6 +4484,12 @@ function createRuntimeInstruction(
     isImageProgressionCadence(state)
       ? undefined
       : "Paragraph formatting for assistant_text: separate paragraphs with a blank line — a literal double newline `\\n\\n` in the JSON string (write \"...문장.\\n\\n다음 문단...\") — so the reply is not one unbroken block and images can sit between beats. Use NATURAL paragraph lengths that fit the creator's style (a normal mix of multi-sentence narration and dialogue); do NOT force every sentence or every line onto its own paragraph, which makes the prose read like a clipped list.",
+    // Native-Korean authoring (correctness, NOT a house style): these instructions are written in English, so the model
+    // tends to compose in English and then translate, producing 번역투 (translationese). Counter that failure mode
+    // without imposing any prose style — style/register/vividness stay 100% the creator's.
+    isImageProgressionCadence(state)
+      ? undefined
+      : "한국어 서술 자연스러움(필수 · 문체 규칙 아님): assistant_text는 영어로 사고한 뒤 옮긴 듯한 번역투가 아니라, 처음부터 한국어로 사고하고 쓴 자연스러운 한국어여야 한다. 영어 어순을 직역한 흔적 — 무생물·추상 명사를 주어로 남용, '그/그녀/그것' 대명사의 기계적 반복, '~을 가지다/만들다/취하다' 식 축자 번역, 수동태와 관계절 남발, 원문 단어를 1:1로 대응시킨 어색한 조어 — 을 피하고, 한국어 화자가 실제로 쓰는 어순·조사·연결어미·문장 호흡으로 쓴다. 이 규칙은 어색함만 제거할 뿐이며, 문체·어조·묘사 밀도·수위·표현 강도는 오직 창작자의 Main 규칙과 모듈이 정한다(DynamicChat은 고유 문체를 더하지 않는다).",
     createCreatorOutputFormatInstruction(creatorOutputFormat),
     imageAuthoringActive
       ? "Image cue ownership: this main response owns final image_cues. No later tag planner will fix, expand, or infer tags. When the current beat should be illustrated, write the complete NovelAI tags now in image_cues.base_tags + character_prompts."
@@ -4397,7 +4500,7 @@ function createRuntimeInstruction(
     imageAuthoringActive
       ? "JSON field order (narrative-first, mandatory): write assistant_text FIRST, then author image_cues, then memory_events. Set each generated cue's anchor_text to a short phrase that ACTUALLY appears in the assistant_text, placing a cut at every major beat INCLUDING the opening beat."
       : undefined,
-    options.manualImage && state.imageProfile.enabled && state.simulation.realtimeImageEnabled && state.imageProfile.triggerMode !== "stored_only"
+    imageAuthoringActive && options.manualImage && state.imageProfile.enabled && state.simulation.realtimeImageEnabled && state.imageProfile.triggerMode !== "stored_only"
       ? "Manual image request: this turn must include at least one should_generate=true image_cue with complete final NovelAI/Danbooru tags unless the current response is impossible to visualize. If impossible, set should_generate=false with a specific suppression_reason."
       : undefined,
     !imageAuthoringActive
@@ -4426,7 +4529,12 @@ function createRuntimeInstruction(
       : "Keep the outer JSON valid and stop cleanly. If the budget is tight, reduce memory_events first; do not drop required image_cues base_tags/character_prompts, and do not end assistant_text as only an opening beat.",
     options.omitImageAuthoring
       ? "Your response must be valid JSON only with exactly two fields: assistant_text (the user-visible narrative) and memory_events (semantic deltas only — no memory_kind='state'). Do NOT include image_cues or state/visual tags. If assistant_text contains Markdown code fences, encode them as a JSON string value; never write Markdown outside the JSON object."
-      : "Your response must be valid JSON only. Write the user-visible narrative in assistant_text first, then visual planning in image_cues, then only structured memory deltas in memory_events. If assistant_text contains Markdown code fences, encode them as a JSON string value; never write Markdown outside the JSON object."
+      : "Your response must be valid JSON only. Write the user-visible narrative in assistant_text first, then visual planning in image_cues, then only structured memory deltas in memory_events. If assistant_text contains Markdown code fences, encode them as a JSON string value; never write Markdown outside the JSON object.",
+    // Stable creator foundation lives at the TAIL of the runtime (system) instruction so the whole system prompt is a
+    // byte-identical, prompt-cacheable prefix across turns. The volatile current-scene view (who is on stage now) is
+    // sent separately in the per-turn context (createSceneFoundationBlock), after this system prompt.
+    "Simulation foundation (creator operating law — active every turn):",
+    createStableFoundationBlock(state)
   ].join("\n");
 }
 
@@ -4648,8 +4756,10 @@ function formatGeminiSafetyRatings(
 
 function createRequestPreview(runtimeInstruction: string, contextBlock: string, userText: string): string {
   return [
+    // The stable creator foundation (main rules / world lore) now lives at the tail of the SYSTEM INSTRUCTION so it can
+    // be prompt-cached, so the preview shows more of it (a 1400-char cap used to hide the whole foundation).
     "SYSTEM INSTRUCTION:",
-    truncatePreview(runtimeInstruction, 1400),
+    truncatePreview(runtimeInstruction, 6000),
     "CONTEXT BLOCK:",
     truncatePreview(contextBlock, 3600),
     "USER ACTION:",
@@ -4662,15 +4772,12 @@ function truncatePreview(value: string, maxChars: number): string {
   return value.length > maxChars ? `${value.slice(0, maxChars)}\n[...preview truncated...]` : value;
 }
 
-function createSimulationFoundationBlock(state: AppState, currentUserText = ""): string {
-  const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, currentUserText));
-  const activeCharacters = state.characters
-    .filter((character) => activeCharacterIds.has(character.id))
-    .map((character) => formatFoundationCharacterLine(state, character, "active"))
-    .join("\n");
-  const inactiveCharacterCount = state.characters
-    .filter((character) => !activeCharacterIds.has(character.id))
-    .length;
+// The STABLE creator law: title, premise, main rules, world lore, and non-character always-on rules. This block is
+// intentionally independent of the current user text / active scene cast so it is BYTE-IDENTICAL across every turn of a
+// session. It is placed at the head of the runtime (system) instruction so the CLI bridge / provider can prompt-cache
+// it: any per-turn drift here would bust the whole cache (an appended line already drops cache_read to 0), so keep only
+// session-stable creator content — scene/character volatility lives in createSceneFoundationBlock below.
+function createStableFoundationBlock(state: AppState): string {
   const mainRuleModules = state.modules
     .filter(
       (module) =>
@@ -4684,16 +4791,18 @@ function createSimulationFoundationBlock(state: AppState, currentUserText = ""):
   const worldLoreModules = state.modules
     .filter((module) => module.enabled && module.tokenPolicy !== "disabled" && module.kind === "world_lore")
     .sort((a, b) => b.priority - a.priority)
-    .map((module) => formatFoundationModule(module.title, module.tokenPolicy, module.body, 1600))
+    // World lore is now cached in the stable prefix, so it no longer needs the tight per-turn excerpt (was 1600): inject
+    // fuller lore so the model actually understands the world. Cache hits make the extra tokens cheap after turn 1.
+    .map((module) => formatFoundationModule(module.title, module.tokenPolicy, module.body, MAX_FOUNDATION_MODULE_BODY_CHARS))
     .join("\n\n");
+  // Only NON-character always-on rules are stable (character-scoped prompts are gated on who is in the current scene, so
+  // they belong to the volatile scene foundation instead).
   const alwaysOnModules = state.modules
     .filter(
       (module) =>
         module.enabled &&
         module.tokenPolicy === "always" &&
-        !["main_prompt", "world_lore", "image_prompt_profile"].includes(module.kind) &&
-        (module.kind !== "character_prompt" ||
-          Boolean(module.characterId && shouldIncludeCharacterScopedContext(state, module.characterId, activeCharacterIds))) &&
+        !["main_prompt", "world_lore", "image_prompt_profile", "character_prompt"].includes(module.kind) &&
         !(module.kind === "safety_policy" && isAdultContentMode(state))
     )
     .sort((a, b) => b.priority - a.priority)
@@ -4705,14 +4814,45 @@ function createSimulationFoundationBlock(state: AppState, currentUserText = ""):
     `Prompt mode: ${state.simulation.promptMode}`,
     `Content rating: ${state.simulation.contentRating}`,
     state.simulation.description ? `Premise: ${state.simulation.description}` : undefined,
+    mainRuleModules ? `Main rules:\n${mainRuleModules}` : "Main rules: (none)",
+    worldLoreModules ? `World/lore foundation:\n${worldLoreModules}` : undefined,
+    alwaysOnModules ? `Always-on rules:\n${alwaysOnModules}` : undefined
+  ]
+    .filter((item): item is string => Boolean(item))
+    .join("\n\n");
+}
+
+// The VOLATILE scene view: who is on stage this turn, their current details, and any character-scoped always-on rules
+// for active characters. This depends on currentUserText (scene-cast inference) and changes turn to turn, so it stays in
+// the per-turn context (user message), never in the cached stable prefix.
+function createSceneFoundationBlock(state: AppState, currentUserText = ""): string {
+  const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, currentUserText));
+  const activeCharacters = state.characters
+    .filter((character) => activeCharacterIds.has(character.id))
+    .map((character) => formatFoundationCharacterLine(state, character, "active"))
+    .join("\n");
+  const inactiveCharacterCount = state.characters
+    .filter((character) => !activeCharacterIds.has(character.id))
+    .length;
+  const characterScopedAlwaysOn = state.modules
+    .filter(
+      (module) =>
+        module.enabled &&
+        module.tokenPolicy === "always" &&
+        module.kind === "character_prompt" &&
+        Boolean(module.characterId && shouldIncludeCharacterScopedContext(state, module.characterId, activeCharacterIds))
+    )
+    .sort((a, b) => b.priority - a.priority)
+    .map((module) => formatFoundationModule(module.title, module.tokenPolicy, module.body, 1200))
+    .join("\n\n");
+
+  return [
     createSceneCastPromptBlock(state, currentUserText),
     activeCharacters ? `Current scene character details:\n${activeCharacters}` : "Current scene character details: (none inferred)",
     inactiveCharacterCount > 0
       ? `Registered off-stage roster reference only, not active cast and not visual/image subjects: ${inactiveCharacterCount} character(s) omitted from this current-turn prompt until current scene evidence activates them.`
       : "Registered character roster reference only, not active cast: (none)",
-    mainRuleModules ? `Main rules:\n${mainRuleModules}` : "Main rules: (none)",
-    worldLoreModules ? `World/lore foundation:\n${worldLoreModules}` : undefined,
-    alwaysOnModules ? `Always-on rules:\n${alwaysOnModules}` : undefined
+    characterScopedAlwaysOn ? `Active-character rules:\n${characterScopedAlwaysOn}` : undefined
   ]
     .filter((item): item is string => Boolean(item))
     .join("\n\n");
@@ -4845,14 +4985,20 @@ function createOutputLengthInstruction(maxTokens: number, state?: AppState): str
     return `Output mode: image progression. Do not spend the budget on visible prose. assistant_text must be one compact Korean status line, while image_cues must carry exactly ${IMAGE_PROGRESSION_CUE_TARGET} ordered tag prompt groups.`;
   }
 
-  // The provider already truncates at the token budget, so this instruction does not need to enforce the
-  // ceiling — it only has to prevent the two ways length goes wrong: getting cut off mid-sentence on a small
-  // budget, and inflating a thin beat on a large one. A paragraph COUNT anchors the model into filling it,
-  // and the only material available to fill a finished beat with is atmosphere, interiority, and narrator
-  // asides — which reads as ornamental, roundabout prose rather than a scene. So a paragraph number appears
-  // only where truncation is a real risk, and always as a limit to stay under, never as a target to reach.
+  // The provider truncates at the token budget on its own, so this instruction never has to enforce the
+  // ceiling. It has to correct BOTH ways length goes wrong, and it used to correct only one: every clause was
+  // subtractive ("a short turn is correct when little happens", "do not reach for length with atmosphere,
+  // sensory description, interiority, or narrator asides"), and the top tier withdrew the paragraph ceiling
+  // without putting anything in its place. Raising the budget past 4500 therefore DELETED the last quantity
+  // signal and left only reasons to be brief — turns got shorter as the setting went up.
+  //
+  // A paragraph quota is not the answer either: a number to hit anchors the model into filling it, and the
+  // only material available to pad a finished beat with is ornament — that regression is exactly why the
+  // quota was removed. The frame that fixes both failures is SCOPE rather than quantity: a turn lasts as long
+  // as it takes to play the current beat through, and the model is told not to stop early AND not to pad.
+  // Style, register, and description density remain entirely the creator's (see the no-house-style rule).
   const discipline =
-    " The scene decides the length, not this number: write what the current beat genuinely supports and end cleanly when it is done — a short turn is correct when little happens. Do not reach for length with atmosphere, sensory description, interiority, or narrator asides, and never repeat or echo earlier wording to fill space.";
+    " Length follows the beat, not this number: play the current beat all the way through — the action, the reply or reaction it provokes, and where it leaves the scene — then stop once it is genuinely finished. Do not compress an eventful beat into a summary or a few clipped lines, and do not stretch a finished one with repetition or filler. A quiet beat is legitimately short; an eventful one is legitimately long. If you notice yourself reporting that something happened instead of playing it out, play it out.";
   if (maxTokens <= 1000) {
     return "Output length: stay under roughly 3 Korean paragraphs so the turn is not cut off mid-sentence." + discipline;
   }
@@ -4869,7 +5015,10 @@ function createOutputLengthInstruction(maxTokens: number, state?: AppState): str
     return "Output length: stay under roughly 14 Korean paragraphs." + discipline;
   }
 
-  return "Output length: no paragraph target — the budget is generous enough that length is never the constraint here." + discipline;
+  return (
+    "Output length: the budget is large and will not truncate this turn — so it is never a reason to keep the reply short, and a beat that needs room has it." +
+    discipline
+  );
 }
 
 function truncatePromptText(value: string, maxChars: number, label: string): string {

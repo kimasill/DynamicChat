@@ -416,7 +416,7 @@ export async function planImageJobForCompletedTurn(
     baseDrafts,
     Boolean(input.manualImage)
   );
-  const drafts = requireMainLlmAuthoredImageTags(initialDrafts, Boolean(input.manualImage));
+  const drafts = requireMainLlmAuthoredImageTags(state, initialDrafts, Boolean(input.manualImage));
   const imageCues = drafts.map((draft) =>
     planImageCue(
       state,
@@ -484,12 +484,21 @@ export async function planImageJobForCompletedTurn(
 }
 
 function requireMainLlmAuthoredImageTags(
+  state: AppState,
   drafts: ImageRuleBackedCueDraft[],
   manualImage: boolean
 ): ImageRuleBackedCueDraft[] {
   return drafts.map((draft) => {
-    if (!isImageGenerationRequestedByDraft(draft, manualImage) || hasLlmAuthoredImageTags(draft)) {
+    if (!isImageGenerationRequestedByDraft(state, draft, manualImage)) {
       return draft;
+    }
+
+    if (hasLlmAuthoredImageTags(draft)) {
+      return {
+        ...draft,
+        shouldGenerate: true,
+        suppressionReason: undefined
+      };
     }
 
     return {
@@ -503,19 +512,29 @@ function requireMainLlmAuthoredImageTags(
   });
 }
 
-function isImageGenerationRequestedByDraft(draft: ImageRuleBackedCueDraft, manualImage: boolean): boolean {
+function isImageGenerationRequestedByDraft(state: AppState, draft: ImageRuleBackedCueDraft, manualImage: boolean): boolean {
+  const isRealtimeAutoActive =
+    state.imageProfile.enabled &&
+    state.simulation.realtimeImageEnabled &&
+    state.imageProfile.triggerMode === "realtime_auto";
+
   return (
     draft.shouldGenerate ||
     manualImage ||
+    isRealtimeAutoActive ||
     draft.forceImagePlanning === true ||
     draft.plannerSource === "user_image_rules" ||
     draft.plannerSource === "image_generation_cadence"
   );
 }
 
-function hasLlmAuthoredImageTags(draft: Pick<AssistantImageCueDraft, "tags" | "baseTags" | "characterPrompts">): boolean {
+function hasLlmAuthoredImageTags(draft: ImageRuleBackedCueDraft | AssistantImageCueDraft): boolean {
+  const backedDraft = draft as ImageRuleBackedCueDraft;
+  if (draft.suppressionReason) {
+    return false;
+  }
   return (
-    draft.tags.some((tag) => tag.trim().length > 0) ||
+    (draft.tags ?? []).some((tag) => tag.trim().length > 0) ||
     (draft.baseTags ?? []).some((tag) => tag.trim().length > 0) ||
     (draft.characterPrompts ?? []).some((prompt) => prompt.prompt.trim().length > 0)
   );
@@ -755,6 +774,7 @@ function createImageCadenceCueDraft(
     forceFreshImage: true,
     forceImagePlanning: true,
     anchorText,
+    visualContext: anchorText,
     priority: Math.max(0.72, 0.9 - index * 0.03),
     kind: normalizedKind,
     label: normalizedKind === "dialogue_face" ? "dialogue face" : normalizedKind === "action" ? "action beat" : "scene establishing",
@@ -2467,8 +2487,8 @@ function normalizeMemoryTags(tags: string[]): string[] {
   return normalized.length > 0 ? normalized.slice(0, 8) : ["memory"];
 }
 
-function uniqueStrings(values: string[]): string[] {
-  return Array.from(new Set(values.filter(Boolean)));
+function uniqueStrings(values: (string | undefined | null)[]): string[] {
+  return Array.from(new Set(values.filter((v): v is string => typeof v === "string" && Boolean(v.trim()))));
 }
 
 function clampNumber(value: number, min: number, max: number): number {

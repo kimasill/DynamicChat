@@ -30,15 +30,18 @@ export type LlmProvider =
   | "openai_compatible"
   | "claude_cli"
   | "codex_cli"
-  | "gemini_cli";
+  | "gemini_cli"
+  | "antigravity_cli";
 
-export const CLI_AGENT_LLM_PROVIDERS: readonly LlmProvider[] = ["claude_cli", "codex_cli", "gemini_cli"];
+export const CLI_AGENT_LLM_PROVIDERS: readonly LlmProvider[] = ["claude_cli", "codex_cli", "gemini_cli", "antigravity_cli"];
 
 export function isCliAgentLlmProvider(provider: LlmProvider): boolean {
   return CLI_AGENT_LLM_PROVIDERS.includes(provider);
 }
 
-export function cliAgentKindForProvider(provider: LlmProvider): "claude" | "codex" | "gemini" | undefined {
+// The kind is the bridge agent id, NOT the binary name. `antigravity` → the `agy` CLI (Google's
+// terminal coding agent that replaced the individual gemini CLI); the command lives server-side.
+export function cliAgentKindForProvider(provider: LlmProvider): "claude" | "codex" | "gemini" | "antigravity" | undefined {
   switch (provider) {
     case "claude_cli":
       return "claude";
@@ -46,6 +49,8 @@ export function cliAgentKindForProvider(provider: LlmProvider): "claude" | "code
       return "codex";
     case "gemini_cli":
       return "gemini";
+    case "antigravity_cli":
+      return "antigravity";
     default:
       return undefined;
   }
@@ -55,7 +60,7 @@ export type ApiRegistrationStatus = "idle" | "verifying" | "registered" | "faile
 
 export type NovelAiRequestMode = "mock" | "direct" | "proxy";
 
-export type NovelAiModelPreset = "NAID4.5F" | "NAID4.5C" | "NAID4.0F" | "NAID4.0C" | "NAID3";
+export type NovelAiModelPreset = "NAID5F" | "NAID5C" | "NAID5" | "NAID4.5F" | "NAID4.5C" | "NAID4.0F" | "NAID4.0C" | "NAID3";
 
 export type NovelAiNoiseSchedule = "karras" | "native" | "exponential" | "polyexponential";
 
@@ -138,6 +143,7 @@ export interface Simulation {
   ownerId: Id;
   title: string;
   description: string;
+  premise?: string;
   promptMode: SimulationPromptMode;
   contentRating: ContentRating;
   activeSessionId: Id;
@@ -153,6 +159,7 @@ export interface PromptModule {
   parentId?: Id;
   kind: PromptModuleKind;
   title: string;
+  name?: string;
   body: string;
   enabled: boolean;
   priority: number;
@@ -165,12 +172,14 @@ export interface PromptModule {
 
 export interface Character {
   id: Id;
-  simulationId: Id;
+  simulationId?: Id;
   name: string;
   role: string;
   summary: string;
   relationship: string;
   currentMood: string;
+  traits?: string[];
+  description?: string;
 }
 
 export interface SimulationCharacterDraft {
@@ -678,6 +687,7 @@ export interface AppState {
   novelAi: NovelAiApiSettings;
   selectedModuleId?: Id;
   selectedContextPackId?: Id;
+  updatedAt?: string;
 }
 
 export interface TurnResult {

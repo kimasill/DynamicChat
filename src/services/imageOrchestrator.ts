@@ -22,6 +22,7 @@ import {
   readStateMemoryStateType,
   readStateMemoryValue
 } from "./stateMemory";
+import { inferCurrentSceneCharacterIds } from "./sceneCast";
 interface ImagePolicyResult {
   allowed: boolean;
   warnings: string[];
@@ -1253,32 +1254,20 @@ function createCueCharacterPrompts(state: AppState, cue: ImageCue): ImageCueChar
   const explicitPrompts = (cue.characterPrompts ?? [])
     .map((prompt, index) => normalizeCueCharacterPrompt(prompt, index))
     .filter((prompt): prompt is ImageCueCharacterPrompt => Boolean(prompt));
-  const legacyCharacterTags = uniqueStrings(cue.tags.flatMap((tag) => promptToTags(tag)).filter(isCharacterPromptTag));
+  const allCueTags = uniqueStrings([...(cue.baseTags ?? []), ...(cue.tags ?? [])]);
+  const legacyCharacterTags = uniqueStrings(allCueTags.flatMap((tag) => promptToTags(tag)).filter(isCharacterPromptTag));
 
   if (explicitPrompts.length > 0) {
-    // The LLM authors each character's action/expression/pose and identifies the character by id; DynamicChat
-    // injects that registered character's stored appearance + current outfit so the saved identity is always present.
-    // Identity (hair/eyes/face/body) is ALWAYS injected so a visible character stays the right character. Only the
-    // stored OUTFIT is conditionally skipped, and only when this character's own tags assert explicit full nudity.
     const composed = explicitPrompts.map((prompt, index) =>
       composeCharacterPrompt(state, prompt, index === 0 ? legacyCharacterTags : [])
     );
-    const coveredIds = new Set(composed.map((prompt) => prompt.characterId).filter((id): id is string => Boolean(id)));
-    const missingRegistered = cue.characters.filter(
-      (characterId) => !coveredIds.has(characterId) && hasRegisteredVisualProfile(state, characterId)
-    );
-    const supplemental = missingRegistered.map((characterId) =>
-      composeCharacterPrompt(state, { characterId, prompt: "" }, [])
-    );
-    const all = [...composed, ...supplemental].filter((prompt) => prompt.prompt.trim());
-    return rebalanceCharacterCenters(all);
+    return rebalanceCharacterCenters(composed.filter((prompt) => prompt.prompt.trim()));
   }
 
   if (legacyCharacterTags.length === 0) {
     return [];
   }
 
-  // Legacy fallback (no LLM-authored character_prompts): keep the flat tags only, with no local profile injection.
   const characterIds = cue.characters.length > 0 ? cue.characters : [undefined];
   return characterIds.map((characterId, index) => ({
     characterId,
@@ -1342,11 +1331,37 @@ function composeCharacterPrompt(
     prompt.characterId && !assertsFullNudity(llmTags)
       ? resolveCurrentCharacterOutfit(state, prompt.characterId)
       : [];
-  const composedTags = uniqueStrings([...llmTags, ...continuityTags, ...extraLeadingTags, ...outfit, ...identity]);
+  // Gender/subject tags lead the caption. Identity used to be appended last, so in a long caption (up to 45
+  // authored tags plus continuity and outfit) the one tag that tells NovelAI this figure is a man or a woman
+  // sat at the very end, where it is weakest — a reliable way to get a male caption rendered as a second
+  // female. The rest of the identity (hair/eyes/face/body) stays at the tail as before.
+  const { subject: identitySubject, rest: identityRest } = splitSubjectIdentityTags(identity);
+  const composedTags = uniqueStrings([
+    ...identitySubject,
+    ...llmTags,
+    ...continuityTags,
+    ...extraLeadingTags,
+    ...outfit,
+    ...identityRest
+  ]);
   return {
     ...prompt,
     prompt: composedTags.join(", ")
   };
+}
+
+/** Splits saved identity tags into the subject/gender assertions and everything else. */
+function splitSubjectIdentityTags(identity: string[]): { subject: string[]; rest: string[] } {
+  const subject: string[] = [];
+  const rest: string[] = [];
+  for (const tag of identity) {
+    if (hasMaleSubjectAssertion([tag]) || hasFemaleSubjectAssertion([tag])) {
+      subject.push(tag);
+    } else {
+      rest.push(tag);
+    }
+  }
+  return { subject, rest };
 }
 
 function resolveCurrentCharacterOutfit(state: AppState, characterId: string): string[] {
@@ -1436,11 +1451,6 @@ function resolveRegisteredCharacterTags(
   return { identity: promptToTags(profile.positivePrompt) };
 }
 
-function hasRegisteredVisualProfile(state: AppState, characterId: string): boolean {
-  const profile = state.visualProfiles.find((candidate) => candidate.characterId === characterId);
-  return Boolean(profile && (profile.positivePrompt.trim() || profile.defaultOutfitPrompt.trim()));
-}
-
 function rebalanceCharacterCenters(prompts: ImageCueCharacterPrompt[]): ImageCueCharacterPrompt[] {
   if (prompts.length <= 1) {
     return prompts;
@@ -1474,7 +1484,7 @@ function createDefaultCharacterCenter(index: number, total: number): { x: number
 }
 
 function createContextTags(state: AppState, cue: ImageCue, hasCharacterPrompts = false): string[] {
-  const baseSource = cue.baseTags && cue.baseTags.length > 0 ? cue.baseTags : cue.tags;
+  const baseSource = uniqueStrings([...(cue.baseTags ?? []), ...(cue.tags ?? [])]);
   const contextTags = uniqueStrings(baseSource.flatMap((tag) => promptToTags(tag)))
     .filter((tag) => !shouldRouteToNegativePrompt(tag))
     .filter((tag) => !hasCharacterPrompts || !isCharacterPromptTag(tag));

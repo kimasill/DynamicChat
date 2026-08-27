@@ -201,7 +201,7 @@ const contentRatingOptions: Array<{ value: ContentRating; label: string; detail:
   { value: "general", label: "일반", detail: "기본 진행 등급" },
   { value: "adult_19", label: "19+ 성인 전용", detail: "성인용 API/이미지 수위로 전환" }
 ];
-const novelAiModelPresets: NovelAiModelPreset[] = ["NAID4.5F", "NAID4.5C", "NAID4.0F", "NAID4.0C", "NAID3"];
+const novelAiModelPresets: NovelAiModelPreset[] = ["NAID5F", "NAID5C", "NAID5", "NAID4.5F", "NAID4.5C", "NAID4.0F", "NAID4.0C", "NAID3"];
 const novelAiSamplers = ["k_euler", "k_euler_ancestral", "k_dpmpp_2m", "k_dpmpp_2s_ancestral", "k_dpmpp_sde", "k_dpmpp_2m_sde", "ddim_v3"];
 const novelAiNoiseSchedules: NovelAiNoiseSchedule[] = ["karras", "native", "exponential", "polyexponential"];
 const novelAiAutomationTerminations: NovelAiAutomationTermination[] = ["unlimited", "timer", "count"];
@@ -255,8 +255,10 @@ const llmProviderOptions: Array<{
     value: "gemini",
     label: "Gemini",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-    defaultModel: "gemini-3-pro-preview",
+    defaultModel: "gemini-3.7-flash",
     models: [
+      "gemini-3.7-flash",
+      "gemini-3.7-pro",
       "gemini-3.1-pro-preview",
       "gemini-3-pro-preview",
       "gemini-3-flash-preview",
@@ -264,6 +266,7 @@ const llmProviderOptions: Array<{
       "gemini-2.5-pro",
       "gemini-2.5-flash",
       "gemini-2.5-flash-lite",
+      "gemini-2.0-flash",
       "gemini-flash-latest"
     ],
     keyPlaceholder: "AIza...",
@@ -315,17 +318,44 @@ const llmProviderOptions: Array<{
     value: "gemini_cli",
     label: "Gemini 구독 CLI",
     baseUrl: "",
-    defaultModel: "gemini-3-pro-preview",
+    defaultModel: "gemini-3.7-flash",
     models: [
+      "gemini-3.7-flash",
+      "gemini-3.7-pro",
       "gemini-3.1-pro-preview",
       "gemini-3-pro-preview",
       "gemini-3-flash-preview",
       "gemini-3.1-flash-lite-preview",
       "gemini-2.5-pro",
       "gemini-2.5-flash",
-      "gemini-2.5-flash-lite"
+      "gemini-2.5-flash-lite",
+      "gemini-2.0-flash"
     ],
     keyPlaceholder: "구독 CLI — API 키 불필요",
+    advancedBaseUrl: false
+  },
+  {
+    value: "antigravity_cli",
+    label: "Antigravity CLI (agy)",
+    baseUrl: "",
+    defaultModel: "gemini-3.7-flash-high",
+    models: [
+      "gemini-3.7-flash-high",
+      "gemini-3.7-flash-medium",
+      "gemini-3.7-flash-low",
+      "gemini-3.6-flash-high",
+      "gemini-3.6-flash-medium",
+      "gemini-3.6-flash-low",
+      "gemini-3.5-flash-high",
+      "gemini-3.5-flash-medium",
+      "gemini-3.5-flash-low",
+      "gemini-3.1-pro-high",
+      "gemini-3.1-pro-low",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6-thinking",
+      "gpt-oss-120b-medium"
+    ],
+    keyPlaceholder: "구독 CLI — API 키 불필요 (agy 로그인)",
     advancedBaseUrl: false
   }
 ];
@@ -5886,22 +5916,7 @@ function App() {
       // Position-based keys line up because realtime turns keep their initial image_cues array stable.
       // Expansion handles distinct appended tail cues (their cueIndex restarts at 0) that the early path
       // never touched, so it keeps the original append behavior and is exempt from the claim.
-      const ownedCueIndexes = new Set<number>();
-      if (!isExpansion) {
-        const claimTurnId = result.assistantMessage.id;
-        const claimCueCount = result.sidecar?.imageCues.length ?? 0;
-        for (let cueIndex = 0; cueIndex < claimCueCount; cueIndex += 1) {
-          const key = `${claimTurnId}:cue${cueIndex}`;
-          if (!dispatchedImageCueKeysRef.current.has(key)) {
-            dispatchedImageCueKeysRef.current.add(key);
-            ownedCueIndexes.add(cueIndex);
-          }
-        }
-        if (claimCueCount > 0 && ownedCueIndexes.size === 0) {
-          // Every cue this call would handle was already claimed by the early path; nothing to dispatch.
-          return;
-        }
-      }
+      const claimTurnId = result.assistantMessage.id;
       try {
         const runtimeSnapshot = preResolvedSnapshot ?? (await resolveStateWithRuntimeSecrets(snapshot));
         const imagePlan = await planImageJobForCompletedTurn(runtimeSnapshot, {
@@ -5914,14 +5929,23 @@ function App() {
           manualImage: manual
         });
         const plannedImageJobs = imagePlan.imageJobs.length > 0 ? imagePlan.imageJobs : imagePlan.imageJob ? [imagePlan.imageJob] : [];
-        // For the initial dispatch, keep only jobs whose cue position this call owns (claimed above) so the
-        // early path's cues are never re-fired. Expansion (and jobs without a numeric cueIndex) run as-is.
-        const imageJobs = isExpansion
-          ? plannedImageJobs
-          : plannedImageJobs.filter((job) => {
-              const cueIndex = (job.providerPayload as { cueIndex?: unknown }).cueIndex;
-              return typeof cueIndex === "number" ? ownedCueIndexes.has(cueIndex) : true;
-            });
+        // Keep only jobs that haven't been dispatched yet (claimed via dispatchedImageCueKeysRef) so mid-stream
+        // early dispatches are not re-fired, while all cadence-expanded paragraph cues are dispatched.
+        const imageJobs: ImageGenerationJob[] = [];
+        if (!isExpansion) {
+          plannedImageJobs.forEach((job, index) => {
+            const cueIndex = typeof (job.providerPayload as { cueIndex?: unknown }).cueIndex === "number"
+              ? (job.providerPayload as { cueIndex: number }).cueIndex
+              : index;
+            const key = `${claimTurnId}:cue${cueIndex}`;
+            if (!dispatchedImageCueKeysRef.current.has(key)) {
+              dispatchedImageCueKeysRef.current.add(key);
+              imageJobs.push(job);
+            }
+          });
+        } else {
+          imageJobs.push(...plannedImageJobs);
+        }
         const primaryImageJob = imagePlan.imageJob && imageJobs.includes(imagePlan.imageJob) ? imagePlan.imageJob : imageJobs[0];
         const reusedAssetIds = imagePlan.reusedAssetIds ?? [];
         if (imageJobs.length === 0 && reusedAssetIds.length === 0 && plannedImageJobs.length > 0) {
@@ -6060,10 +6084,12 @@ function App() {
   // background completion retry produces (realtime image pipeline: start fast, fill in the rest).
   const planTurnImagesWithExpansion = useCallback(
     async (result: TurnResult, snapshot: AppState, manual: boolean, preResolvedSnapshot?: AppState) => {
-      // Image cues are now authored by requestTurnAnnotations inside runSimulationTurn and embedded in
-      // result.sidecar.imageCues. Use them directly — no separate image-cue LLM call here.
       const imageCues = result.sidecar?.imageCues ?? [];
-      if (imageCues.length === 0) {
+      const isAutoActive =
+        snapshot.imageProfile.enabled &&
+        snapshot.simulation.realtimeImageEnabled &&
+        (snapshot.imageProfile.triggerMode === "realtime_auto" || snapshot.imageProfile.triggerMode === "realtime_confirm");
+      if (imageCues.length === 0 && !isAutoActive && !manual) {
         return;
       }
       await planAndQueueImageForTurn(result, snapshot, manual, preResolvedSnapshot);
@@ -14323,8 +14349,8 @@ function SettingsPanel({
   const llmNeedsSecret = state.llm.provider !== "mock" && !llmHasSecret;
   const novelAiHasSecret = hasStoredSecret(state.novelAi);
   const novelAiNeedsSecret = state.novelAi.enabled && state.novelAi.requestMode !== "mock" && !novelAiHasSecret;
-  // v4/v4.5는 generate 전에 참조 이미지를 encode-vibe로 인코딩해야 한다. v3는 원본 이미지를 직접 전송한다.
-  const requiresVibeEncoding = state.novelAi.modelPreset.startsWith("NAID4");
+  // v4/v4.5/v5는 generate 전에 참조 이미지를 encode-vibe로 인코딩해야 한다. v3는 원본 이미지를 직접 전송한다.
+  const requiresVibeEncoding = state.novelAi.modelPreset.startsWith("NAID4") || state.novelAi.modelPreset.startsWith("NAID5");
   const canEncodeVibe = state.novelAi.requestMode !== "mock" && novelAiHasSecret;
   const llmStatusLabel = state.llm.provider === "mock" ? "mock" : llmHasSecret ? "키 등록됨" : "키 필요";
   const novelAiStatusLabel = !state.novelAi.enabled ? "비활성" : state.novelAi.requestMode === "mock" ? "mock" : novelAiHasSecret ? "토큰 등록됨" : "토큰 필요";

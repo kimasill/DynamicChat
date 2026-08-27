@@ -23,6 +23,7 @@ import { createSecuritySettings, normalizeSecuritySettings } from "../services/s
 import { toShareableLlmSettings, toShareableNovelAiSettings } from "../services/runtimeApiSettings";
 import { createDefaultProgressRunId, normalizeProgressRuns } from "../services/progressRuns";
 import { resolveNovelAiModelName } from "../services/novelAiModels";
+import { womanLifeSeedState } from "./womanLifeSeed";
 
 const now = "2026-05-03T00:00:00.000Z";
 const defaultOutfitPrompt = "";
@@ -1028,7 +1029,7 @@ export const sunnyLineSeedState: AppState = {
   selectedContextPackId: "sunny_ctx_seed"
 };
 
-export const builtInSimulationStates: AppState[] = [seedState, sunnyLineSeedState];
+export const builtInSimulationStates: AppState[] = [womanLifeSeedState, seedState, sunnyLineSeedState];
 
 function normalizeContentRating(value: unknown): ContentRating {
   return value === "adult_19" ? "adult_19" : "general";

@@ -288,7 +288,11 @@ const CLI_AGENT_DEFAULT_COMMANDS = {
   codex: ["codex", "exec", "--model", "{model}", "-"],
   // --skip-trust: the bridge spawns gemini headlessly in the data dir (an untrusted workspace), which it otherwise
   // refuses with exit 55. Gemini reads the piped stdin as the prompt and runs non-interactively (no -p flag needed).
-  gemini: ["gemini", "--skip-trust", "--model", "{model}"]
+  gemini: ["gemini", "--skip-trust", "--model", "{model}"],
+  // antigravity → the `agy` CLI (Google's terminal coding agent that replaced the individual gemini CLI).
+  // `agy` reads the piped stdin as the prompt when no -p flag is provided and runs non-interactively.
+  // Passing prompt via stdin prevents Windows cmd.exe command line length limits (~8191 chars) on full simulation prompts.
+  antigravity: ["agy", "--model", "{model}", "--disable-slash-commands"]
 };
 
 // Streaming variants. `claude --output-format stream-json --verbose --include-partial-messages` emits
@@ -305,7 +309,8 @@ const CLI_AGENT_STREAM_COMMANDS = {
 const CLI_AGENT_ENV_OVERRIDES = {
   claude: "DYNAMICCHAT_CLI_CLAUDE",
   codex: "DYNAMICCHAT_CLI_CODEX",
-  gemini: "DYNAMICCHAT_CLI_GEMINI"
+  gemini: "DYNAMICCHAT_CLI_GEMINI",
+  antigravity: "DYNAMICCHAT_CLI_ANTIGRAVITY"
 };
 
 // Kept below the client-side CLI ceiling (MAX_CLI_AGENT_REQUEST_TIMEOUT_MS = 300s in llmClient)
@@ -329,14 +334,17 @@ async function proxyLlmCliAgent(_request, response) {
 
   const agent = String(payload.agent ?? "").toLowerCase();
   if (!Object.prototype.hasOwnProperty.call(CLI_AGENT_DEFAULT_COMMANDS, agent)) {
-    sendJson(response, 400, { error: `Unsupported CLI agent: ${agent || "(none)"}. Use claude, codex, or gemini.` });
+    sendJson(response, 400, { error: `Unsupported CLI agent: ${agent || "(none)"}. Use claude, codex, gemini, or antigravity.` });
     return;
   }
 
-  const model = sanitizeCliModel(payload.model);
+  let model = sanitizeCliModel(payload.model);
   if (payload.model && !model) {
     sendJson(response, 400, { error: "Invalid model name for CLI agent." });
     return;
+  }
+  if (agent === "antigravity") {
+    model = normalizeAntigravityModel(model);
   }
 
   const systemPrompt = typeof payload.systemPrompt === "string" ? payload.systemPrompt : "";
@@ -369,12 +377,13 @@ async function proxyLlmCliAgent(_request, response) {
     }
   };
 
-  const [command, ...args] = resolveCliAgentArgv(agent, model, { stream: wantStream }, sysPromptFilePath);
+  const [command, ...args] = resolveCliAgentArgv(agent, model, { stream: wantStream, prompt: fullPrompt }, sysPromptFilePath);
 
   // claude receives its system prompt via --system-prompt-file (above); its stdin carries only the
-  // user turn so the two don't collide. Other agents (codex, gemini) get the combined system+user
-  // prompt via stdin, unchanged from before.
-  const stdinText = agent === "claude" ? (userPrompt.trim() || fullPrompt) : fullPrompt;
+  // user turn so the two don't collide. Other agents (codex/gemini/antigravity) get the combined prompt via stdin.
+  const stdinText =
+    agent === "claude" ? (userPrompt.trim() || fullPrompt) : fullPrompt;
+  const spawnWithoutShell = agent === "antigravity";
 
   const describeSpawnError = (error) =>
     error?.code === "ENOENT"
@@ -418,6 +427,7 @@ async function proxyLlmCliAgent(_request, response) {
       result = await runCliAgentProcess(command, args, stdinText, {
         idleTimeoutMs,
         maxTimeoutMs: cliAgentStreamMaxTimeoutMs,
+        shell: spawnWithoutShell ? false : undefined,
         // claude spawns in a neutral directory outside the project to prevent it from loading
         // the DynamicChat git context or CLAUDE.md. codex/gemini stay in dataDir (gemini
         // requires --skip-trust and is already scoped; codex has no similar cwd restriction).
@@ -481,6 +491,7 @@ async function proxyLlmCliAgent(_request, response) {
 
   try {
     const result = await runCliAgentProcess(command, args, stdinText, {
+      shell: spawnWithoutShell ? false : undefined,
       cwd: agent === "claude" ? claudeNeutralCwd : undefined
     });
     if (result.code !== 0) {
@@ -507,6 +518,26 @@ function sanitizeCliModel(value) {
   return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(trimmed) ? trimmed : "";
 }
 
+function normalizeAntigravityModel(model) {
+  if (!model) return "gemini-3.7-flash-high";
+  const exactMappings = {
+    "gemini-3.7-flash": "gemini-3.7-flash-high",
+    "gemini-3.7-pro": "gemini-3.1-pro-high",
+    "gemini-3.1-pro": "gemini-3.1-pro-high",
+    "gemini-3.6-flash": "gemini-3.6-flash-high",
+    "gemini-3.5-flash": "gemini-3.5-flash-high",
+    "gemini-2.0-flash": "gemini-3.7-flash-high",
+    "gemini-flash-latest": "gemini-3.7-flash-high"
+  };
+  if (exactMappings[model]) {
+    return exactMappings[model];
+  }
+  if (model.startsWith("gemini-") && !/-(high|medium|low)$/u.test(model)) {
+    return `${model}-high`;
+  }
+  return model;
+}
+
 function resolveCliAgentArgv(agent, model, options = {}, systemPromptFile = "") {
   const override = process.env[CLI_AGENT_ENV_OVERRIDES[agent]]?.trim();
   // An explicit env override always wins; otherwise the streaming variant (if any) is used for streaming
@@ -517,6 +548,18 @@ function resolveCliAgentArgv(agent, model, options = {}, systemPromptFile = "") 
   const argv = [];
   for (let index = 0; index < template.length; index += 1) {
     const token = template[index];
+    if (token.includes("{prompt}")) {
+      const promptText = typeof options.prompt === "string" ? options.prompt : "";
+      if (!promptText) {
+        const previous = argv[argv.length - 1];
+        if (index > 0 && previous && previous.startsWith("-")) {
+          argv.pop();
+        }
+        continue;
+      }
+      argv.push(promptText);
+      continue;
+    }
     if (token.includes("{model}")) {
       // No model selected: drop the placeholder AND the flag that introduces it (e.g. "--model"), otherwise the agent
       // sees a dangling flag with no value (e.g. `gemini --model` → "Not enough arguments following: model").
@@ -557,7 +600,7 @@ function runCliAgentProcess(command, args, stdinText, options = {}) {
       // Callers may supply a custom cwd (e.g. claudeNeutralCwd for the claude bridge).
       // Defaults to dataDir (the original behavior for codex and gemini).
       cwd: options.cwd ?? dataDir,
-      shell: process.platform === "win32",
+      shell: options.shell ?? process.platform === "win32",
       windowsHide: true,
       // Lean-completion env for the claude CLI (ignored by codex/gemini): disable extended thinking so it does
       // not burn thousands of hidden reasoning tokens (the main cause of ~14 tok/s, 466s turns), and skip

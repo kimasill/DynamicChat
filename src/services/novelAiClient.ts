@@ -159,8 +159,8 @@ function createNovelAiPayload(input: {
   }
 
   if (state.novelAi.vibeTransferEnabled) {
-    if (model.includes("nai-diffusion-4")) {
-      // v4/v4.5는 encode-vibe로 사전 인코딩한 vibe만 받는다. information extracted는 인코딩 단계에 반영된다.
+    if (model.includes("nai-diffusion-4") || model.includes("nai-diffusion-5")) {
+      // v4/v4.5/v5는 encode-vibe로 사전 인코딩한 vibe만 받는다. information extracted는 인코딩 단계에 반영된다.
       const references = state.novelAi.vibeTransferReferences.filter((reference) => reference.encodedVibe?.trim());
       if (references.length > 0) {
         baseParameters.reference_image_multiple = references.map((reference) => reference.encodedVibe!.trim());
@@ -177,7 +177,7 @@ function createNovelAiPayload(input: {
     }
   }
 
-  if (model.includes("nai-diffusion-4")) {
+  if (model.includes("nai-diffusion-4") || model.includes("nai-diffusion-5")) {
     const cueCharacterPrompts = resolveNovelAiCharacterPrompts(input.cue);
     const characterCaptions: Array<{ char_caption: string; centers: Array<{ x: number; y: number }> }> = cueCharacterPrompts
       .map((prompt, index, prompts) => ({
@@ -231,7 +231,8 @@ function resolveNovelAiCharacterPrompts(cue: ImageCue): NonNullable<ImageCue["ch
     return explicitPrompts;
   }
 
-  const characterTags = cue.tags
+  const allTags = Array.from(new Set([...(cue.baseTags ?? []), ...(cue.tags ?? [])]));
+  const characterTags = allTags
     .flatMap((tag) => tag.split(","))
     .map((tag) => tag.trim())
     .filter(isNovelAiCharacterPromptTag);
@@ -273,7 +274,7 @@ function clampVibeValue(value: number): number {
 }
 
 function getVarPlusSigma(preset: NovelAiModelPreset): number {
-  return preset === "NAID4.5F" || preset === "NAID4.5C" ? 58 : 19;
+  return preset === "NAID5F" || preset === "NAID5C" || preset === "NAID5" || preset === "NAID4.5F" || preset === "NAID4.5C" ? 58 : 19;
 }
 
 function normalizeApiToken(value: string): string {

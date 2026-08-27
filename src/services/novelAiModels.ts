@@ -1,7 +1,10 @@
 import type { NovelAiModelPreset } from "../types";
 
-export function resolveNovelAiModelName(preset: NovelAiModelPreset, fallback = "nai-diffusion-4-5-curated"): string {
+export function resolveNovelAiModelName(preset: NovelAiModelPreset, fallback = "nai-diffusion-5-curated"): string {
   const models: Record<NovelAiModelPreset, string> = {
+    "NAID5F": "nai-diffusion-5-full",
+    "NAID5C": "nai-diffusion-5-curated",
+    "NAID5": "nai-diffusion-5",
     "NAID4.5F": "nai-diffusion-4-5-full",
     "NAID4.5C": "nai-diffusion-4-5-curated",
     "NAID4.0F": "nai-diffusion-4-full",

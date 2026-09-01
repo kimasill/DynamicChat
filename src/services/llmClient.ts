@@ -10,8 +10,25 @@ import type {
   PromptModule
 } from "../types";
 import { cliAgentKindForProvider, isCliAgentLlmProvider } from "../types";
-import { getLlmCliAgentProxyUrl } from "./dynamicChatApi";
+import { getLlmChatProxyUrl, getLlmCliAgentProxyUrl } from "./dynamicChatApi";
+import {
+  clampProviderTemperature,
+  getLlmProviderPreset,
+  isReasoningModel,
+  supportsJsonResponseFormat,
+  type LlmProviderPreset
+} from "./llmProviders";
 import { createImageUserRulesForContentRating, isAdultContentMode } from "./contentRating";
+import { normalizeImageCueFrame } from "./imageFrame";
+import {
+  buildWithinBudget,
+  estimateTokens,
+  includesOptionalReferenceBlocks,
+  resolveAnnotationPromptBudget,
+  resolveContextTokens,
+  resolveScenePresetLimit,
+  type PromptDetailTier
+} from "./promptBudget";
 import { IMAGE_STATE_TYPE_INSTRUCTION } from "./imageStateTags";
 import { createStructuredContextSummary, describeRelationshipParameterValue } from "./memoryCompiler";
 import { createSceneCastPromptBlock, inferCurrentSceneCharacterIds } from "./sceneCast";
@@ -29,6 +46,14 @@ interface OpenAiCompatibleChoice {
   message?: {
     content?: string | Array<{ type?: string; text?: string }>;
     refusal?: string;
+    /**
+     * Chain-of-thought, returned alongside `content` by DeepSeek-reasoner-class models and by the thinking
+     * modes of Qwen/GLM. It is NEVER the answer — surfacing it would render raw reasoning as the narrative —
+     * but knowing it arrived turns a mystifying "empty response" into "the budget went to reasoning".
+     */
+    reasoning_content?: string;
+    /** OpenRouter's name for the same field. */
+    reasoning?: string;
   };
   text?: string;
   finish_reason?: string;
@@ -36,6 +61,12 @@ interface OpenAiCompatibleChoice {
 
 interface OpenAiCompatibleResponse {
   choices?: OpenAiCompatibleChoice[];
+  /**
+   * Aggregators and self-hosted servers frequently answer HTTP 200 with an error envelope and no choices
+   * (upstream failure, moderation, out of credit, context overflow). Without this the real message was
+   * discarded and the operator saw a generic "no content" error.
+   */
+  error?: { message?: string; code?: string | number; type?: string };
 }
 
 interface GeminiSafetyRating {
@@ -76,7 +107,19 @@ interface ProviderTextOptions {
   allowRecovery?: boolean;
   allowProviderSafeRecovery?: boolean;
   onRawText?: (rawText: string) => void;
+  /**
+   * Ask the backend to guarantee a JSON object. Set for the annotation/image-cue passes, whose output is
+   * parsed as strict JSON — open-weight models are far less disciplined about that than the hosted tier, and
+   * a malformed reply degrades into cues with missing character prompts (the wrong-cast failure).
+   */
+  jsonResponse?: boolean;
 }
+
+/**
+ * Providers that rejected `response_format` this session. Set on the 400 that names the field, so the retry
+ * without it happens once per provider rather than on every turn.
+ */
+const jsonResponseFormatUnsupported = new Set<string>();
 
 class LlmRateLimitError extends Error {
   readonly retryAfterMs: number;
@@ -233,7 +276,7 @@ export async function generateAssistantText(input: {
   fallback: string;
   manualImage?: boolean;
   // When true, the narrative LLM does NOT author image_cues at all — a separate image-cue LLM call
-  // (requestTurnImageCues) plans the visuals afterward. Keeps tag rules out of the narrative prompt.
+  // (requestTurnAnnotations) plans the visuals afterward. Keeps tag rules out of the narrative prompt.
   separateImageCues?: boolean;
   onAssistantText?: (assistantText: string) => void;
   onEarlyImageCues?: (cues: AssistantImageCueDraft[]) => void;
@@ -250,19 +293,41 @@ export async function generateAssistantText(input: {
 }> {
   const { state } = input;
   const outputTokenBudget = resolveInteractiveOutputTokenBudget(state);
-  const contextBlock = createContextBlock(state, input.userText, input.modules, input.evidence, {
-    manualImage: input.manualImage,
-    outputTokenBudget,
-    omitImageAuthoring: input.separateImageCues
-  });
-  const runtimeInstruction = createRuntimeInstruction(state, outputTokenBudget, {
-    manualImage: input.manualImage,
-    modules: input.modules,
-    omitImageAuthoring: input.separateImageCues
-  });
+  // Fit the narrative prompt to the model's window, the way the annotation pass already does.
+  //
+  // Measured on the shipped full-size simulation (39 enabled modules, 17.4k characters of module bodies),
+  // this prompt reaches ~16.5k tokens — larger than a 16k context on its own, before the reply. Until now
+  // only the reply was clamped, so the request went out over-budget and the provider rejected it or the
+  // model produced a truncated turn. Retrieved modules are the compressible part: they are already ranked,
+  // so the lowest-ranked ones are dropped until the prompt fits, and the drop is reported rather than
+  // silently swallowed.
+  const fittedNarrative = fitNarrativePromptToContext(state, input, outputTokenBudget);
+  const { contextBlock, runtimeInstruction, droppedModuleCount } = fittedNarrative;
+  if (droppedModuleCount > 0 || fittedNarrative.transcriptScale !== undefined) {
+    console.warn("[narrative] trimmed the prompt to fit the model context", {
+      droppedModuleCount,
+      keptModuleCount: input.modules.length - droppedModuleCount,
+      transcriptScale: fittedNarrative.transcriptScale ?? 1,
+      contextTokens: resolveContextTokens(state)
+    });
+  }
+  if (fittedNarrative.foundationExceedsBudget) {
+    // Name the lever that measurement actually supports. The obvious advice — "shorten the main prompt" —
+    // is wrong on a real simulation: measured on the shipped full-size one the creator's main rules are
+    // ~2.4k tokens of a ~12.5k prompt, so deleting all of it would not close the gap. A larger context is
+    // the effective fix, and the annotation pass can be pointed at a second, smaller model that has one.
+    console.warn(
+      "[narrative] the prompt does not fit this model's context even after trimming; the reply budget is " +
+        "reduced to compensate. Raise the context size in LLM settings, or use a model with a larger window.",
+      { contextTokens: resolveContextTokens(state) }
+    );
+  }
   const requestPreview = createRequestPreview(runtimeInstruction, contextBlock, input.userText);
 
-  const requiresApiKey = !isCliAgentLlmProvider(state.llm.provider);
+  // Comes from the preset, not from "is it a CLI bridge": local servers (Ollama, LM Studio, self-hosted
+  // OpenAI-compatible) take unauthenticated requests, and gating them on a key made them fall silently back
+  // to the mock response with no request ever sent.
+  const requiresApiKey = getLlmProviderPreset(state.llm.provider).requiresApiKey;
   if (!state.llm.enabled || state.llm.provider === "mock" || (requiresApiKey && !state.llm.apiKey.trim())) {
     return {
       content: input.fallback,
@@ -288,6 +353,11 @@ export async function generateAssistantText(input: {
     let sidecarExpansion: Promise<AssistantSidecar | undefined> | undefined;
     let rawContent = await requestProviderTextWithRecovery(state, input, runtimeInstruction, contextBlock, outputTokenBudget, {
       allowProviderSafeRecovery: true,
+      // The narrative pass returns a JSON envelope too ({assistant_text, memory_events}), so ask the backend
+      // to guarantee it where it can. This is what stops a weaker open-weight model writing an unescaped
+      // quote inside the story and spilling the rest of the envelope into the reply — observed on
+      // qwen3:14b, where a line opened with " and closed with 』 and the turn ended in raw JSON.
+      jsonResponse: supportsJsonResponseFormat(state.llm.provider),
       onRawText: onPrimaryRawText
     });
     if (!rawContent?.trim()) {
@@ -733,6 +803,12 @@ export async function generateAssistantText(input: {
       rawPreview: rawContent.slice(0, 700)
     };
   } catch (error) {
+    // A cancelled turn is NOT a provider failure. Falling through to the fallback path here would commit a
+    // synthetic "LLM 실패" assistant message as if it were the turn the user just asked to stop, so the abort
+    // propagates to runTurnFromText, which reports it as 취소됨 and commits nothing.
+    if (isLlmAbortedError(error)) {
+      throw error;
+    }
     const errorMessage = error instanceof Error ? error.message : "Unknown LLM error";
     const fallbackContent = isLlmRateLimitError(error)
       ? createRateLimitFallbackContent(input.fallback, error)
@@ -756,6 +832,104 @@ export async function generateAssistantText(input: {
 // expansion result is consumed for image_cues alone (see planTurnImagesWithExpansion), so the full narrative
 // runtime instruction (memory/persona/format rules) is dead weight a CLI subprocess would re-process. Keep the
 // image tag contract so tag quality is unchanged.
+/**
+ * Builds the narrative prompt at the largest module set that fits the model's context.
+ *
+ * Modules arrive already ranked by the retrieval step, so trimming from the tail drops the least relevant
+ * context first. Foundation content (main rules, persona, recent transcript) is never dropped — losing it
+ * changes who the characters are, which is worse than losing a lore entry.
+ */
+function fitNarrativePromptToContext(
+  state: AppState,
+  input: { userText: string; modules: PromptModule[]; evidence: ContextEvidence[]; manualImage?: boolean; separateImageCues?: boolean },
+  outputTokenBudget: number
+): {
+  contextBlock: string;
+  runtimeInstruction: string;
+  droppedModuleCount: number;
+  foundationExceedsBudget?: boolean;
+  transcriptScale?: number;
+} {
+  const contextTokens = resolveContextTokens(state);
+  // Leave room for the reply and for chat-template/tokenizer drift.
+  const inputTokenBudget = Math.max(1_024, Math.floor(contextTokens * 0.88) - Math.max(MIN_OUTPUT_TOKENS, outputTokenBudget));
+
+  const build = (modules: PromptModule[], tier: PromptDetailTier = "full", transcriptScale = 1) => ({
+    contextBlock: createContextBlock(state, input.userText, modules, input.evidence, {
+      manualImage: input.manualImage,
+      outputTokenBudget,
+      omitImageAuthoring: input.separateImageCues,
+      transcriptScale
+    }),
+    runtimeInstruction: createRuntimeInstruction(state, outputTokenBudget, {
+      manualImage: input.manualImage,
+      modules,
+      omitImageAuthoring: input.separateImageCues,
+      tier
+    })
+  });
+
+  const measure = (candidate: { runtimeInstruction: string; contextBlock: string }) =>
+    estimateTokens(`${candidate.runtimeInstruction}\n${candidate.contextBlock}\n${input.userText}`);
+
+  const full = build(input.modules);
+  if (measure(full) <= inputTokenBudget) {
+    return { ...full, droppedModuleCount: 0 };
+  }
+
+  // Shorten DynamicChat's own rule text before touching the creator's retrieved lore. The scaffolding is
+  // ours and its terse form keeps every rule; a dropped module is content the creator wrote and expected to
+  // be in play. Measured on the full-size simulation this alone recovers enough room to keep all 12 modules.
+  const compact = build(input.modules, "compact");
+  if (measure(compact) <= inputTokenBudget) {
+    return { ...compact, droppedModuleCount: 0 };
+  }
+
+  // Check the floor FIRST. The foundation (main rules, world lore, persona, recent transcript) is never
+  // dropped, so if the prompt does not fit even with zero retrieved modules, dropping them buys nothing —
+  // and discarding every piece of retrieved lore for no gain is strictly worse than keeping it and letting
+  // the reply clamp absorb the overflow. Measured on the shipped full-size simulation at a 16k context this
+  // is exactly what happened: all 12 selected modules were discarded and the prompt still overflowed.
+  const bare = build([], "compact");
+  if (measure(bare) > inputTokenBudget) {
+    // Last resort before the reply budget pays for it: shrink the recent transcript. It is the only
+    // always-present block that grows during a session, so a run that fit at turn 1 can stop fitting at turn
+    // 3 purely because the log got longer — and the visible symptom was the narrative collapsing mid-session.
+    // Losing transcript detail costs continuity; losing the reply budget costs the turn itself.
+    for (const transcriptScale of [0.6, 0.35]) {
+      const trimmed = build(input.modules, "compact", transcriptScale);
+      if (measure(trimmed) <= inputTokenBudget) {
+        return { ...trimmed, droppedModuleCount: 0, transcriptScale };
+      }
+      const trimmedBare = build([], "compact", transcriptScale);
+      if (measure(trimmedBare) <= inputTokenBudget) {
+        return { ...trimmedBare, droppedModuleCount: input.modules.length, transcriptScale };
+      }
+    }
+    return { ...build([], "compact", 0.35), droppedModuleCount: input.modules.length, foundationExceedsBudget: true };
+  }
+
+  // Dropping does help: binary-search the largest prefix that fits, so a 39-module set costs ~6 rebuilds
+  // rather than a linear walk. Modules arrive ranked, so a prefix keeps the most relevant ones.
+  let low = 0;
+  let high = input.modules.length;
+  let best = bare;
+  let bestLength = 0;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = build(input.modules.slice(0, middle), "compact");
+    if (measure(candidate) <= inputTokenBudget) {
+      best = candidate;
+      bestLength = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  return { ...best, droppedModuleCount: input.modules.length - bestLength };
+}
+
 function createImageCueExpansionInstruction(state: AppState): string {
   return [
     "You are DynamicChat's image-cut expander. The turn's assistant_text is ALREADY final and shown to the user; do NOT rewrite, restate, or change it. Produce ONLY the remaining image_cues for that same already-written text.",
@@ -1573,9 +1747,17 @@ function removeRepeatedContinuationPrefix(previousAssistantText: string, continu
 }
 
 function createImageCueVisualProfileBlock(state: AppState, currentUserText = ""): string {
+  // Cast inference is a name/id match against the transcript, so it misses anyone the narrative names only
+  // by pronoun, role, or title. When it misses, this block used to come back EMPTY — leaving the tag author
+  // with no identity or outfit reference for anybody, which is exactly when it invents an appearance or
+  // silently drops the character. Fall back to the roster (capped) so an id is always reachable.
   const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, currentUserText));
-  return state.characters
-    .filter((character) => shouldIncludeCharacterScopedContext(state, character.id, activeCharacterIds))
+  const scopedCharacters = state.characters.filter((character) =>
+    shouldIncludeCharacterScopedContext(state, character.id, activeCharacterIds)
+  );
+  const characters =
+    scopedCharacters.length > 0 ? scopedCharacters : state.characters.slice(0, OFF_LIST_ROSTER_HINT_LIMIT);
+  return characters
     .map((character) => {
       const visualProfile = state.visualProfiles.find((profile) => profile.characterId === character.id);
       if (!visualProfile) {
@@ -1601,12 +1783,14 @@ function createImageCueVisualProfileBlock(state: AppState, currentUserText = "")
 
 function createImageCueCurrentStateBlock(state: AppState, currentUserText = ""): string {
   const activeCharacterIds = new Set(inferCurrentSceneCharacterIds(state, currentUserText));
-  return state.memoryEvents
-    .filter(isCurrentStateMemoryEvent)
-    .filter((event) => {
-      const ownerId = readStateMemoryOwnerId(event);
-      return !ownerId || shouldIncludeCharacterScopedContext(state, ownerId, activeCharacterIds);
-    })
+  const stateEvents = state.memoryEvents.filter(isCurrentStateMemoryEvent);
+  const scopedEvents = stateEvents.filter((event) => {
+    const ownerId = readStateMemoryOwnerId(event);
+    return !ownerId || shouldIncludeCharacterScopedContext(state, ownerId, activeCharacterIds);
+  });
+  // Same reasoning as the visual-profile block: an empty ongoing-state block is worse than a slightly wider
+  // one, because the cut then resets the scene's still-active pose/action instead of continuing it.
+  return (scopedEvents.length > 0 ? scopedEvents : stateEvents)
     .slice(-12)
     .map((event) => {
       const ownerId = readStateMemoryOwnerId(event);
@@ -1624,7 +1808,7 @@ function createImageCueCurrentStateBlock(state: AppState, currentUserText = ""):
 // place so the model can compose image_cues that reflect the cast count, who-is-who, outfits, actions, and
 // who-acts-on-whom without having to cross-reference the scattered cast/profile/state blocks. Tag vocabulary
 // still comes from the model + user rules + presets; this only surfaces existing persisted state.
-function createImageSceneBriefingBlock(state: AppState, currentUserText = ""): string {
+function createImageSceneBriefingBlock(state: AppState, currentUserText = "", compact = false): string {
   const presentIds = inferCurrentSceneCharacterIds(state, currentUserText);
   if (presentIds.length === 0 && state.characters.length === 0) {
     return "";
@@ -1686,17 +1870,27 @@ function createImageSceneBriefingBlock(state: AppState, currentUserText = ""): s
       const subjectHint = profile ? readSubjectHintTags(profile.positivePrompt) : "";
       return `- ${character.name} (character_id: ${character.id})${subjectHint ? ` | ${subjectHint}` : ""}`;
     });
-  const header =
-    (presentIds.length > 0
+  // The full header is a ~2k-character rationale explaining WHY the cast list is a hint rather than the
+  // cast. It earns its place on a large context; on a small one the instruction survives and the
+  // explanation goes.
+  const compactHeader =
+    "The list below is a name match against the transcript, not the cast. YOU decide who is in this turn's scene. " +
+    "For each cut choose the frame first, then emit one character_prompts entry per person visible inside it — including people absent from this list, whom you author in full — and set the subject-count base tag to that visible count. " +
+    "A character who is on-stage but outside the frame (usually the POV observer) gets no entry. " +
+    "Set character_id for a registered character so their saved appearance is injected. " +
+    "Reflect each rendered character's listed outfit, action, expression and condition only to the extent this cut's frame shows them; omitting an out-of-frame attribute is not a state change.";
+  const header = compact
+    ? compactHeader
+    : ((presentIds.length > 0
       ? `DynamicChat name-matched ${presentIds.length} registered character(s) in the recent transcript (listed below). That match is a HINT, not the cast: it cannot see characters the narrative refers to only by pronoun, role, or title, and it does not know who this turn actually shows. `
       : "DynamicChat could not name-match any registered character in the recent transcript. That is a limitation of the match, not evidence that the scene is empty. ") +
     "YOU decide, from the narrative and the current action, who is actually in this turn's scene and who is inside each cut's frame. " +
     "For EACH cut, first decide the camera/framing, then emit one character_prompts entry for every person whose body is visible inside that frame — including people who are NOT in any list here (unnamed men, soldiers, bystanders, crowds), which you author in full yourself — and set the subject-count base tag to that VISIBLE count (e.g. 1girl / 1boy / 2girls / 1girl 1boy). " +
     "A character who is on-stage but NOT in the chosen frame must NOT get an entry in that cut — in particular the point-of-view/observer character whose eyes the shot looks through is usually off-frame, so do not add them just because they are on-stage. Match image_cues.characters to the entries you actually emit; a listed id without an authored entry is NOT rendered. " +
     "When a registered character IS in the frame, set their character_id so their saved appearance is injected — do this even if they are absent from the lists below, using the roster ids given. " +
-    "For each character you DO render, reflect their listed current outfit, ongoing action/pose, expression, condition, and interaction target — keep them unless this turn explicitly changes them. " +
+    "For each character you DO render, reflect their listed current outfit, ongoing action/pose, expression, condition, and interaction target ONLY to the extent this cut's frame shows them: an expression only when the face is toward the viewer and inside the crop, a garment only when the region it covers is inside the crop, posture only when the relevant body region is inside the crop. Omitting an out-of-frame attribute is NOT a wardrobe or posture change — the state is unchanged, it is simply not in this shot. Otherwise keep them unless this turn explicitly changes them. " +
     "Never merge two people into one entry. When one character acts on another, " +
-    "render the interaction from both sides (the actor's pose/hands and the target's reaction/contact point).";
+    "render the interaction from both sides (the actor's pose/hands and the target's reaction/contact point).");
   return [
     header,
     ...lines,
@@ -1729,7 +1923,14 @@ function readSubjectHintTags(positivePrompt: string): string {
   return (subjectTags.length > 0 ? subjectTags : tags.slice(0, 2)).slice(0, 3).join(", ");
 }
 
-function createImageSceneTagPresetBlock(state: AppState, currentUserText = ""): string {
+function createImageSceneTagPresetBlock(
+  state: AppState,
+  currentUserText = "",
+  // Caller-supplied so the block can shrink to fit a small context. This is the second-largest block of the
+  // annotation prompt and the most compressible: it is reference material the model samples from, so fewer
+  // entries degrade the result gradually rather than breaking the contract.
+  limit = IMAGE_SCENE_PRESET_PROMPT_LIMIT
+): string {
   const contextText = [
     currentUserText,
     state.simulation.title,
@@ -1748,7 +1949,7 @@ function createImageSceneTagPresetBlock(state: AppState, currentUserText = ""): 
   }
 
   let exampleBudget = IMAGE_SCENE_PRESET_EXAMPLE_TOTAL;
-  return scoredPresets
+  const entries = scoredPresets
     .sort(
       (a, b) =>
         Number(b.branchScore > 0) - Number(a.branchScore > 0) ||
@@ -1757,7 +1958,7 @@ function createImageSceneTagPresetBlock(state: AppState, currentUserText = ""): 
         a.depth - b.depth ||
         a.order - b.order
     )
-    .slice(0, IMAGE_SCENE_PRESET_PROMPT_LIMIT)
+    .slice(0, limit)
     .map(({ node, path, inheritedTags, inheritedNotes, branchScore, depth }) => {
       const sceneTags = uniqueScenePresetTags(node.tags.filter((tag) => !looksLikeCharacterScenePresetTag(tag))).slice(0, 24);
       const parentTags = uniqueScenePresetTags(inheritedTags.filter((tag) => !looksLikeCharacterScenePresetTag(tag))).slice(0, 12);
@@ -1773,14 +1974,22 @@ function createImageSceneTagPresetBlock(state: AppState, currentUserText = ""): 
         sceneTags.length > 0 ? `base_scene_tags: ${sceneTags.join(", ")}` : undefined,
         parentNotes.length > 0 ? `inherited_creator_notes: ${parentNotes.map((note) => truncatePromptText(note, 120, "parent scene preset note")).join(" / ")}` : undefined,
         node.note.trim() ? `creator_note: ${truncatePromptText(node.note, 260, "scene preset note")}` : undefined,
-        exampleFiles.length > 0 ? `example_prompts: ${formatScenePresetExampleFiles(exampleFiles)}` : undefined,
-        "rule: adapt this branch only if relevant. example_prompts are optional references; when none are provided, author tags normally. example_prompts are the creator's own finished NovelAI prompts for this keyword, optionally split into labeled groups (for example a per-character side/role like a female-side and a male-side group): use each group as a style/structure/tag-vocabulary reference for the matching character_prompt and adapt to the current scene, do not copy verbatim. Scene/composition/shared-action/environment tags go to image_cues.base_tags; expression, exact pose, clothing, body-state, and identity-like tags go to the appropriate image_cues.character_prompts item; do not copy character-identity tags from examples since registered character appearance is injected separately."
+        exampleFiles.length > 0 ? `example_prompts: ${formatScenePresetExampleFiles(exampleFiles)}` : undefined
       ]
         .filter((item): item is string => Boolean(item))
         .join(" | ");
     })
     .join("\n");
+
+  // The usage rule is stated ONCE, as a header. It used to be appended to every preset entry — the
+  // same ~950-character paragraph repeated up to 18 times, which made this block the second-largest
+  // part of the annotation prompt while saying nothing new after the first copy. On a small local
+  // context that duplication alone was most of what pushed the request past the window.
+  return entries ? `${SCENE_PRESET_USAGE_RULE}\n${entries}` : "";
 }
+
+const SCENE_PRESET_USAGE_RULE =
+  "How to use these presets: adapt a branch only if it is relevant to this turn. example_prompts are optional references — when a branch has none, author tags normally. They are the creator's own finished NovelAI prompts for that keyword, sometimes split into labeled groups per character side or role (for example a female-side and a male-side group): use each group as a style/structure/tag-vocabulary reference for the matching character_prompt and adapt it to the current scene, never copy verbatim. Route scene/composition/shared-action/environment tags to image_cues.base_tags, and expression/pose/clothing/body-state/identity-like tags to the matching image_cues.character_prompts item. Never copy character-identity tags from an example: registered character appearance is injected separately.";
 
 interface ScoredImageSceneTagPresetNode {
   node: ImageSceneTagPresetNode;
@@ -2111,7 +2320,13 @@ function createContextBlock(
   currentUserText: string,
   modules: PromptModule[],
   evidence: ContextEvidence[],
-  options: { manualImage?: boolean; outputTokenBudget?: number; omitImageAuthoring?: boolean } = {}
+  options: {
+    manualImage?: boolean;
+    outputTokenBudget?: number;
+    omitImageAuthoring?: boolean;
+    /** Fraction of the normal recent-transcript size to keep, for fitting a small context. */
+    transcriptScale?: number;
+  } = {}
 ): string {
   const creatorOutputFormat = analyzeCreatorOutputFormat(state, modules);
   // The stable creator law (title/premise/main rules/world lore/always-on) has moved to the runtime (system) instruction
@@ -2121,7 +2336,7 @@ function createContextBlock(
   // Narrative audience: strips image-machinery state types and qualitatively bands relationship-map
   // values so the prose model never sees NovelAI tag vocabulary or raw numeric stat values.
   const structuredMemoryText = createStructuredContextSummary(state, { maxEvents: 8, maxStates: 10, currentText: currentUserText, audience: "narrative" });
-  const recentTranscriptText = createRecentTranscriptBlock(state);
+  const recentTranscriptText = createRecentTranscriptBlock(state, options.transcriptScale);
   const turnSelectedModules = modules.filter(
     (module) => !(module.kind === "safety_policy" && isAdultContentMode(state)) && !isFoundationContextModule(module)
   );
@@ -2261,7 +2476,7 @@ function createContextBlock(
     omit ? undefined : imageCadenceText,
     omit ? undefined : "Image cue authoring reference for current-scene visible characters only (reference, do not copy verbatim). Keep only scene/composition/shared-action tags in image_cues.base_tags. For a registered character, set its character_id on a character_prompt and author its action/expression/pose plus any outfit change; DynamicChat injects that character's required_identity_tags and current outfit into the same entry, so do not repeat the saved appearance. Use this reference only to disambiguate which character is which and never to borrow another character's appearance:",
     omit ? undefined : imageVisualProfileText || "(none)",
-    omit ? undefined : "Ongoing scene/visual state for current-scene characters only. These are the situation's still-active pose/action/interaction/position facts AND ongoing physical-detail facts — injuries, bandages, bruises, blood, bodily fluids, sweat/wetness, dirt, trembling, held props, and damaged/loosened/wet clothing state (who is doing what to whom right now, and what marks/conditions their body and clothing currently show). Treat them as continuity that PERSISTS across cuts and turns: every should_generate=true cue — including a close-up or a single body-region focus — must keep the still-active action/interaction/position tags AND the still-true body/clothing-damage detail tags from here, so the cut shows the character actually performing the ongoing action with the same visible condition, never standing idle and never silently healed or re-clothed. When you emit several cuts in one turn, keep these details consistent across all of them and only progress a detail in the direction the scene moves it (a fresh wound, more sweat, clothing torn further). Drop or change one of these only when the assistant_text or current user action explicitly ends, heals, or changes it this turn:",
+    omit ? undefined : "Ongoing scene/visual state for current-scene characters only. These are the situation's still-active pose/action/interaction/position facts AND ongoing physical-detail facts — injuries, bandages, bruises, blood, bodily fluids, sweat/wetness, dirt, trembling, held props, and damaged/loosened/wet clothing state (who is doing what to whom right now, and what marks/conditions their body and clothing currently show). Treat them as continuity that PERSISTS across cuts and turns: every should_generate=true cue must keep the still-active action/interaction/position tags AND the still-true body/clothing-damage detail tags from here — but only the ones its chosen crop can actually show, tested against that cue's frame.visible_regions. So a close-up or a single body-region focus keeps the contact/interaction tags whose contact point is inside the crop (and the marks/conditions on the visible region), and drops whole-body posture and detail belonging to regions outside it. The cut must still read as the character performing the ongoing action with the same visible condition — never standing idle and never silently healed or re-clothed. If none of the ongoing action is visible at your chosen crop, widen the crop. When you emit several cuts in one turn, keep these details consistent across all of them and only progress a detail in the direction the scene moves it (a fresh wound, more sweat, clothing torn further). Drop or change one of these only when the assistant_text or current user action explicitly ends, heals, or changes it this turn:",
     omit ? undefined : imageCurrentStateText || "(none)",
     "Structured simulation memory:",
     structuredMemoryText,
@@ -2381,6 +2596,67 @@ function isFoundationContextModule(module: PromptModule): boolean {
   return module.kind === "main_prompt" || module.kind === "world_lore" || module.tokenPolicy === "always";
 }
 
+/** Lines shorter than this are left alone: the saving is negligible and a short generic line ("---", a
+ *  heading, "- 어휘:") can legitimately recur in two different rule sets. */
+const SYSTEM_PROMPT_DEDUPE_MIN_LINE_LENGTH = 24;
+
+/**
+ * The creator's system prompt with the lines the foundation block already carries removed.
+ *
+ * The settings screen offers an LLM system prompt and the module editor offers a `main_prompt` module, and
+ * creators routinely fill both from the same source. The shipped full-size simulation does exactly this: its
+ * system prompt and its main-rules module share a 2,840-character prefix and then diverge. The runtime sent
+ * the whole of both on every turn — the overlap once bare at the head of the instruction and once more under
+ * the module's title.
+ *
+ * Two properties make this safe to do automatically, and both are load-bearing:
+ *
+ * 1. It matches LINE BY LINE, not whole-string. The two texts are near-duplicates, not copies, so an
+ *    all-or-nothing containment test either keeps the entire overlap (the original behaviour) or deletes the
+ *    creator's unique tail along with it.
+ * 2. It matches against `renderedFoundation` — the text createStableFoundationBlock ACTUALLY emits — not
+ *    against the raw module bodies. Those are not the same set: the block truncates always-on modules to
+ *    1200 characters and drops `image_prompt_profile`, `character_prompt`, and (in adult mode)
+ *    `safety_policy` entirely. Deduping against the raw bodies could therefore delete a creator's line
+ *    against text that never ships, losing an authored rule from BOTH halves of the prompt.
+ */
+function createDeduplicatedSystemPrompt(state: AppState, renderedFoundation: string): string | undefined {
+  const systemPrompt = state.llm.systemPrompt?.trim();
+  if (!systemPrompt) {
+    return undefined;
+  }
+  const normalize = (text: string) => text.replace(/\s+/gu, " ").trim();
+  const foundationLines = new Set(
+    renderedFoundation
+      .split("\n")
+      .map(normalize)
+      .filter((line) => line.length >= SYSTEM_PROMPT_DEDUPE_MIN_LINE_LENGTH)
+  );
+  if (foundationLines.size === 0) {
+    return systemPrompt;
+  }
+
+  const lines = systemPrompt.split("\n");
+  let removed = 0;
+  const kept = lines.filter((line) => {
+    const normalized = normalize(line);
+    if (normalized.length >= SYSTEM_PROMPT_DEDUPE_MIN_LINE_LENGTH && foundationLines.has(normalized)) {
+      removed += 1;
+      return false;
+    }
+    return true;
+  });
+  if (removed === 0) {
+    return systemPrompt;
+  }
+  const deduped = kept.join("\n").replace(/\n{3,}/gu, "\n\n").trim();
+  // If essentially everything was a duplicate, what is left is section headings with no content under them —
+  // more confusing to the model than sending nothing, since the real rules are still in the foundation block.
+  // Tested only on the deduped path: an untouched short system prompt is returned above, so a creator's
+  // deliberate one-line preamble is never discarded.
+  return deduped.length < 40 ? undefined : deduped;
+}
+
 function collectCreatorRulePromptSources(state: AppState, modules: PromptModule[] = []): string {
   const foundationModules = state.modules.filter(
     (module) =>
@@ -2412,8 +2688,14 @@ function collectMainPromptSources(state: AppState): string {
 // directions such as "[심리 및 소통의 시각화]: 적들의 상태를 실시간 출력" — a creative instruction to vividly narrate
 // character states in flowing prose, not to print a UI status panel. The remaining Korean branch ("상태\s*(?:창|표|…)")
 // covers genuine panel nouns (상태창, 상태패널, etc.) without the false-positive risk.
+// `표` is a productive Korean syllable, not a standalone token, and Korean has no word boundaries — so the
+// old `상태\s*표` alternative matched inside 상태 표현 / 상태 표시 / 상태 표출, which are ordinary creative
+// directions about DESCRIBING a character's state, not requests to print a panel. A single such phrase in a
+// creator prompt both told the model to emit a status table every turn and switched off the prose sanitizer.
 const EXPLICIT_STATUS_PANEL_DIRECTIVE =
-  /상태\s*(?:창|표|블록|윈도우|패널|보드)|status\s*(?:window|panel|block|board)|```\s*status|::status\b|\[status\]/iu;
+  // The compound noun 상태표시창 (the ordinary Korean word for a status window/HUD) must match, so it is
+  // listed BEFORE the lookahead that rejects 상태 표현 / 상태 표시 / 상태 표기.
+  /상태\s*표시\s*(?:창|패널|윈도우|보드)|상태\s*(?:창|블록|윈도우|패널|보드)|상태\s*표(?![현시출력기])|스테이터스|status\s*(?:window|panel|block|board)|```\s*status|::status\b|\[status\]/iu;
 
 // A PROHIBITION is not a design. "상태창을 출력하지 않는다" names the same nouns as "상태창을 출력한다", so a keyword test
 // reads a ban as a request, flips the gate on, and disables the very sanitizer the author asked for. Drop the sentences
@@ -2436,15 +2718,25 @@ function mainPromptRequiresVisibleFormat(state: AppState): boolean {
   const main = stripNegatedFormatDirectives(collectMainPromptSources(state));
   return (
     EXPLICIT_STATUS_PANEL_DIRECTIVE.test(main) ||
-    /마크다운\s*표|markdown\s*table|gfm\s*table|pipe\s*table|표\s*(?:형식|로|를|출력|표시)|\|[^|\n]+\|[^|\n]+\|/iu.test(main) ||
+    /마크다운\s*표|markdown\s*table|gfm\s*table|pipe\s*table|표\s*형식|(?<![가-힣])표\s*로(?=\s*\S)|(?:^|\n)\s*\|[^|\n]+\|[^\n]*\n\s*\|\s*:?-+/iu.test(main) ||
     /```\s*(?:scene|impact|whisper|sfx|status|choice|memory|letter)|::(?:scene|impact|whisper|sfx|status|choice|memory|letter)\b|선택지\s*블록|choice\s*block/iu.test(main)
   );
 }
 
 function analyzeCreatorOutputFormat(state: AppState, modules: PromptModule[] = []): CreatorOutputFormatHints {
   const text = stripNegatedFormatDirectives(collectCreatorRulePromptSources(state, modules));
+  // Same Korean-substring hazard: `표\s*를` matched inside 목표를 / 발표를 / 대표를 and `표\s*로` inside
+  // 목표로, so a sentence like "주인공은 목표를 달성해야 한다" was read as "output a markdown table".
+  // A bare `|a|b|` substring also matched any prompt that merely mentions a pipe, so a real pipe-table
+  // example must now span a header line AND a delimiter line to count.
+  // `(?<![가-힣])표로` is what separates a real directive from 목표로 / 대표로: 표 is a productive syllable and
+  // Korean has no word boundaries, so only the absence of a preceding Hangul syllable distinguishes them.
+  // The pipe-table example must still span a header line AND a delimiter line, but GFM's delimiter is legal
+  // at one dash, not three.
   const requiresMarkdownTables =
-    /마크다운\s*표|markdown\s*table|gfm\s*table|pipe\s*table|표\s*(?:형식|로|를)|\|[^|\n]+\|[^|\n]+\|/iu.test(text);
+    /마크다운\s*표|markdown\s*table|gfm\s*table|pipe\s*table|표\s*형식|(?<![가-힣])표\s*로(?=\s*\S)|(?:^|\n)\s*\|[^|\n]+\|[^\n]*\n\s*\|\s*:?-+/iu.test(
+      text
+    );
   const requiresStatusBlock = EXPLICIT_STATUS_PANEL_DIRECTIVE.test(text);
   // Explicit, unambiguous request for a visible choice block (choices are not status, so they stay visible).
   const requiresChoiceBlock = /```\s*choice|::choice\b|선택지\s*블록/iu.test(text);
@@ -2463,7 +2755,10 @@ function analyzeCreatorOutputFormat(state: AppState, modules: PromptModule[] = [
     (!relationshipMapEnabled && looseVisibleSignal);
   // The relationship-map path gates the visible status panel on the MAIN prompt alone: only when the author explicitly
   // asks for a status panel there do we both instruct the model to print it and stop the sanitizer from stripping it.
-  const requiresStatusBlockFromMain = EXPLICIT_STATUS_PANEL_DIRECTIVE.test(collectMainPromptSources(state));
+  // Negation stripping must run here too, or "상태창을 출력하지 않는다" reads as a request for one.
+  const requiresStatusBlockFromMain = EXPLICIT_STATUS_PANEL_DIRECTIVE.test(
+    stripNegatedFormatDirectives(collectMainPromptSources(state))
+  );
   const requiresVisibleFormatFromMain = mainPromptRequiresVisibleFormat(state);
 
   return {
@@ -3245,7 +3540,7 @@ function createImageCueTagContractInstruction(state: AppState): string {
 
     "2. FIELDS. Emit kind, placement, anchor_text, should_generate, characters, base_tags, character_prompts, and — when it helps you commit to a composition — one short `reason` naming who is in frame and the camera. Skip label, priority, scene, visual_context, and the legacy flat `tags` field; base_tags plus per-character character_prompts are the single source of tags.",
 
-    "3. COMPOSITION FIRST, AND IT IS YOUR CALL. Before choosing any tag, decide this cut's camera/framing and what it actually shows (close-up, face focus, upper body, cowboy shot, full body, wide shot, from behind, pov, over-the-shoulder…). Every should_generate cue must commit to exactly one explicit shot/framing tag so the crop is decided rather than ambiguous — shared framing in base_tags, per-character viewpoint detail in that character's entry. Emit tags only for what that frame reveals: no clothing, accessories, jewelry, or props the crop would not show.",
+    "3. COMPOSITION FIRST, AND IT IS YOUR CALL. Work in this order for every cue, and emit the JSON fields in the same order so the order is visible: (a) `frame` — the crop; (b) `characters` + `character_prompts` — who is inside it; (c) each entry's pose/contact; (d) each entry's visible detail; (e) `excluded_by_frame` — what the crop forbids. Fill `frame` FIRST: exactly one `shot` (close_up | face_focus | upper_body | cowboy_shot | full_body | wide_shot), one `viewpoint` (front | side | from_behind | pov | over_the_shoulder), and `visible_regions` listing only the body regions this crop actually shows (head / torso / hips / legs / feet). Mirror the same crop as exactly one explicit shot tag in base_tags. Then emit tags only for what those regions reveal: no clothing, accessories, jewelry, footwear, or props outside them. `visible_regions` is the single test every later rule refers to — DynamicChat also applies it to the appearance and outfit tags it injects, so a region you leave out is genuinely absent from the image.",
 
     "4. WHO IS IN FRAME IS YOUR CALL. After framing, decide which people are inside it. Emit one character_prompts entry for EACH human visible in THIS cut's frame — focus subject, secondary, aggressor, background-but-visible, registered or not. Never merge two people into one entry and never describe a second person inside base_tags or inside another person's entry. image_cues.characters lists only the registered characters you actually author an entry for this cut; an id listed without a matching entry is NOT rendered, and a present-but-off-frame character (typically the observer the shot looks through) belongs in neither.",
 
@@ -3265,7 +3560,7 @@ function createImageCueTagContractInstruction(state: AppState): string {
 
     "12. OUTFIT FOLLOWS THE STORY AND THE CROP. Take the character's current Wearing state as the baseline. Change it only when the narrative changed it (removed/added/torn/wet/displaced) or when the crop reveals only part of it. Name only garments the composition actually shows; write a clothing tag yourself when this turn changed it or the close-up reveals a specific region; if the cut is fully nude, write the explicit nudity tag (nude / completely nude) and DynamicChat skips the outfit injection. Never randomly swap, drop, or re-add garments the story did not touch, and never paste the saved default outfit into a close-up just to fill space.",
 
-    "13. THE SITUATION DOES NOT RESET — WITHIN THE TURN OR BETWEEN TURNS. Build every cut on top of the ongoing scene action/interaction from the visual state and recent transcript. A cut that narrows to a moment or a body region is the SAME ongoing situation, not a fresh neutral pose: pair the narrow focus with the still-active action/position/interaction tags, or the image collapses into an idle figure with a detail floating beside it. Likewise carry the action that was active at the END of the previous turn into this turn's first cue unless the narrative or user action explicitly ends it — a continuing physical action (still strangling, still pinned, still embracing, still running) keeps appearing until it stops. Example (non-sexual): a beat focusing on her neck while a man strangles her still needs the interaction tags (strangling, hands on another's neck, choking, struggling) on the right entries. Example (sexual): emphasising the hips during penetration still needs the position/insertion tags (sex from behind, vaginal, penis, penetration, hetero). When such an ongoing action is present, persist it as a memory_events state (state_type='ActionTags' or 'InteractionTags', state_value = the English tags) — only persisted state survives to the next turn.",
+    "13. THE SITUATION DOES NOT RESET — BUT IT IS STILL SHOWN THROUGH THE CROP. Build every cut on top of the ongoing scene action/interaction from the visual state and recent transcript, and carry the action that was active at the END of the previous turn into this turn's first cue unless the narrative or user action explicitly ends it — a continuing physical action (still strangling, still pinned, still embracing, still running) keeps appearing until it stops. A cut that narrows to a moment or a body region is the SAME ongoing situation, not a fresh neutral pose. Express that ongoing action with the tags this crop CAN show, and drop the ones it cannot: keep the interaction/contact tags whose contact point is inside `visible_regions` (a neck close-up during a strangling keeps `hands on another's neck, choking`; a hip-region cut during sex keeps the position/insertion tags `sex from behind, vaginal, penetration`), and drop whole-body posture whose body region is outside the frame (`standing`, `spread legs`, `full body pose`). This is not a licence to blank the action — if NO tag of the ongoing action is visible at the crop you chose, the crop is wrong: widen it until the action reads. When such an ongoing action is present, persist it as a memory_events state (state_type='ActionTags' or 'InteractionTags', state_value = the English tags) — only persisted state survives to the next turn.",
 
     "14. IDENTITY LOCK. Never mix one character's hair, eyes, outfit, or body tags into another's entry, and never borrow another character's required_identity_tags. A single character must never become 2girls/3girls. When a pronoun or unnamed continuation could match more than one roster character and the scene does not disambiguate, reuse the character already visible in the latest image/assistant beat, or set should_generate=false with a suppression_reason rather than guessing.",
 
@@ -3305,9 +3600,26 @@ async function requestProviderTextImmediate(
   options: ProviderTextOptions = {}
 ): Promise<string | undefined> {
   const baseUrl = state.llm.baseUrl.replace(/\/$/u, "");
-  const model = options.model?.trim() || state.llm.model;
-  const temperature = options.temperature ?? state.llm.temperature;
-  const providerOutputTokenBudget = resolveProviderOutputTokenBudget(state, outputTokenBudget);
+  const model = (options.model?.trim() || state.llm.model).trim();
+  // Picking "직접 입력" in the model dropdown clears the field. Open-model ids are long and slash-bearing so
+  // they are always typed by hand, which makes an empty model a routine mistake rather than an exotic one —
+  // and an empty string sent verbatim produces an opaque provider 400.
+  if (!model && state.llm.provider !== "mock") {
+    throw new Error("모델 이름이 비어 있습니다. LLM 설정에서 모델을 선택하거나 직접 입력하세요.");
+  }
+  const temperature = clampProviderTemperature(state.llm.provider, options.temperature ?? state.llm.temperature);
+  // Clamp the reply budget so prompt + reply fit the model's window. Without this the two are sized
+  // independently and their sum can exceed the context — which a hosted 128k model absorbs silently and a
+  // local 4k/8k one rejects with a raw upstream 400. Applied here, at the single choke point, so it covers
+  // the narrative pass as well as the annotation pass.
+  const providerOutputTokenBudget = clampOutputToContext(
+    state,
+    resolveProviderOutputTokenBudget(state, outputTokenBudget),
+    `${runtimeInstruction}
+${contextBlock}
+${input.userText}`
+  );
+  const preset = getLlmProviderPreset(state.llm.provider);
   const cliAgentKind = cliAgentKindForProvider(state.llm.provider);
   const timeoutMs = resolveLlmRequestTimeoutMs(providerOutputTokenBudget, {
     isCliAgent: Boolean(cliAgentKind)
@@ -3373,6 +3685,73 @@ async function requestProviderTextImmediate(
     const content = data.text?.trim();
     if (!content) {
       throw new Error(`${cliAgentKind} CLI agent returned no content.`);
+    }
+    return content;
+  }
+
+  // Ollama native transport. Its OpenAI-compatible endpoint accepts `options` and then discards them, so a
+  // model with a 32k window is still served at Ollama's 4096 default — which the annotation prompt cannot
+  // fit. /api/chat honours num_ctx, so the local preset uses it and the model's real window becomes
+  // available without asking the user to run `ollama create` with a custom Modelfile.
+  if (preset.transport === "ollama") {
+    const contextTokens = resolveContextTokens(state);
+    const response = await fetchWithTimeout(
+      `${baseUrl.replace(/\/v1$/u, "")}/api/chat`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: `${runtimeInstruction}
+
+${contextBlock}` },
+            { role: "user", content: input.userText }
+          ],
+          stream: false,
+          // Hybrid reasoning models (Qwen3, DeepSeek-R1 distills, GLM-Z1) think by DEFAULT under Ollama, and
+          // Ollama returns that reasoning in a separate `thinking` field with `content` left EMPTY when the
+          // budget runs out. Measured on qwen3:14b: every one of 200 tokens went to thinking and the reply
+          // was blank. DynamicChat wants one finished JSON object per call, never a chain of thought, so
+          // thinking is off. Models without a thinking mode ignore the field.
+          think: false,
+          // Ollama returns JSON-only output for format:"json"; the annotation/cue passes depend on it.
+          format: options.jsonResponse ? "json" : undefined,
+          options: {
+            num_ctx: contextTokens,
+            num_predict: providerOutputTokenBudget,
+            ...(preset.sendTemperature ? { temperature: clampProviderTemperature(state.llm.provider, temperature) } : {})
+          }
+        })
+      },
+      timeoutMs
+    );
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      throwProviderHttpError(state, response, "Ollama", errorBody);
+    }
+
+    const data = (await response.json()) as {
+      message?: { content?: string; thinking?: string };
+      error?: string;
+      done_reason?: string;
+    };
+    if (data.error) {
+      throw new Error(`Ollama error: ${data.error}`);
+    }
+    const content = data.message?.content?.trim();
+    if (!content) {
+      // A reasoning model that spent the whole budget thinking. Naming it beats "empty response", which
+      // sends the operator looking for a loading or connectivity problem that is not there.
+      if (data.message?.thinking?.trim()) {
+        throw new Error(
+          "Ollama 모델이 추론만 반환하고 본문이 비었습니다. 출력 토큰을 늘리거나 thinking을 끄는 모델 태그(-instruct 등)를 사용하세요."
+        );
+      }
+      throw new Error(
+        `Ollama가 빈 응답을 반환했습니다${data.done_reason ? ` (done_reason: ${data.done_reason})` : ""}. 모델이 로드되어 있는지 확인하세요.`
+      );
     }
     return content;
   }
@@ -3443,7 +3822,9 @@ async function requestProviderTextImmediate(
       headers: {
         "content-type": "application/json",
         "x-api-key": state.llm.apiKey,
-        "anthropic-version": "2023-06-01"
+        "anthropic-version": "2023-06-01",
+        // Anthropic refuses requests whose Origin is a browser page unless this opt-in is present.
+        ...(getLlmProviderPreset(state.llm.provider).extraHeaders ?? {})
       },
       body: JSON.stringify({
         model,
@@ -3488,37 +3869,63 @@ async function requestProviderTextImmediate(
     return data.content?.map((part) => (part.type === "text" ? part.text ?? "" : "")).join("").trim();
   }
 
-  const response = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${state.llm.apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      temperature,
-      max_tokens: providerOutputTokenBudget,
-      stream: Boolean(options.onRawText),
-      messages: [
-        {
-          role: "system",
-          content: runtimeInstruction
-        },
-        {
-          role: "system",
-          content: contextBlock
-        },
-        {
-          role: "user",
-          content: input.userText
-        }
-      ]
-    })
-  }, timeoutMs);
+  const wantsJsonResponse =
+    options.jsonResponse === true &&
+    preset.jsonMode === "json_object" &&
+    !jsonResponseFormatUnsupported.has(state.llm.provider);
+  // OpenAI tolerates repeated system turns, but the Jinja chat templates shipped with many open weights
+  // assert a single leading system message and either 400 or SILENTLY DROP the second one — which here is the
+  // entire scene cast, visual state, and schema. The turn would then succeed having never seen the contract.
+  // The preset's tokenParam is the backend's default, but OpenAI's own reasoning models (o-series, gpt-5 —
+  // and gpt-5-mini is the preset's DEFAULT model) reject `max_tokens` outright and require
+  // `max_completion_tokens`. The reasoning branch below already existed for temperature; the token
+  // parameter needed the same treatment or the shipped default model could not complete a single turn.
+  const tokenParam =
+    preset.transport === "openai" && preset.tokenParam === "max_tokens" && isReasoningModel({ provider: state.llm.provider, model })
+      ? "max_completion_tokens"
+      : preset.tokenParam;
+  const requestBody: Record<string, unknown> = {
+    model,
+    [tokenParam]: providerOutputTokenBudget,
+    stream: Boolean(options.onRawText),
+    messages: [
+      {
+        role: "system",
+        content: `${runtimeInstruction}\n\n${contextBlock}`
+      },
+      {
+        role: "user",
+        content: input.userText
+      }
+    ],
+    ...(preset.extraBody ?? {})
+  };
+  // Reasoning models on several backends reject any non-default temperature outright.
+  if (preset.sendTemperature && !isReasoningModel({ provider: state.llm.provider, model })) {
+    requestBody.temperature = clampProviderTemperature(state.llm.provider, temperature);
+  }
+  if (wantsJsonResponse) {
+    requestBody.response_format = { type: "json_object" };
+  }
+
+  const response = await postOpenAiCompatible(state, preset, `${baseUrl}/chat/completions`, requestBody, timeoutMs);
 
   if (!response.ok) {
+    // Read the body ONCE and pass it through: the proxy answers with an actionable message (host not in the
+    // allow-list, upstream timeout) and vendors put the real reason in a 400 body. Reporting only
+    // "LLM request failed: 403" made an allow-list rejection look like a bad API key.
+    const errorBody = await response.text().catch(() => "");
     if (isRateLimitHttpStatus(response.status)) {
-      throwProviderHttpError(state, response, "LLM");
+      throwProviderHttpError(state, response, "LLM", errorBody);
+    }
+    // Negotiate JSON mode down rather than failing the turn: some OpenAI-compatible servers advertise the
+    // shape but reject response_format. Remembered per provider so it costs one extra request, not one a turn.
+    if (wantsJsonResponse && /response_format|json_object|json_schema/iu.test(errorBody)) {
+      jsonResponseFormatUnsupported.add(state.llm.provider);
+      return requestProviderTextImmediate(state, input, runtimeInstruction, contextBlock, outputTokenBudget, {
+        ...options,
+        jsonResponse: false
+      });
     }
     if (options.onRawText) {
       return requestProviderTextImmediate(state, input, runtimeInstruction, contextBlock, outputTokenBudget, {
@@ -3526,7 +3933,7 @@ async function requestProviderTextImmediate(
         onRawText: undefined
       });
     }
-    throwProviderHttpError(state, response, "LLM");
+    throwProviderHttpError(state, response, "LLM", errorBody);
   }
 
   if (options.onRawText) {
@@ -3541,18 +3948,96 @@ async function requestProviderTextImmediate(
   }
 
   const data = (await response.json()) as OpenAiCompatibleResponse;
+  // HTTP 200 + an error envelope: OpenRouter reports upstream/moderation/credit failures this way, vLLM and
+  // llama.cpp report context-length and template errors. Without this the real message was thrown away.
+  if (!data.choices?.length && data.error?.message) {
+    throw new Error(`LLM request failed: ${data.error.code ?? 200} (${data.error.message})`);
+  }
   const choice = data.choices?.[0];
   const content = readOpenAiCompatibleChoiceText(choice);
   if (content) {
     return content;
   }
-  if (choice?.finish_reason) {
-    throw new Error(`LLM response did not include content (finish: ${choice.finish_reason}).`);
+  // A reasoning model that spent its whole budget thinking returns empty content next to a full
+  // reasoning_content. Retrying is pointless and costs a second full generation, so name the real cause.
+  const reasoningOnly = choice?.message?.reasoning_content ?? choice?.message?.reasoning;
+  if (reasoningOnly?.trim()) {
+    throw new Error(
+      `LLM 응답이 추론(reasoning)만 반환하고 본문이 비었습니다 (finish: ${choice?.finish_reason ?? "unknown"}). 최대 출력 토큰을 늘리거나 이 모델의 thinking 모드를 끄세요.`
+    );
   }
   if (choice?.message?.refusal) {
     throw new Error("LLM response returned a refusal instead of content.");
   }
+  if (choice?.finish_reason) {
+    throw new Error(`LLM response did not include content (finish: ${choice.finish_reason}).`);
+  }
   return undefined;
+}
+
+/**
+ * Issues one OpenAI-compatible chat request, either straight to the vendor or through the DynamicChat API
+ * server when the preset declares `requiresProxy`. Almost no inference vendor serves CORS headers for a
+ * browser origin, so the relay is what makes an open-model provider reachable at all; the response (SSE
+ * included) is passed through unchanged, so every reader below works on either path.
+ */
+async function postOpenAiCompatible(
+  state: AppState,
+  preset: LlmProviderPreset,
+  url: string,
+  body: Record<string, unknown>,
+  timeoutMs: number
+): Promise<Response> {
+  const providerHeaders = preset.extraHeaders ?? {};
+  if (!preset.requiresProxy) {
+    return fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${state.llm.apiKey}`,
+          ...providerHeaders
+        },
+        body: JSON.stringify(body)
+      },
+      timeoutMs
+    );
+  }
+
+  return fetchWithTimeout(
+    getLlmChatProxyUrl(),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        // The proxy forwards this as the upstream Authorization header and never persists it.
+        authorization: `Bearer ${state.llm.apiKey}`
+      },
+      body: JSON.stringify({ url, headers: providerHeaders, body })
+    },
+    timeoutMs
+  );
+}
+
+/**
+ * Caps the reply budget at whatever the context has left after the prompt.
+ *
+ * Returns at least a small floor: a reply budget of zero produces an empty completion, which is a worse
+ * failure than a short one. When even the floor does not fit, the request goes out anyway and the provider's
+ * own error is surfaced — it names the real numbers, which is more useful than a guess made here.
+ */
+function clampOutputToContext(state: AppState, requestedOutputTokens: number, promptText: string): number {
+  const contextTokens = resolveContextTokens(state);
+  if (!Number.isFinite(contextTokens) || contextTokens <= 0) {
+    return requestedOutputTokens;
+  }
+  const promptTokens = estimateTokens(promptText);
+  const available = Math.floor(contextTokens * 0.92) - promptTokens;
+  if (available >= requestedOutputTokens) {
+    return requestedOutputTokens;
+  }
+  return Math.max(MIN_OUTPUT_TOKENS, available);
 }
 
 function formatProviderErrorBody(value: string): string {
@@ -3916,6 +4401,11 @@ async function requestProviderTextWithRecovery(
     if (isLlmRateLimitError(error)) {
       throw error;
     }
+    // A cancel must not trigger a recovery re-request — that would issue a second paid call for the turn
+    // the user just stopped.
+    if (isLlmAbortedError(error)) {
+      throw error;
+    }
 
     if (state.llm.provider === "gemini" && isGeminiOffSafetySettingRejected(error)) {
       try {
@@ -4067,8 +4557,30 @@ function isTurnImageCueGenerationActive(state: AppState, manualImage: boolean): 
   return mode !== "stored_only" && mode !== "manual";
 }
 
+/**
+ * Picks the config for the annotation / image-cue pass: the dedicated image-tag model when it is genuinely
+ * usable, otherwise the main LLM.
+ *
+ * The fallback matters more than it looks. This pass is the SOLE author of both image_cues and the turn's
+ * state_events, and it used to short-circuit to nothing whenever the image-tag config was enabled but
+ * unusable — most often because its API key did not survive a library round-trip. The turn then silently lost
+ * its images AND every Wearing/pose/relationship-parameter update, with only a console warning. Degrading to
+ * the main model keeps the turn whole.
+ */
 function resolveImageTagLlmState(state: AppState): AppState {
-  return state.imageTagLlm?.enabled ? { ...state, llm: state.imageTagLlm } : state;
+  const imageTagLlm = state.imageTagLlm;
+  if (!imageTagLlm?.enabled || imageTagLlm.provider === "mock") {
+    return state;
+  }
+  const usable = !getLlmProviderPreset(imageTagLlm.provider).requiresApiKey || Boolean(imageTagLlm.apiKey.trim());
+  if (!usable) {
+    console.warn("[annotation] image-tag LLM is enabled but has no usable key; falling back to the main LLM", {
+      provider: imageTagLlm.provider,
+      model: imageTagLlm.model
+    });
+    return state;
+  }
+  return { ...state, llm: imageTagLlm };
 }
 
 // Output budget for the separated annotation / image-cue call. This used to be
@@ -4077,173 +4589,372 @@ function resolveImageTagLlmState(state: AppState): AppState {
 // character captions, and ran out of room partway: the tail cuts came back thin, or the JSON was truncated
 // and recovered as cues with missing character_prompts — which is precisely when the pipeline starts
 // rendering the wrong cast. The budget now follows how many cuts the cadence actually asks for.
+// Output budget for the annotation call. The ladder below sizes the CUT LIST from the cadence, then adds a
+// separate allowance for state_events. They used to share one number, so on the default `balanced` cadence a
+// turn with several outfit/pose deltas ate the cue allocation and the image_cues array came back truncated —
+// recovered as cues with missing character_prompts, which is exactly when the wrong cast gets rendered.
+const ANNOTATION_STATE_EVENT_TOKEN_ALLOWANCE = 1200;
+
 function resolveAnnotationOutputTokenBudget(state: AppState, includeImageCues: boolean): number {
   if (!includeImageCues) {
     return 1800;
   }
   const cadence = state.imageProfile.generationCadence ?? "balanced";
-  if (cadence === "image_progression") {
-    return Math.max(IMAGE_PROGRESSION_MIN_OUTPUT_TOKENS, 5200);
-  }
-  if (cadence === "paragraph") {
-    return 4200;
-  }
-  if (cadence === "rich") {
-    return 2800;
-  }
-  return 1800;
+  const cueBudget =
+    cadence === "image_progression"
+      ? Math.max(IMAGE_PROGRESSION_MIN_OUTPUT_TOKENS, 5200)
+      : cadence === "paragraph"
+        ? 4200
+        : cadence === "rich"
+          ? 2800
+          : 1800;
+  return cueBudget + ANNOTATION_STATE_EVENT_TOKEN_ALLOWANCE;
 }
 
-function createImageCueLlmInstruction(state: AppState, outputTokenBudget: number): string {
+// ── Cue-count enforcement ───────────────────────────────────────────────────────────────────────────
+// The authoring prompt states the cadence as an upper bound ("up to 8 cues"). A model that returns one cue
+// has not broken that rule, so nothing in the pipeline noticed: a paragraph-cadence turn measured 1.0
+// generated cue against a 6-8 target. Hosted models read the intent from the surrounding "high-density cut
+// list" framing; local open-weight models take the cap literally.
+//
+// So the count is no longer left to instruction-following. The floor below is what the creator's cadence
+// setting actually demands, and a short follow-up call fills the gap when the first pass undershoots.
+
+/** Generated cuts the cadence setting requires, or 0 for cadences where a single strong cut is correct. */
+function resolveRequiredImageCueFloor(state: AppState, outputTokenBudget: number): number {
+  const cadence = state.imageProfile.generationCadence ?? "balanced";
+  if (cadence === "image_progression") {
+    return IMAGE_PROGRESSION_CUE_TARGET;
+  }
+  if (cadence === "paragraph") {
+    return resolveInitialParagraphImageCueTarget(outputTokenBudget).min;
+  }
+  if (cadence === "rich") {
+    return 2;
+  }
+  // balanced / sparse ask for one cut on a visual beat and none on a quiet turn. Enforcing a floor there
+  // would manufacture images the setting deliberately does not want.
+  return 0;
+}
+
+/**
+ * Follow-up rounds allowed per turn.
+ *
+ * Each round is a real inference call (~15s on a local 14B), so the cost is bounded rather than looped
+ * until satisfied. Two rounds is what it took to carry a 1-cue first pass to the 6-cue floor in testing,
+ * and a round that adds nothing new stops the loop early regardless.
+ */
+const MAX_IMAGE_CUE_TOPUP_ROUNDS = 2;
+
+/** Narrative short enough that additional cuts would be inventing beats the prose does not contain. */
+const MIN_TOPUP_NARRATIVE_CHARS = 240;
+
+/**
+ * The beat a cue is anchored to, or "" when it names none.
+ *
+ * Deliberately does NOT fall back to `cue.scene`: normalizeAssistantImageCueDraft defaults that field to the
+ * literal string "current scene" for every cue, and the annotation schema has no `scene` field at all — so a
+ * fallback would give every anchor-less cue the SAME key and make mergeAdditionalImageCues reject all but the
+ * first as an already-covered beat. Anchor-less cues are deduped by their tag signature instead.
+ */
+function readImageCueAnchorKey(cue: AssistantImageCueDraft): string {
+  return (cue.anchorText ?? "").trim().toLowerCase().replace(/\s+/gu, " ");
+}
+
+/**
+ * Tag signature used to reject a "new" cut that is really the same frame rendered twice.
+ *
+ * Includes the per-character captions, not just base_tags/tags. A cue can legitimately carry all of its
+ * content in character_prompts — hasLlmAuthoredImageTags accepts exactly that shape — and keying on the base
+ * tags alone would score such a cue as empty, drop it, and end the top-up loop as "no new beats".
+ */
+function readImageCueTagKey(cue: AssistantImageCueDraft): string {
+  const tags = [
+    ...(cue.baseTags ?? []),
+    ...(cue.tags ?? []),
+    ...(cue.characterPrompts ?? []).map((entry) => entry.prompt ?? "")
+  ]
+    .map((tag) => tag.trim().toLowerCase())
+    .filter((tag) => tag.length > 0)
+    .sort();
+  return tags.join("|");
+}
+
+/**
+ * Appends cuts from a follow-up round, skipping anything that repeats a beat already covered.
+ *
+ * Returns how many were actually added, so the caller can stop as soon as a round stops producing new
+ * material instead of spending its remaining rounds re-asking a model that has said all it has.
+ */
+function mergeAdditionalImageCues(
+  existing: AssistantImageCueDraft[],
+  candidates: AssistantImageCueDraft[],
+  limit: number
+): { cues: AssistantImageCueDraft[]; added: number } {
+  const anchors = new Set(existing.map(readImageCueAnchorKey).filter((key) => key.length > 0));
+  const tagKeys = new Set(existing.map(readImageCueTagKey).filter((key) => key.length > 0));
+  const cues = [...existing];
+  let added = 0;
+
+  for (const candidate of candidates) {
+    if (added >= limit) {
+      break;
+    }
+    if (!candidate.shouldGenerate) {
+      continue;
+    }
+    const anchorKey = readImageCueAnchorKey(candidate);
+    const tagKey = readImageCueTagKey(candidate);
+    // A cut with no tags at all is the truncation artefact that renders the wrong cast; never merge it in.
+    if (tagKey.length === 0) {
+      continue;
+    }
+    if (anchorKey.length > 0 && anchors.has(anchorKey)) {
+      continue;
+    }
+    if (tagKeys.has(tagKey)) {
+      continue;
+    }
+    if (anchorKey.length > 0) {
+      anchors.add(anchorKey);
+    }
+    tagKeys.add(tagKey);
+    cues.push(candidate);
+    added += 1;
+  }
+
+  return { cues, added };
+}
+
+function createImageCueTopUpInstruction(
+  state: AppState,
+  outputTokenBudget: number,
+  tier: PromptDetailTier,
+  missing: number,
+  coveredAnchors: string[]
+): string {
+  const covered =
+    coveredAnchors.length > 0
+      ? `Beats already covered (do NOT repeat these): ${coveredAnchors.map((anchor) => `"${anchor}"`).join(", ")}`
+      : "No beats are covered yet.";
   return [
-    "You are DynamicChat's image-cue planner. You are given the ALREADY-WRITTEN Korean narrative for this turn (assistant_text) plus the current visual state. Your only job is to output image_cues: the ordered list of NovelAI image cuts that illustrate that narrative.",
-    "Do NOT rewrite, translate, summarize, continue, or comment on the narrative. Do NOT output assistant_text or memory_events. Output ONLY a JSON object with an image_cues array.",
+    "You are DynamicChat's image-cue completion pass. The narrative below has ALREADY been annotated, but the cut list came back shorter than the creator's image cadence requires. Add the missing cuts.",
     createContentRatingInstruction(state),
-    isImageProgressionCadence(state)
-      ? `Image progression mode: output exactly ${IMAGE_PROGRESSION_CUE_TARGET} ordered should_generate=true cue objects.`
-      : "Place a cut at every major visual beat of the narrative INCLUDING the opening beat — dialogue lines, action/interaction beats, body-detail beats, pose/outfit/state changes, and camera/location changes each deserve their own cue. Set should_generate=false (with a short suppression_reason) only for a genuinely non-visual beat; use [] only if the whole turn is non-visual.",
-    "Set each cue's anchor_text to a short phrase copied verbatim from the narrative where the cut belongs, so the image is placed at the right beat.",
-    `Image generation cadence is binding: ${createImageGenerationCadenceBlock(state, outputTokenBudget)}`,
-    createImageCueTagContractInstruction(state),
-    createInitialImageCueCountInstruction(state, outputTokenBudget),
-    "Return valid JSON only, no Markdown outside the JSON object."
+    covered,
+    `Emit exactly ${missing} additional should_generate=true image_cues for DIFFERENT visual beats of the same narrative — dialogue lines, action/interaction beats, body-detail beats, pose/outfit/state changes, and camera/location changes each qualify. Work through the narrative in order and pick the strongest beats that are not listed above.`,
+    "Each new cue needs its own anchor_text copied verbatim from a DIFFERENT part of the narrative, its own frame, and complete final NovelAI/Danbooru tags. Do not restate a covered beat with different wording, and do not emit a cue with empty tags.",
+    tier === "full" ? createImageCueTagContractInstruction(state) : createCompactImageCueTagContract(state),
+    'Return valid JSON only: {"image_cues": [...]}. Do NOT output state_events — they are already recorded.'
   ]
     .filter((item): item is string => Boolean(item))
     .join("\n");
 }
 
-function createImageCueLlmContext(
+/**
+ * Brings the cut list up to the floor the cadence setting demands.
+ *
+ * Degrades to whatever the first pass produced on any failure: a turn with 3 cuts is a far better outcome
+ * than a turn that loses its images because the completion call timed out.
+ */
+async function topUpImageCues(
+  llmState: AppState,
   state: AppState,
-  input: { userText: string; assistantText: string; manualImage?: boolean; outputTokenBudget?: number }
-): string {
-  const sceneBriefingText = createImageSceneBriefingBlock(state, input.userText);
-  const imageCueShape = {
-    kind: "scene | action | body_detail | dialogue_face | context | interaction",
-    placement: "before | after | inline",
-    anchor_text: "a short phrase copied verbatim from the narrative, marking where this cut belongs",
-    should_generate: true,
-    characters: ["visible registered character ids"],
-    base_tags: ["base prompt tags only: artist-free scene, camera, composition, location, props, action shared by the cut"],
-    character_prompts: [
-      {
-        character_id: "registered visible character id — omit entirely for any figure not in the registered roster (unregistered NPC, enemy, bystander, crowd member); NEVER assign a registered character's id to a different person's caption (e.g. do not put a registered female character's id on a male aggressor's entry)",
-        prompt: "this character's CURRENT action, pose, expression, interaction, framing/visible-body-state tags only — DynamicChat injects the saved appearance and current outfit, so do not restate identity or the established outfit; write a garment tag only when this turn changed it or the crop reveals a region",
-        negative_prompt: "optional character-specific negative tags"
-      }
-    ]
-  };
-  return [
-    "Plan image_cues for the following already-written turn. Do not change the narrative.",
-    "Already-written narrative (assistant_text) — anchor your cuts to phrases in this exact text:",
-    input.assistantText || "(empty)",
-    "Current user action this turn:",
-    input.userText || "(none)",
-    "Current scene cast guard:",
-    createSceneCastPromptBlock(state, input.userText),
-    sceneBriefingText ? "Current scene briefing (cast count, identities, current outfit/action/condition, who-acts-on-whom):" : undefined,
-    sceneBriefingText || undefined,
-    "Current turn image generation policy:",
-    createCurrentTurnImagePolicyBlock(state, { manualImage: input.manualImage, outputTokenBudget: input.outputTokenBudget }),
-    "Image prompt user rules:",
-    createImageUserRulesBlock(state) || "(none)",
-    "Image tag keyword presets (no roster identity tags):",
-    createImageSceneTagPresetBlock(state, input.userText) || "(none)",
-    "Image cue authoring reference for current-scene visible characters only (reference, do not copy verbatim). Keep only scene/composition/shared-action tags in base_tags. For a registered character set its character_id on a character_prompt and author its action/expression/pose plus any outfit change; DynamicChat injects that character's required_identity_tags and current outfit, so do not repeat the saved appearance:",
-    createImageCueVisualProfileBlock(state, input.userText) || "(none)",
-    "Ongoing scene/visual state for current-scene characters only (still-active pose/action/interaction/position + physical-detail facts; persists across cuts and turns unless the narrative changed it):",
-    createImageCueCurrentStateBlock(state, input.userText) || "(none)",
-    "Return JSON only. The JSON schema is:",
-    JSON.stringify({ image_cues: [imageCueShape] })
-  ]
-    .filter((item): item is string => Boolean(item))
-    .join("\n\n");
-}
+  input: { userText: string; assistantText: string; manualImage?: boolean },
+  result: TurnAnnotationResult,
+  options: { outputTokenBudget: number; tier: PromptDetailTier }
+): Promise<TurnAnnotationResult> {
+  const floor = resolveRequiredImageCueFloor(state, options.outputTokenBudget);
+  if (floor <= 0) {
+    return result;
+  }
+  let cues = result.imageCues;
+  let generated = cues.filter((cue) => cue.shouldGenerate).length;
+  if (generated >= floor) {
+    return result;
+  }
+  // Distinguish a JUDGEMENT from a FAILURE. A pass that returned cues and marked them should_generate=false
+  // with suppression reasons decided this turn is not visual — respect that. A pass that returned nothing at
+  // all, on a cadence that demands a cut list, is the failure mode behind "이미지가 가끔 안 생성됨": measured
+  // on a weaker tag model it produced an empty array on 3 of 5 turns of substantial prose. Retry those.
+  if (generated === 0 && cues.length > 0) {
+    return result;
+  }
+  // Enough prose to carry more beats — otherwise the extra cuts would be invented rather than observed.
+  // Image-progression mode is exempt: its assistant_text is deliberately a single status line, and the cut
+  // list IS the turn's output, so the prose length says nothing about how many cuts the scene supports.
+  if (!isImageProgressionCadence(state) && input.assistantText.trim().length < MIN_TOPUP_NARRATIVE_CHARS) {
+    return result;
+  }
 
-function parseImageCuesResponse(raw: string): PlannedImageCueDraft[] {
-  const errors: string[] = [];
-  const jsonText = extractJsonObject(unwrapCliAgentBridgeResponse(raw));
-  if (jsonText) {
-    try {
-      const value = JSON.parse(jsonText) as Record<string, unknown>;
-      const cues = normalizeAssistantImageCueDrafts(value.image_cues ?? value.imageCues ?? value, errors);
-      if (cues.length > 0) {
-        return cues;
-      }
-    } catch {
-      /* fall through to lenient recovery */
-    }
-  }
-  return extractRecoverableImageCueDrafts(raw, errors);
-}
+  const context = createAnnotationLlmContext(
+    state,
+    { ...input, outputTokenBudget: options.outputTokenBudget },
+    true,
+    options.tier
+  );
 
-// Authors the turn's image_cues with the dedicated image-cue LLM, given the already-written narrative.
-// Returns [] when image generation is not active for this turn or the image LLM is unconfigured.
-export async function requestTurnImageCues(
-  state: AppState,
-  input: { userText: string; assistantText: string; manualImage?: boolean }
-): Promise<AssistantImageCueDraft[]> {
-  // Temporary diagnostics: this function silently returned [] on every failure/gate, so a missing image had no
-  // visible cause. Each return path now logs why. Filter the browser console by "[image-cue]".
-  if (!isTurnImageCueGenerationActive(state, Boolean(input.manualImage))) {
-    console.warn("[image-cue] skipped: turn image-cue generation not active", {
-      imageProfileEnabled: state.imageProfile.enabled,
-      realtimeImageEnabled: state.simulation.realtimeImageEnabled,
-      triggerMode: state.imageProfile.triggerMode,
-      manualImage: Boolean(input.manualImage)
-    });
-    return [];
-  }
-  const llmState = resolveImageTagLlmState(state);
-  const requiresApiKey = !isCliAgentLlmProvider(llmState.llm.provider);
-  if (!llmState.llm.enabled || llmState.llm.provider === "mock" || (requiresApiKey && !llmState.llm.apiKey.trim())) {
-    console.warn("[image-cue] skipped: image-tag LLM disabled/unconfigured", {
-      provider: llmState.llm.provider,
-      enabled: llmState.llm.enabled,
-      requiresApiKey,
-      hasApiKey: Boolean(llmState.llm.apiKey.trim())
-    });
-    return [];
-  }
-  const outputTokenBudget = resolveAnnotationOutputTokenBudget(state, true);
-  const instruction = createImageCueLlmInstruction(state, outputTokenBudget);
-  const context = createImageCueLlmContext(state, { ...input, outputTokenBudget });
-  try {
-    const raw = await requestProviderText(
-      llmState,
-      { userText: input.userText, modules: [], evidence: [] },
-      instruction,
-      context,
-      outputTokenBudget,
-      { temperature: llmState.llm.temperature }
+  for (let round = 0; round < MAX_IMAGE_CUE_TOPUP_ROUNDS && generated < floor; round += 1) {
+    const missing = floor - generated;
+    const coveredAnchors = cues
+      .filter((cue) => cue.shouldGenerate)
+      .map(readImageCueAnchorKey)
+      .filter((anchor) => anchor.length > 0);
+    const instruction = createImageCueTopUpInstruction(
+      state,
+      options.outputTokenBudget,
+      options.tier,
+      missing,
+      coveredAnchors
     );
+    // Size the reply to the cuts still owed rather than to the full annotation budget: this call has no
+    // state_events to carry, and a smaller ceiling is a faster round on a local backend.
+    const roundOutputTokens = Math.min(options.outputTokenBudget, Math.max(700, missing * 280));
+
+    let raw: string | undefined;
+    try {
+      raw = await requestProviderText(
+        llmState,
+        { userText: input.userText, modules: [], evidence: [] },
+        instruction,
+        context,
+        roundOutputTokens,
+        {
+          temperature: llmState.llm.temperature,
+          jsonResponse: supportsJsonResponseFormat(llmState.llm.provider)
+        }
+      );
+    } catch (error) {
+      if (isLlmAbortedError(error)) {
+        throw error;
+      }
+      console.warn("[annotation] image-cue top-up round failed; keeping the cues already authored", {
+        round: round + 1,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      break;
+    }
+
     if (!raw?.trim()) {
-      console.warn("[image-cue] LLM returned empty content", { provider: llmState.llm.provider, model: llmState.llm.model });
-      return [];
+      break;
     }
-    const cues = parseImageCuesResponse(raw);
-    if (cues.length === 0) {
-      console.warn("[image-cue] parsed 0 cues from LLM output", { rawPreview: raw.slice(0, 400) });
-    } else {
-      console.info(`[image-cue] parsed ${cues.length} cue(s)`, { shouldGenerate: cues.filter((c) => c.shouldGenerate).length });
+    const parsed = parseAnnotationResponse(raw, true);
+    const merged = mergeAdditionalImageCues(cues, parsed.imageCues, missing);
+    if (merged.added === 0) {
+      // The model has nothing further to offer for this narrative. Re-asking would spend another round to
+      // get the same answer.
+      console.info("[annotation] image-cue top-up produced no new beats; stopping", { round: round + 1, generated, floor });
+      break;
     }
-    return cues;
-  } catch (error) {
-    console.warn("[image-cue] LLM call failed", { provider: llmState.llm.provider, model: llmState.llm.model, error: error instanceof Error ? error.message : String(error) });
-    return [];
+    cues = merged.cues;
+    generated += merged.added;
   }
+
+  if (generated < floor) {
+    console.info("[annotation] image-cue count is below the cadence floor after top-up", {
+      cadence: state.imageProfile.generationCadence,
+      generated,
+      floor
+    });
+  }
+
+  return { ...result, imageCues: cues };
 }
 
-// Result of the post-narrative annotation call.
-// state_events: memory_kind='state' deltas (Wearing/pose/scene + relationship params) — always extracted.
-// image_cues:   authored only when isTurnImageCueGenerationActive is true.
+// NOTE: the standalone image-cue pass that once lived here was removed. Image cues and state events are
+// authored by ONE call (requestTurnAnnotations below). Keeping a second, unreferenced copy of the tag
+// contract and cue parser meant every prompt fix had to be made twice, and the diagnostics that were added
+// to explain missing images had been added to the copy that never ran.
+
 export interface TurnAnnotationResult {
   imageCues: AssistantImageCueDraft[];
   stateEvents: AssistantMemoryEventDraft[];
+  /**
+   * Why this turn produced no annotations, when the cause was a failure rather than a judgement.
+   *
+   * This call is the sole author of BOTH image cues and state deltas, so when it fails the turn silently
+   * loses its images AND every Wearing/pose/relationship update — which is indistinguishable, on screen,
+   * from the model deciding the turn was non-visual. A context-size overflow, a rate limit or a network
+   * blip therefore looked exactly like "이미지가 가끔 안 나온다". The caller surfaces this.
+   */
+  failureReason?: string;
+}
+
+/**
+ * The tag contract, reduced to its structural rules.
+ *
+ * The full contract is ~12k characters — nearly half the annotation prompt — because each rule carries the
+ * reasoning behind it and the failure it prevents. That elaboration is what makes a strong model apply the
+ * rule correctly to an unforeseen case, so it is kept whenever the context can afford it. When it cannot
+ * (a local model with a small window), the rules themselves survive and only the justification is dropped:
+ * a shorter contract the model actually receives beats a better one that fails the request.
+ *
+ * Every numbered rule below maps to one in createImageCueTagContractInstruction. Nothing structural is lost.
+ */
+function createCompactImageCueTagContract(state: AppState): string {
+  const adultRule = isAdultContentMode(state)
+    ? "In adult_19 mode emit the direct visual tags the user rules and presets call for; do not blank a cue because the scene is adult."
+    : "No sexual or explicit contact tags unless the content mode and user rules allow them.";
+  return [
+    "IMAGE CUE TAG CONTRACT (structure only — every creative and compositional judgement is yours):",
+    "1. FORMAT. base_tags and each character_prompts[].prompt are comma-separated English NovelAI tags — never prose. No artist/style/quality/negative tags. Never emit should_generate=true with no tags: use should_generate=false plus a short suppression_reason instead.",
+    "2. FRAME FIRST. Fill `frame` before choosing any tag: exactly one shot, one viewpoint, and visible_regions listing only the body regions this crop shows. Mirror the shot as one explicit framing tag in base_tags. Emit tags only for what those regions reveal — no clothing, props or accessories outside them.",
+    "3. CAST. One character_prompts entry per human visible in THIS frame, registered or not. Never merge two people into one entry, never describe a second person inside base_tags or another person's entry. An on-stage but off-frame character (usually the POV observer) gets no entry.",
+    "4. SUBJECT COUNT. base_tags carries the non-character tags plus exactly one subject-count tag matching the entries (1girl / 1boy / 2girls / 1girl, 1boy…). Without it NovelAI renders everyone as its default gender.",
+    "5. GENDER. Every entry states its subject's gender explicitly. A person with no character_id gets NO injection — author their full description yourself, gender tag first.",
+    "6. REGISTERED CHARACTERS. Set character_id and write only that character's current action, pose, expression, interaction and visible body state. DynamicChat injects their saved appearance and current outfit; do not restate them. This is licence to skip redundancy, not to write a thin cut.",
+    "7. CONTACT. Two people touching, grappling or in a sexual position are still two entries. Put each participant's own body action in their own entry, with the shared position anchor on both.",
+    "8. DETAIL FOLLOWS THE CROP. Give the focus subject thorough detail about what the crop reveals only. A face crop gets gaze/mouth/expression and skips body/pose/outfit; a body-region crop skips facing-camera face tags. Render background figures compactly.",
+    "9. FACE FOLLOWS THE POSE. Give a matching expression when the face is toward the viewer and inside the crop; when it is turned away or out of frame, use viewpoint tags instead and force no expression.",
+    "10. OUTFIT. Take the current Wearing state as the baseline; change it only when the narrative changed it or the crop reveals part of it. Name only garments the crop shows. For a fully nude cut write the explicit nudity tag.",
+    "11. THE SITUATION DOES NOT RESET. Carry the ongoing action/interaction into every cut, expressed with the tags this crop can show — keep contact tags whose contact point is in frame, drop whole-body posture that is not. Persist an ongoing action as a state_event (ActionTags / InteractionTags) or it will not survive to the next turn.",
+    "12. IDENTITY LOCK. Never mix one character's hair, eyes, outfit or body into another's entry. A single character must never become 2girls.",
+    "13. RENDER-ABLE OVER ABSTRACT. NovelAI cannot draw `panic attack`; express it through visible cues (wide eyes, open mouth, trembling, tears).",
+    `14. ${adultRule}`
+  ].join("\n");
+}
+
+/** The cue schema with its field descriptions reduced to type hints. */
+const COMPACT_IMAGE_CUE_SHAPE = {
+  kind: "scene | action | body_detail | dialogue_face | context | interaction",
+  placement: "before | after | inline",
+  anchor_text: "short phrase copied verbatim from the narrative",
+  should_generate: true,
+  frame: {
+    shot: "close_up | face_focus | upper_body | cowboy_shot | full_body | wide_shot",
+    viewpoint: "front | side | from_behind | pov | over_the_shoulder",
+    visible_regions: ["head | torso | hips | legs | feet"]
+  },
+  characters: ["registered character ids visible in this frame"],
+  base_tags: ["scene, camera/framing, location, props, lighting + exactly one subject-count tag"],
+  character_prompts: [
+    {
+      character_id: "registered id, or omit entirely for an unregistered figure",
+      prompt: "this character's action, pose, expression, contact and visible body state",
+      negative_prompt: "optional"
+    }
+  ]
+};
+
+/** Roster the model can attach a character_id to, without the per-character authoring guidance. */
+function createCompactRosterBlock(state: AppState): string {
+  return state.characters
+    .slice(0, OFF_LIST_ROSTER_HINT_LIMIT)
+    .map((character) => {
+      const profile = state.visualProfiles.find((candidate) => candidate.characterId === character.id);
+      const subject = profile ? readSubjectHintTags(profile.positivePrompt) : "";
+      return `- ${character.name} (character_id: ${character.id})${subject ? ` | ${subject}` : ""}`;
+    })
+    .join("\n");
 }
 
 // Instruction for the annotation LLM. State-event extraction runs every turn; image_cues authoring is
 // conditional on includeImageCues so image-off turns still get Wearing/pose/param state extraction.
-function createAnnotationLlmInstruction(state: AppState, outputTokenBudget: number, includeImageCues: boolean): string {
+function createAnnotationLlmInstruction(
+  state: AppState,
+  outputTokenBudget: number,
+  includeImageCues: boolean,
+  tier: PromptDetailTier = "full"
+): string {
   return [
     includeImageCues
       ? "You are DynamicChat's annotation planner. Given the already-written Korean narrative, output BOTH state_events (required every turn) and image_cues (for this visual turn). Do NOT rewrite or comment on the narrative."
@@ -4251,12 +4962,16 @@ function createAnnotationLlmInstruction(state: AppState, outputTokenBudget: numb
     createContentRatingInstruction(state),
     includeImageCues
       ? [
+          // Field order is load-bearing, not cosmetic. The cue array is the part that gets truncated when the
+          // model runs out of budget, and a truncated cue arrives with no character_prompts — which is what
+          // renders the wrong cast. Emitting it first means state_events, not the images, absorb any overflow.
+          "Write the JSON fields in this exact order: image_cues first, then state_events. The image tags must never be the part that gets cut off at the end.",
           isImageProgressionCadence(state)
             ? `Image progression mode: output exactly ${IMAGE_PROGRESSION_CUE_TARGET} ordered should_generate=true image_cues.`
-            : "For image_cues: place a cut at every major visual beat INCLUDING the opening beat. Set should_generate=false only for a genuinely non-visual beat.",
-          "Set each cue's anchor_text to a short phrase copied verbatim from the narrative.",
+            : "For image_cues: place a cut at every major visual beat of the narrative INCLUDING the opening beat — dialogue lines, action/interaction beats, body-detail beats, pose/outfit/state changes, and camera/location changes each deserve their own cue. Set should_generate=false (with a short suppression_reason) only for a genuinely non-visual beat; use [] only if the whole turn is non-visual.",
+          "Set each cue's anchor_text to a short phrase copied verbatim from the narrative where the cut belongs, so the image is placed at the right beat.",
           `Image generation cadence is binding: ${createImageGenerationCadenceBlock(state, outputTokenBudget)}`,
-          createImageCueTagContractInstruction(state),
+          tier === "full" ? createImageCueTagContractInstruction(state) : createCompactImageCueTagContract(state),
           createInitialImageCueCountInstruction(state, outputTokenBudget)
         ]
           .filter((item): item is string => Boolean(item))
@@ -4275,9 +4990,18 @@ function createAnnotationLlmInstruction(state: AppState, outputTokenBudget: numb
 function createAnnotationLlmContext(
   state: AppState,
   input: { userText: string; assistantText: string; manualImage?: boolean; outputTokenBudget?: number },
-  includeImageCues: boolean
+  includeImageCues: boolean,
+  tier: PromptDetailTier = "full"
 ): string {
-  const sceneBriefingText = createImageSceneBriefingBlock(state, input.userText);
+  // Every derived block below scopes itself by matching character names / preset keywords against a "current
+  // text" string. Passing only the user's action made all of them blind to the very narrative they are meant
+  // to annotate: a character who first appears in this turn's prose was filtered out of the visual-profile and
+  // ongoing-state blocks (so the tag author had no identity or outfit to work from), and the creator's
+  // keyword→tag preset library was scored against the PREVIOUS turn and usually collapsed to "(none)".
+  const cueScopeText = [input.userText, input.assistantText].filter((text) => Boolean(text?.trim())).join("\n");
+  const scenePresetLimit = resolveScenePresetLimit(tier, IMAGE_SCENE_PRESET_PROMPT_LIMIT);
+  const withOptionalBlocks = includesOptionalReferenceBlocks(tier);
+  const sceneBriefingText = createImageSceneBriefingBlock(state, cueScopeText, tier !== "full");
   const annotationRelParamsBlock = createAnnotationRelationshipParamsBlock(state);
   const stateEventShape: Record<string, unknown> = {
     memory_kind: "state",
@@ -4293,27 +5017,40 @@ function createAnnotationLlmContext(
   const imageCueShape = {
     kind: "scene | action | body_detail | dialogue_face | context | interaction",
     placement: "before | after | inline",
-    anchor_text: "a short phrase copied verbatim from the narrative",
+    anchor_text: "a short phrase copied verbatim from the narrative, marking where this cut belongs",
     should_generate: true,
+    frame: {
+      shot: "close_up | face_focus | upper_body | cowboy_shot | full_body | wide_shot — exactly one, decided BEFORE any other tag",
+      viewpoint: "front | side | from_behind | pov | over_the_shoulder",
+      angle: "eye_level | from_above | from_below | dutch_angle",
+      visible_regions: ["head | torso | hips | legs | feet — only the regions this crop actually shows"]
+    },
     characters: ["visible registered character ids"],
-    base_tags: ["scene, camera, composition, location, props, shared-action tags"],
+    base_tags: [
+      "base prompt tags only: artist-free scene, camera/framing, composition, location, props, lighting, shared staging, plus exactly one subject-count tag (1girl / 1boy / 2girls / 1girl, 1boy…) matching the entries below"
+    ],
     character_prompts: [
       {
-        character_id: "registered visible character id",
-        prompt: "this character's CURRENT action, pose, expression, interaction, framing/body-state tags",
-        negative_prompt: "optional"
+        character_id:
+          "registered visible character id — omit entirely for any figure not in the registered roster (unregistered NPC, enemy, bystander, crowd member); NEVER assign a registered character's id to a different person's caption (e.g. do not put a registered female character's id on a male aggressor's entry)",
+        prompt:
+          "this character's CURRENT action, pose, expression, interaction, and visible body state — tags only for what frame.visible_regions actually shows. DynamicChat injects the saved appearance and current outfit, so do not restate identity or the established outfit; write a garment tag only when this turn changed it or the crop reveals that region",
+        negative_prompt: "optional character-specific negative tags"
       }
+    ],
+    excluded_by_frame: [
+      "self-check: tags this frame forbids and you therefore did NOT write (e.g. on face_focus: footwear, full-body pose, skirt; on from_behind: expression, eye colour, looking at viewer)"
     ]
   };
 
   return [
     "Extract state_events" + (includeImageCues ? " and plan image_cues" : "") + " for the following already-written turn. Do not change the narrative.",
-    "Already-written narrative (assistant_text):",
+    "Already-written narrative (assistant_text) — anchor your cuts to phrases in this exact text:",
     input.assistantText || "(empty)",
     "Current user action this turn:",
     input.userText || "(none)",
     "Current scene cast guard:",
-    createSceneCastPromptBlock(state, input.userText),
+    createSceneCastPromptBlock(state, cueScopeText),
     sceneBriefingText ? "Current scene briefing (cast count, identities, current outfit/action/condition, who-acts-on-whom):" : undefined,
     sceneBriefingText || undefined,
     annotationRelParamsBlock || undefined,
@@ -4321,19 +5058,43 @@ function createAnnotationLlmContext(
     includeImageCues ? createCurrentTurnImagePolicyBlock(state, { manualImage: input.manualImage, outputTokenBudget: input.outputTokenBudget }) : undefined,
     includeImageCues ? "Image prompt user rules:" : undefined,
     includeImageCues ? (createImageUserRulesBlock(state) || "(none)") : undefined,
-    includeImageCues ? "Image tag keyword presets (no roster identity tags):" : undefined,
-    includeImageCues ? (createImageSceneTagPresetBlock(state, input.userText) || "(none)") : undefined,
-    includeImageCues ? "Image cue authoring reference for current-scene visible characters only:" : undefined,
-    includeImageCues ? (createImageCueVisualProfileBlock(state, input.userText) || "(none)") : undefined,
-    includeImageCues ? "Ongoing scene/visual state for current-scene characters only (still-active pose/action/interaction/position + physical-detail facts):" : undefined,
-    includeImageCues ? (createImageCueCurrentStateBlock(state, input.userText) || "(none)") : undefined,
+    includeImageCues && scenePresetLimit > 0 ? "Image tag keyword presets (no roster identity tags):" : undefined,
+    includeImageCues && scenePresetLimit > 0
+      ? createImageSceneTagPresetBlock(state, cueScopeText, scenePresetLimit) || "(none)"
+      : undefined,
+    includeImageCues && withOptionalBlocks
+      ? "Image cue authoring reference for current-scene visible characters only (reference, do not copy verbatim). Keep only scene/composition/shared-action tags in base_tags. For a registered character set its character_id on a character_prompt and author its action/expression/pose plus any outfit change; DynamicChat injects that character's saved identity and current outfit, so do not repeat the saved appearance:"
+      : includeImageCues
+        ? "Registered characters — set character_id so the saved appearance and current outfit are injected:"
+        : undefined,
+    includeImageCues
+      ? (withOptionalBlocks ? createImageCueVisualProfileBlock(state, cueScopeText) : createCompactRosterBlock(state)) ||
+        "(none)"
+      : undefined,
+    includeImageCues
+      ? "Ongoing scene/visual state for current-scene characters only (still-active pose/action/interaction/position + physical-detail facts; persists across cuts and turns unless the narrative changed it):"
+      : undefined,
+    includeImageCues ? (createImageCueCurrentStateBlock(state, cueScopeText) || "(none)") : undefined,
     "Return JSON only. The JSON schema is:",
     includeImageCues
-      ? JSON.stringify({ state_events: [stateEventShape], image_cues: [imageCueShape] })
+      ? JSON.stringify({ image_cues: [tier === "full" ? imageCueShape : COMPACT_IMAGE_CUE_SHAPE], state_events: [stateEventShape] })
       : JSON.stringify({ state_events: [stateEventShape] })
   ]
     .filter((item): item is string => Boolean(item))
     .join("\n\n");
+}
+
+/**
+ * Whether an annotation item is a state delta.
+ *
+ * `state_type` is the load-bearing field — it is what memoryCompiler routes on. `memory_kind` is a constant
+ * the schema asks the model to echo, and open-weight models routinely fill it with the CATEGORY instead
+ * ("action", "expression", "outfit") while still writing a perfectly good `state_type`. Requiring the literal
+ * "state" threw away every one of those, so a turn silently lost its Wearing/pose/expression updates and the
+ * next image reset the scene. Accept the item when either field identifies it.
+ */
+function isAnnotationStateEvent(item: AssistantMemoryEventDraft): boolean {
+  return item.memoryKind === "state" || Boolean(item.stateType?.trim());
 }
 
 function parseAnnotationResponse(raw: string, includeImageCues: boolean): TurnAnnotationResult {
@@ -4350,7 +5111,7 @@ function parseAnnotationResponse(raw: string, includeImageCues: boolean): TurnAn
       const stateEvents = stateEventsRaw
         .map((item) => normalizeMemoryEventDraft(item, errors))
         .filter((item): item is AssistantMemoryEventDraft => Boolean(item))
-        .filter((item) => item.memoryKind === "state");
+        .filter(isAnnotationStateEvent);
       const imageCues = includeImageCues
         ? normalizeAssistantImageCueDrafts(value.image_cues ?? value.imageCues, errors)
         : [];
@@ -4368,7 +5129,7 @@ function parseAnnotationResponse(raw: string, includeImageCues: boolean): TurnAn
         .filter((item): item is Record<string, unknown> => Boolean(item))
         .map((item) => normalizeMemoryEventDraft(item, errors))
         .filter((item): item is AssistantMemoryEventDraft => Boolean(item))
-        .filter((item) => item.memoryKind === "state")
+        .filter(isAnnotationStateEvent)
     : [];
   const recoveredImageCues = includeImageCues ? extractRecoverableImageCueDrafts(raw, errors) : [];
   return { stateEvents: recoveredStateEvents, imageCues: recoveredImageCues };
@@ -4384,12 +5145,57 @@ function parseAnnotationResponse(raw: string, includeImageCues: boolean): TurnAn
 //     tag author so the narrative LLM is completely free of tag vocabulary.
 //
 // Returns { stateEvents: [], imageCues: [] } when the annotation LLM is unconfigured (graceful degradation).
+/**
+ * Builds the annotation prompt at a given detail tier, for measurement in the eval suite.
+ *
+ * Exists so the tier ladder can be asserted to actually shrink the prompt rather than merely relabel it —
+ * the failure mode that let a "compact" build still overflow a local context.
+ */
+export function __buildAnnotationPromptForTest(state: AppState, tier: PromptDetailTier): string {
+  const instruction = createAnnotationLlmInstruction(state, 2000, true, tier);
+  const context = createAnnotationLlmContext(
+    state,
+    { userText: "테스트", assistantText: "유나가 고개를 들었다.", outputTokenBudget: 2000 },
+    true,
+    tier
+  );
+  return `${instruction}
+${context}`;
+}
+
+/**
+ * Builds the NARRATIVE prompt's two halves, for size measurement in the eval suite.
+ *
+ * The annotation pass had a measurable size from the start; the narrative pass did not, so "the prompt does
+ * not fit" could only be diagnosed from a provider error. Exposing the built strings makes the split between
+ * the creator's own content and DynamicChat's generated scaffolding a number instead of an assumption —
+ * which is what decides whether shortening the main prompt is the useful lever or a waste of the user's time.
+ */
+export function __buildNarrativePromptForTest(
+  state: AppState,
+  input: { userText: string; modules: PromptModule[]; evidence: ContextEvidence[] },
+  outputTokenBudget = 2000,
+  tier: PromptDetailTier = "full"
+): { runtimeInstruction: string; contextBlock: string } {
+  return {
+    runtimeInstruction: createRuntimeInstruction(state, outputTokenBudget, {
+      modules: input.modules,
+      omitImageAuthoring: true,
+      tier
+    }),
+    contextBlock: createContextBlock(state, input.userText, input.modules, input.evidence, {
+      outputTokenBudget,
+      omitImageAuthoring: true
+    })
+  };
+}
+
 export async function requestTurnAnnotations(
   state: AppState,
   input: { userText: string; assistantText: string; manualImage?: boolean }
 ): Promise<TurnAnnotationResult> {
   const llmState = resolveImageTagLlmState(state);
-  const requiresApiKey = !isCliAgentLlmProvider(llmState.llm.provider);
+  const requiresApiKey = getLlmProviderPreset(llmState.llm.provider).requiresApiKey;
   if (!llmState.llm.enabled || llmState.llm.provider === "mock" || (requiresApiKey && !llmState.llm.apiKey.trim())) {
     console.warn("[annotation] skipped: annotation LLM disabled/unconfigured", {
       provider: llmState.llm.provider,
@@ -4397,12 +5203,52 @@ export async function requestTurnAnnotations(
       requiresApiKey,
       hasApiKey: Boolean(llmState.llm.apiKey.trim())
     });
-    return { stateEvents: [], imageCues: [] };
+    return {
+      stateEvents: [],
+      imageCues: [],
+      failureReason: "이미지 태그/상태 추출 LLM이 설정되지 않았습니다. LLM 설정에서 모델과 키를 확인하세요."
+    };
   }
   const includeImageCues = isTurnImageCueGenerationActive(state, Boolean(input.manualImage));
-  const outputTokenBudget = resolveAnnotationOutputTokenBudget(state, includeImageCues);
-  const instruction = createAnnotationLlmInstruction(state, outputTokenBudget, includeImageCues);
-  const context = createAnnotationLlmContext(state, { ...input, outputTokenBudget }, includeImageCues);
+  if (!includeImageCues) {
+    // The single most common "why is there no image" cause is a settings gate, not a model failure.
+    // Filter the browser console by "[annotation]" to see which one fired.
+    console.info("[annotation] image cues skipped: generation not active for this turn", {
+      imageProfileEnabled: state.imageProfile.enabled,
+      realtimeImageEnabled: state.simulation.realtimeImageEnabled,
+      triggerMode: state.imageProfile.triggerMode,
+      cadence: state.imageProfile.generationCadence,
+      manualImage: Boolean(input.manualImage)
+    });
+  }
+  // Size the prompt to the model that will actually serve it. This is the largest call of the turn (~10k
+  // tokens at full detail), and a local backend commonly has a 4k window — so without this the request is
+  // rejected upstream before the model sees it, and the turn loses BOTH its images and its state deltas.
+  const budget = resolveAnnotationPromptBudget(llmState, resolveAnnotationOutputTokenBudget(state, includeImageCues));
+  const outputTokenBudget = budget.outputTokenBudget;
+  // Measure, do not assume. The prompt's real size depends on how many characters, presets and state
+  // events the creator's simulation carries, so the tier is chosen by building and checking rather than
+  // from a constant that cannot know any of that.
+  const fitted = buildWithinBudget(
+    budget,
+    (tier) => ({
+      instruction: createAnnotationLlmInstruction(state, outputTokenBudget, includeImageCues, tier),
+      context: createAnnotationLlmContext(state, { ...input, outputTokenBudget }, includeImageCues, tier)
+    }),
+    (built) => `${built.instruction}
+${built.context}
+${input.userText}`
+  );
+  const { instruction, context } = fitted.built;
+  if (!fitted.fits) {
+    console.warn("[annotation] prompt exceeds the model's context even at the smallest detail tier", {
+      tier: fitted.tier,
+      estimatedInputTokens: fitted.estimatedTokens,
+      inputTokenBudget: budget.inputTokenBudget,
+      outputTokenBudget,
+      contextTokens: budget.contextTokens
+    });
+  }
   try {
     const raw = await requestProviderText(
       llmState,
@@ -4410,29 +5256,69 @@ export async function requestTurnAnnotations(
       instruction,
       context,
       outputTokenBudget,
-      { temperature: llmState.llm.temperature }
+      // The annotation/image-cue reply is parsed as strict JSON, so ask the backend to guarantee it where
+      // it can. Open-weight models are markedly less disciplined about unprompted JSON than the hosted tier,
+      // and a malformed reply degrades into cues with missing character prompts.
+      { temperature: llmState.llm.temperature, jsonResponse: supportsJsonResponseFormat(llmState.llm.provider) }
     );
     if (!raw?.trim()) {
       console.warn("[annotation] LLM returned empty content", { provider: llmState.llm.provider, model: llmState.llm.model });
-      return { stateEvents: [], imageCues: [] };
+      return { stateEvents: [], imageCues: [], failureReason: "이미지 태그 LLM이 빈 응답을 반환했습니다." };
     }
     const result = parseAnnotationResponse(raw, includeImageCues);
     console.info(`[annotation] parsed ${result.stateEvents.length} state event(s), ${result.imageCues.length} image cue(s)`, {
       includeImageCues,
       shouldGenerate: result.imageCues.filter((c) => c.shouldGenerate).length
     });
-    return result;
+    // The cadence is a creator setting, not a suggestion to the model. When the first pass undershoots it,
+    // fill the gap here rather than shipping a one-cut turn on a high-density cadence.
+    return includeImageCues
+      ? await topUpImageCues(llmState, state, input, result, { outputTokenBudget, tier: fitted.tier })
+      : result;
   } catch (error) {
-    console.warn("[annotation] LLM call failed", { provider: llmState.llm.provider, model: llmState.llm.model, error: error instanceof Error ? error.message : String(error) });
-    return { stateEvents: [], imageCues: [] };
+    // Same reasoning as the narrative pass: a cancelled turn must abort, not degrade into an empty
+    // annotation that the caller would treat as a completed (image-less, state-less) turn.
+    if (isLlmAbortedError(error)) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("[annotation] LLM call failed", { provider: llmState.llm.provider, model: llmState.llm.model, error: message });
+    return { stateEvents: [], imageCues: [], failureReason: summarizeAnnotationFailure(message) };
   }
+}
+
+/**
+ * Turns a provider error into something the operator can act on. The context-overflow case is called out by
+ * name because it is the one an open-model or local setup hits first: the annotation prompt carries the tag
+ * contract, the cast, the visual state and the preset library, so it is by far the largest of the turn.
+ */
+function summarizeAnnotationFailure(message: string): string {
+  if (/context size|context length|exceeds the available context|maximum context|too many tokens/iu.test(message)) {
+    return "이미지 태그 LLM의 컨텍스트 한도를 초과했습니다. 컨텍스트가 더 큰 모델을 쓰거나 프롬프트 모듈/프리셋을 줄이세요.";
+  }
+  if (/\b429\b|rate limit/iu.test(message)) {
+    return "이미지 태그 LLM이 요청 제한에 걸렸습니다. 잠시 후 다시 진행하세요.";
+  }
+  if (/\b401\b|\b403\b|unauthor|invalid api key/iu.test(message)) {
+    return "이미지 태그 LLM 인증에 실패했습니다. API 키를 확인하세요.";
+  }
+  return `이미지 태그/상태 추출에 실패했습니다: ${message.slice(0, 180)}`;
 }
 
 function createRuntimeInstruction(
   state: AppState,
   outputTokenBudget: number,
-  options: { manualImage?: boolean; modules?: PromptModule[]; omitImageAuthoring?: boolean } = {}
+  options: { manualImage?: boolean; modules?: PromptModule[]; omitImageAuthoring?: boolean; tier?: PromptDetailTier } = {}
 ): string {
+  // Same bargain as the annotation prompt's tier ladder: every structural rule survives, only the reasoning
+  // that explains WHY a rule exists is dropped. A large context keeps the elaboration, because that is what
+  // makes a model apply a rule correctly to a case the rule did not foresee; a 16k local context cannot
+  // afford it and would otherwise pay for it out of the reply budget, which is what produced 204-character
+  // turns on the shipped full-size simulation.
+  const terse = options.tier === "compact" || options.tier === "minimal";
+  // Rendered once and used twice: the dedup below may only remove a line that this exact text still carries,
+  // and the block itself is emitted at the tail.
+  const stableFoundation = createStableFoundationBlock(state);
   // Compute the creator output-format contract from STABLE sources only (main prompt + always-on foundation), not the
   // per-turn RAG module selection. The visible-format gate is a session-level creator contract; letting a transiently
   // selected module flip it would also make this system-prompt instruction drift turn to turn and bust prompt caching.
@@ -4450,27 +5336,37 @@ function createRuntimeInstruction(
   const imageAuthoringActive =
     !options.omitImageAuthoring && (realtimeImageActive || Boolean(options.manualImage) || isImageProgressionCadence(state));
   return [
-    state.llm.systemPrompt,
+    createDeduplicatedSystemPrompt(state, stableFoundation),
     contentRatingInstruction,
-    "High-priority roster/relationship-map guard: registered characters, relationship values, current moods, and stored status records are background reference only. Do not mention, summon, move, react with, or include a character solely because they exist in the roster or relationship map; require current-scene evidence from the recent transcript, current User action, or an active scene rule.",
-    "DynamicChat execution order:",
-    "1. Read the Simulation foundation first. Every Main rules block is creator-authored operating law for this turn.",
-    "2. Read the Selected prompt modules for this turn after the foundation. Apply always modules and locally/neuralmap/manually selected modules as active rules, not as optional summaries.",
-    "3. Continue the exact current scene from the Recent transcript and User action. assistant_text must be an actual Korean simulation continuation, not a meta acknowledgement that the next scene will continue.",
-    "4. If creator rules define a response structure, status window, choice format, or required ending block, put that complete structure inside assistant_text every turn while keeping the outer response valid JSON.",
+    terse
+      ? "Roster guard: the character roster and relationship map are background reference. Put a character on stage only with evidence from the recent transcript, the User action, or an active scene rule."
+      : "High-priority roster/relationship-map guard: registered characters, relationship values, current moods, and stored status records are background reference only. Do not mention, summon, move, react with, or include a character solely because they exist in the roster or relationship map; require current-scene evidence from the recent transcript, current User action, or an active scene rule.",
+    terse
+      ? "Execution order: (1) Simulation foundation is creator-authored operating law. (2) Selected prompt modules are active rules, not summaries. (3) Continue the exact current scene from the transcript and User action — real Korean continuation, never a meta acknowledgement. (4) Any response structure the creator's rules require goes inside assistant_text every turn."
+      : "DynamicChat execution order:",
+    terse ? undefined : "1. Read the Simulation foundation first. Every Main rules block is creator-authored operating law for this turn.",
+    terse ? undefined : "2. Read the Selected prompt modules for this turn after the foundation. Apply always modules and locally/neuralmap/manually selected modules as active rules, not as optional summaries.",
+    terse ? undefined : "3. Continue the exact current scene from the Recent transcript and User action. assistant_text must be an actual Korean simulation continuation, not a meta acknowledgement that the next scene will continue.",
+    terse ? undefined : "4. If creator rules define a response structure, status window, choice format, or required ending block, put that complete structure inside assistant_text every turn while keeping the outer response valid JSON.",
     isImageProgressionCadence(state)
       ? "Image progression mode override: visible response structures, long status windows, prose narration, and choice blocks are replaced by the compact assistant_text line plus the ordered image_cues cut list. Persist only durable changes in memory_events."
       : undefined,
     "Always preserve the Simulation foundation below: title, premise, existing character roster, and main rules are active every turn.",
-    "Long-run continuity (anti-degradation only): keep the established facts, character state, scene, and momentum from the transcript, and do not loop or repeat earlier turns as the log grows. HOW the scene reads — voice, tone, vividness, pacing, dialogue, intensity, explicitness — is governed solely by the creator's Main rules and modules; DynamicChat adds no style of its own and must not suppress, soften, or restrain the creator's. Match the creator's register exactly.",
+    terse
+      ? "Long-run continuity: keep established facts, character state, scene and momentum; do not loop earlier turns. Voice, tone, vividness, pacing, intensity and explicitness are the creator's Main rules alone — match that register exactly and never soften it."
+      : "Long-run continuity (anti-degradation only): keep the established facts, character state, scene, and momentum from the transcript, and do not loop or repeat earlier turns as the log grows. HOW the scene reads — voice, tone, vividness, pacing, dialogue, intensity, explicitness — is governed solely by the creator's Main rules and modules; DynamicChat adds no style of its own and must not suppress, soften, or restrain the creator's. Match the creator's register exactly.",
     "The Immediate continuity anchor is the handoff point for this turn. Continue from the latest assistant ending and the current User action before using older retrieved memories.",
     "For long previous assistant output, the ending/status/choice block is more important than the opening. Do not restart from the prior response opening when a later ending is available.",
     "Use retrieved prompt modules and memory evidence as additional active context. If they conflict with the foundation, preserve explicit user-authored main rules unless the user changes them.",
     "Treat character summaries, relationships, current moods, active scene rules, and situation-specific modules as concrete setting constraints, not flavor text.",
     "Treat Structured simulation memory as the compact truth/current-state view. Do not infer that every character knows every fact; respect observation and belief notes when deciding character knowledge.",
     "Do not replace the main cast or invent unrelated protagonists. Introduce a new character only when the user action or retrieved context clearly requires one.",
-    "If a user persona is active, treat it as the user's controlled role, background, goals, tone, and boundaries. If the persona source is an existing character, the User action is that character's action/dialogue/choice in the current scene; do not also puppet that controlled character beyond the user's explicit input.",
-    "Input notation rule: any user text enclosed by the literal `*(` and `)*` marker, such as `*(문 쪽으로 이동한다)*`, is an action, stage direction, or descriptive instruction. Do not treat that enclosed text as spoken dialogue or internal thought unless the user explicitly labels it that way.",
+    terse
+      ? "An active user persona is the user's controlled role. If it maps to an existing character, the User action is that character's action — do not puppet them beyond the user's input."
+      : "If a user persona is active, treat it as the user's controlled role, background, goals, tone, and boundaries. If the persona source is an existing character, the User action is that character's action/dialogue/choice in the current scene; do not also puppet that controlled character beyond the user's explicit input.",
+    terse
+      ? "Input notation: user text wrapped in `*(` `)*` is an action or stage direction, not spoken dialogue."
+      : "Input notation rule: any user text enclosed by the literal `*(` and `)*` marker, such as `*(문 쪽으로 이동한다)*`, is an action, stage direction, or descriptive instruction. Do not treat that enclosed text as spoken dialogue or internal thought unless the user explicitly labels it that way.",
     createOutputLengthInstruction(outputTokenBudget, state),
     "Use the Recent transcript to continue the exact current scene, location, cast, and momentum. Do not jump to a stale or unrelated scene label.",
     options.omitImageAuthoring
@@ -4479,17 +5375,25 @@ function createRuntimeInstruction(
     isImageProgressionCadence(state)
       ? `Image progression assistant_text rule: write one short Korean status line only, such as \`이미지 진행 ${IMAGE_PROGRESSION_CUE_TARGET}컷.\` Do not write prose narration, dialogue, markdown, status windows, choices, explanations, or visible tag lists in assistant_text.`
       : creatorOutputFormat.requiresVisibleFormatFromMain
-        ? "assistant_text must follow the creator-defined output format every turn: Korean scene prose plus any required Markdown status/choice/table blocks from Main rules. Use valid GFM pipe tables ONLY for an explicit structured status/data block the Main rules require; a table holds short field/value data, never narration or spoken dialogue. Do not wrap anything in DynamicChat effect blocks (```scene/```impact/```whisper/```sfx/```status/```choice/```memory/```letter or ::impact[text]) — they are not rendered; write required status/choice structure as plain Markdown instead. Do not replace a required status/table block with memory_events only. Do not output raw HTML."
-        : "Default assistant_text to natural Korean prose with Markdown only when useful. DynamicChat effect blocks are off by default — do not output status windows, stat lines, choice menus, Markdown tables, or code-fence effect blocks (```scene/```impact/```status/```choice/```memory/```letter/```whisper/```sfx). Do not output raw HTML or visible parser labels such as 'SFX:' or 'status -'.",
+        ? terse
+          ? "assistant_text = Korean scene prose plus the Markdown status/choice/table blocks the Main rules require. GFM pipe tables hold short field/value data only, never narration or dialogue. No DynamicChat effect fences (```scene/```impact/```status/```choice/…) and no raw HTML — they are not rendered."
+          : "assistant_text must follow the creator-defined output format every turn: Korean scene prose plus any required Markdown status/choice/table blocks from Main rules. Use valid GFM pipe tables ONLY for an explicit structured status/data block the Main rules require; a table holds short field/value data, never narration or spoken dialogue. Do not wrap anything in DynamicChat effect blocks (```scene/```impact/```whisper/```sfx/```status/```choice/```memory/```letter or ::impact[text]) — they are not rendered; write required status/choice structure as plain Markdown instead. Do not replace a required status/table block with memory_events only. Do not output raw HTML."
+        : terse
+          ? "assistant_text is natural Korean prose. No status windows, stat lines, choice menus, Markdown tables, effect fences, raw HTML, or visible parser labels."
+          : "Default assistant_text to natural Korean prose with Markdown only when useful. DynamicChat effect blocks are off by default — do not output status windows, stat lines, choice menus, Markdown tables, or code-fence effect blocks (```scene/```impact/```status/```choice/```memory/```letter/```whisper/```sfx). Do not output raw HTML or visible parser labels such as 'SFX:' or 'status -'.",
     isImageProgressionCadence(state)
       ? undefined
-      : "Paragraph formatting for assistant_text: separate paragraphs with a blank line — a literal double newline `\\n\\n` in the JSON string (write \"...문장.\\n\\n다음 문단...\") — so the reply is not one unbroken block and images can sit between beats. Use NATURAL paragraph lengths that fit the creator's style (a normal mix of multi-sentence narration and dialogue); do NOT force every sentence or every line onto its own paragraph, which makes the prose read like a clipped list.",
+      : terse
+        ? "Paragraph formatting: separate paragraphs with a literal `\\n\\n` in the JSON string. Use natural paragraph lengths — do not put every sentence on its own line."
+        : "Paragraph formatting for assistant_text: separate paragraphs with a blank line — a literal double newline `\\n\\n` in the JSON string (write \"...문장.\\n\\n다음 문단...\") — so the reply is not one unbroken block and images can sit between beats. Use NATURAL paragraph lengths that fit the creator's style (a normal mix of multi-sentence narration and dialogue); do NOT force every sentence or every line onto its own paragraph, which makes the prose read like a clipped list.",
     // Native-Korean authoring (correctness, NOT a house style): these instructions are written in English, so the model
     // tends to compose in English and then translate, producing 번역투 (translationese). Counter that failure mode
     // without imposing any prose style — style/register/vividness stay 100% the creator's.
     isImageProgressionCadence(state)
       ? undefined
-      : "한국어 서술 자연스러움(필수 · 문체 규칙 아님): assistant_text는 영어로 사고한 뒤 옮긴 듯한 번역투가 아니라, 처음부터 한국어로 사고하고 쓴 자연스러운 한국어여야 한다. 영어 어순을 직역한 흔적 — 무생물·추상 명사를 주어로 남용, '그/그녀/그것' 대명사의 기계적 반복, '~을 가지다/만들다/취하다' 식 축자 번역, 수동태와 관계절 남발, 원문 단어를 1:1로 대응시킨 어색한 조어 — 을 피하고, 한국어 화자가 실제로 쓰는 어순·조사·연결어미·문장 호흡으로 쓴다. 이 규칙은 어색함만 제거할 뿐이며, 문체·어조·묘사 밀도·수위·표현 강도는 오직 창작자의 Main 규칙과 모듈이 정한다(DynamicChat은 고유 문체를 더하지 않는다).",
+      : terse
+        ? "한국어 서술 자연스러움(필수 · 문체 규칙 아님): assistant_text는 번역투가 아니라 처음부터 한국어로 쓴 문장이어야 한다. 무생물 주어 남용, 대명사 반복, 수동태·관계절 남발을 피하고 한국어의 어순·조사·연결어미로 쓴다. 문체와 수위는 오직 창작자의 규칙이 정한다."
+        : "한국어 서술 자연스러움(필수 · 문체 규칙 아님): assistant_text는 영어로 사고한 뒤 옮긴 듯한 번역투가 아니라, 처음부터 한국어로 사고하고 쓴 자연스러운 한국어여야 한다. 영어 어순을 직역한 흔적 — 무생물·추상 명사를 주어로 남용, '그/그녀/그것' 대명사의 기계적 반복, '~을 가지다/만들다/취하다' 식 축자 번역, 수동태와 관계절 남발, 원문 단어를 1:1로 대응시킨 어색한 조어 — 을 피하고, 한국어 화자가 실제로 쓰는 어순·조사·연결어미·문장 호흡으로 쓴다. 이 규칙은 어색함만 제거할 뿐이며, 문체·어조·묘사 밀도·수위·표현 강도는 오직 창작자의 Main 규칙과 모듈이 정한다(DynamicChat은 고유 문체를 더하지 않는다).",
     createCreatorOutputFormatInstruction(creatorOutputFormat),
     imageAuthoringActive
       ? "Image cue ownership: this main response owns final image_cues. No later tag planner will fix, expand, or infer tags. When the current beat should be illustrated, write the complete NovelAI tags now in image_cues.base_tags + character_prompts."
@@ -4534,7 +5438,7 @@ function createRuntimeInstruction(
     // byte-identical, prompt-cacheable prefix across turns. The volatile current-scene view (who is on stage now) is
     // sent separately in the per-turn context (createSceneFoundationBlock), after this system prompt.
     "Simulation foundation (creator operating law — active every turn):",
-    createStableFoundationBlock(state)
+    stableFoundation
   ].join("\n");
 }
 
@@ -4921,17 +5825,33 @@ function formatFoundationModule(title: string, tokenPolicy: string, body: string
   return `# ${title} (${tokenPolicy})\n${excerpt}`;
 }
 
-function createRecentTranscriptBlock(state: AppState): string {
+/**
+ * The last few turns of prose, optionally shrunk to fit a small context.
+ *
+ * This block is the one part of the "always present" prompt that GROWS as a simulation runs: eight messages
+ * at up to 800 characters each. On a 16k local context a session therefore starts fitting comfortably and
+ * stops fitting a few turns later, which surfaced as a reply budget that silently collapsed mid-session.
+ *
+ * `scale` shrinks the excerpt length before the message count, because the transcript's job here is to show
+ * the model how this simulation reads and how the scene stands — fewer, fuller turns lose the register;
+ * shorter excerpts of the same turns keep it. The newest messages are always the ones kept.
+ */
+function createRecentTranscriptBlock(state: AppState, scale = 1): string {
+  const clampedScale = Math.max(0.25, Math.min(1, scale));
+  const messageCount = clampedScale >= 0.5 ? 8 : 5;
+  const excerptChars = Math.max(220, Math.round(RECENT_TRANSCRIPT_MESSAGE_CHARS * clampedScale));
   const recentMessages = state.messages
     .filter((message) => !(message.role === "assistant" && looksLikeProviderBoilerplateText(message.content)))
-    .slice(-8);
+    .slice(-messageCount);
   const latestAssistantId = [...recentMessages].reverse().find((message) => message.role === "assistant")?.id;
   return recentMessages
     .map((message) => {
       const isLatestAssistant = message.id === latestAssistantId;
       const content = createContinuityExcerpt(
         message.content,
-        RECENT_TRANSCRIPT_MESSAGE_CHARS,
+        // The latest assistant ending is the handoff point for this turn, so it keeps its full length even
+        // when the rest of the transcript is trimmed.
+        isLatestAssistant ? RECENT_TRANSCRIPT_MESSAGE_CHARS : excerptChars,
         isLatestAssistant ? "tail" : "balanced"
       );
       const roleLabel = isLatestAssistant ? `${message.role} (latest ending)` : message.role;
@@ -5030,9 +5950,44 @@ function truncatePromptText(value: string, maxChars: number, label: string): str
   return `${normalized.slice(0, maxChars)}\n[...${label} truncated for interactive latency...]`;
 }
 
+/**
+ * Error thrown when the user cancels a turn. Distinguished from a timeout so the caller can report it as
+ * "취소됨" rather than as a failure.
+ */
+export class LlmAbortedError extends Error {
+  constructor() {
+    super("LLM request was cancelled.");
+    this.name = "LlmAbortedError";
+  }
+}
+
+export function isLlmAbortedError(error: unknown): error is LlmAbortedError {
+  return error instanceof LlmAbortedError;
+}
+
+/**
+ * The signal for the turn currently in flight. A module-level slot rather than a parameter threaded through
+ * ~20 call sites: only one turn runs at a time (the composer and auto-progress both guard on `isSending`),
+ * and every provider request in this file belongs to that turn.
+ */
+let activeTurnAbortSignal: AbortSignal | undefined;
+
+/** Binds the in-flight turn's cancellation signal. Pass undefined when the turn settles. */
+export function setActiveTurnAbortSignal(signal: AbortSignal | undefined): void {
+  activeTurnAbortSignal = signal;
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  // A cancelled turn must stop the request in flight, not just ignore its result — otherwise "중지" leaves a
+  // paid provider call running to completion.
+  const turnSignal = activeTurnAbortSignal;
+  const abortForTurn = () => controller.abort();
+  turnSignal?.addEventListener("abort", abortForTurn, { once: true });
+  if (turnSignal?.aborted) {
+    controller.abort();
+  }
   try {
     try {
       return await fetch(url, {
@@ -5040,6 +5995,9 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
         signal: controller.signal
       });
     } catch (error) {
+      if (turnSignal?.aborted) {
+        throw new LlmAbortedError();
+      }
       if (controller.signal.aborted) {
         throw new Error(`LLM request timed out after ${Math.round(timeoutMs / 1000)}s.`);
       }
@@ -5047,6 +6005,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
     }
   } finally {
     globalThis.clearTimeout(timeoutId);
+    turnSignal?.removeEventListener("abort", abortForTurn);
   }
 }
 
@@ -5161,10 +6120,31 @@ function stripLeakedScaffolding(text: string): string {
   return result;
 }
 
-// Single chokepoint for cleaning a finalized assistant_text before it is displayed AND persisted: strip
-// echoed internal context scaffolding, then collapse decoding-level repetition loops.
+/**
+ * The sidecar keys that follow assistant_text in the JSON envelope.
+ *
+ * When a model writes an UNESCAPED quote inside the narrative — which weaker open-weight models do routinely,
+ * e.g. opening a line with `"` and closing it with `』` — the JSON becomes malformed and the lenient string
+ * reader stops at the wrong quote, carrying the rest of the envelope into the narrative. Observed verbatim
+ * from qwen3:14b: a turn ended with `당신은 어떻게 대답할 것인가?","memory_events":[{"memory_kind":"observation`.
+ * Prose never legitimately contains a `","<key>":` boundary, so cutting there is safe and unambiguous.
+ */
+const LEAKED_SIDECAR_BOUNDARY =
+  /["'`]\s*,\s*["'`](?:memory_events|image_cues|state_events|assistant_text|imageCues|memoryEvents|stateEvents)["'`]\s*:/u;
+
+function truncateAtLeakedSidecarBoundary(text: string): string {
+  const match = LEAKED_SIDECAR_BOUNDARY.exec(text);
+  if (!match || match.index === 0) {
+    return text;
+  }
+  return text.slice(0, match.index).trimEnd();
+}
+
+// Single chokepoint for cleaning a finalized assistant_text before it is displayed AND persisted: cut any
+// JSON envelope that leaked past a malformed string, strip echoed internal context scaffolding, then
+// collapse decoding-level repetition loops.
 function sanitizeFinalAssistantText(text: string): string {
-  return collapseDegenerateRepetition(stripLeakedScaffolding(text));
+  return collapseDegenerateRepetition(stripLeakedScaffolding(truncateAtLeakedSidecarBoundary(text)));
 }
 
 function collapseLineRepetition(line: string): string {
@@ -5416,7 +6396,13 @@ function normalizeMemoryEventDraft(value: unknown, errors: string[]): AssistantS
     return undefined;
   }
 
-  const content = readString(value.content);
+  const stateType = readString(value.state_type) ?? readString(value.stateType);
+  const stateValue = readString(value.state_value) ?? readString(value.stateValue) ?? readString(value.value);
+  // `content` is a human-readable note; `state_type` + `state_value` are what memoryCompiler actually acts
+  // on. Open-weight models routinely omit the note while filling the load-bearing fields perfectly, and
+  // dropping the whole item over a missing label threw away the turn's outfit/pose/expression deltas — so
+  // the next image reset the scene. Synthesize the note when the event is otherwise usable.
+  const content = readString(value.content) ?? (stateType && stateValue ? `${stateType}: ${stateValue}` : undefined);
   if (!content) {
     errors.push("memory_events item missing content.");
     return undefined;
@@ -5430,8 +6416,8 @@ function normalizeMemoryEventDraft(value: unknown, errors: string[]): AssistantS
     actorName: readString(value.actor_name) ?? readString(value.actorName),
     memoryKind: normalizeMemoryKind(readString(value.memory_kind) ?? readString(value.memoryKind) ?? readString(value.kind)),
     eventType: readString(value.event_type) ?? readString(value.eventType),
-    stateType: readString(value.state_type) ?? readString(value.stateType),
-    stateValue: readString(value.state_value) ?? readString(value.stateValue) ?? readString(value.value),
+    stateType,
+    stateValue,
     targetId: readString(value.target_id) ?? readString(value.targetId),
     observers: readStringArray(value.observers).slice(0, 8),
     confidence: clampNumber(readNumber(value.confidence) ?? 0.78, 0, 1)
@@ -5470,15 +6456,23 @@ function normalizeImageCueDraft(value: unknown, errors: string[]): PlannedImageC
   const visualContext = readString(value.visual_context) ?? readString(value.visualContext);
   const explicitShouldGenerate = readBoolean(value.should_generate) ?? readBoolean(value.shouldGenerate);
   const kind = readString(value.kind) ?? readString(value.type) ?? readString(value.cue_type) ?? readString(value.cueType);
+  const shouldGenerate =
+    explicitShouldGenerate ?? Boolean(tags.length > 0 || baseTags.length > 0 || characterPrompts.length > 0 || visualContext);
+  // A suppression note only means something on a cue the model actually declined. Carrying a filler value
+  // ("none", "n/a") through on a generating cue made the planner discard a fully-tagged cut downstream.
+  const suppressionReason = shouldGenerate
+    ? undefined
+    : readString(value.suppression_reason) ?? readString(value.suppressionReason);
   return {
-    shouldGenerate: explicitShouldGenerate ?? Boolean(tags.length > 0 || baseTags.length > 0 || characterPrompts.length > 0 || visualContext),
+    shouldGenerate,
     reason,
     characters: readStringArray(value.characters),
     tags,
     baseTags,
     characterPrompts,
     scene,
-    suppressionReason: readString(value.suppression_reason) ?? readString(value.suppressionReason),
+    frame: normalizeImageCueFrame(value.frame, [...baseTags, ...tags]),
+    suppressionReason,
     visualContext,
     label: readString(value.label) ?? readString(value.name),
     kind,
@@ -5799,9 +6793,26 @@ function unwrapCliAgentBridgeResponse(raw: string): string {
   return raw;
 }
 
+/**
+ * Removes inline chain-of-thought wrappers before any JSON scan.
+ *
+ * Hosted DeepSeek/Qwen APIs put reasoning in a separate `reasoning_content` field, but the SAME open weights
+ * served locally (Ollama, LM Studio, llama.cpp, vLLM) emit `<think>…</think>` inline in `content`. Reasoning
+ * about a JSON schema is full of braces, so a first-brace/last-brace scan lands inside the think block and
+ * the slice never parses — pushing every annotation turn into lenient regex recovery.
+ */
+function stripReasoningWrappers(raw: string): string {
+  return raw
+    .replace(/<(think|thinking|reasoning)>[\s\S]*?<\/\1>/giu, "")
+    // Unterminated open case: the model was cut off mid-thought, so everything up to the last close tag goes.
+    .replace(/^[\s\S]*?<\/(?:think|thinking|reasoning)>/u, "")
+    .trim();
+}
+
 function extractJsonObject(raw: string): string | undefined {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/iu)?.[1]?.trim();
-  const candidate = fenced ?? raw.trim();
+  const withoutReasoning = stripReasoningWrappers(raw);
+  const fenced = withoutReasoning.match(/```(?:json)?\s*([\s\S]*?)```/iu)?.[1]?.trim();
+  const candidate = fenced ?? withoutReasoning.trim();
   const firstBrace = candidate.indexOf("{");
   const lastBrace = candidate.lastIndexOf("}");
   if (firstBrace < 0 || lastBrace <= firstBrace) {
@@ -5812,7 +6823,7 @@ function extractJsonObject(raw: string): string | undefined {
 }
 
 function stripLikelyJsonFence(raw: string): string {
-  return raw.replace(/```(?:json)?/giu, "").replace(/```/gu, "");
+  return stripReasoningWrappers(raw).replace(/```(?:json)?/giu, "").replace(/```/gu, "");
 }
 
 function createDisplayFallbackText(rawInput: string, fallback: string): string {

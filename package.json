@@ -10,9 +10,12 @@
     "eval:simulation": "node server/simulation-quality-eval.mjs",
     "eval:image-prompts": "node server/image-prompt-quality-eval.mjs",
     "eval:simulation-runs": "node server/simulation-run-quality-eval.mjs",
-    "eval:quality": "pnpm eval:simulation && pnpm eval:image-prompts && pnpm eval:simulation-runs",
+    "eval:quality": "pnpm eval:simulation && pnpm eval:image-prompts && pnpm eval:simulation-runs && pnpm eval:oss-models",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "eval:oss-models": "node server/oss-model-integration-eval.mjs",
+    "eval:oss-suitability": "node server/oss-model-suitability-eval.mjs",
+    "eval:oss-compare": "node server/oss-model-compare-eval.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",

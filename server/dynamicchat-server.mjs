@@ -31,6 +31,7 @@ const novelAiSubscriptionUrls = [
 ];
 const novelAiGenerateImageUrl = "https://image.novelai.net/ai/generate-image";
 const novelAiEncodeVibeUrl = "https://image.novelai.net/ai/encode-vibe";
+const NOVELAI_UPSTREAM_TIMEOUT_MS = 180_000;
 const rateLimitWindowMs = Number(process.env.DYNAMICCHAT_RATE_LIMIT_WINDOW_MS ?? 60_000);
 const rateLimitMaxRequests = Number(process.env.DYNAMICCHAT_RATE_LIMIT_MAX ?? 180);
 const rateLimitBuckets = new Map();
@@ -95,6 +96,7 @@ function matchRoute(method, pathname) {
     ["POST", /^\/novelai\/generate-image$/u, proxyNovelAiGenerateImage],
     ["POST", /^\/novelai\/encode-vibe$/u, proxyNovelAiEncodeVibe],
     ["POST", /^\/llm\/cli-agent$/u, proxyLlmCliAgent],
+    ["POST", /^\/llm\/chat$/u, proxyLlmChat],
     ["GET", /^\/objects\/(.+)$/u, getObjectAsset],
     ["GET", /^\/simulations$/u, listSimulations],
     ["POST", /^\/simulations$/u, createSimulation],
@@ -208,14 +210,28 @@ async function proxyNovelAiGenerateImage(request, response) {
   // the upstream round-trip in ms. Remove once the first-image delay is pinpointed.
   const requestBody = JSON.stringify(payload);
   const upstreamStartedAt = Date.now();
-  const upstream = await fetch(novelAiGenerateImageUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json"
-    },
-    body: requestBody
-  });
+  let upstream;
+  try {
+    upstream = await fetch(novelAiGenerateImageUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: requestBody,
+      // Mirrors the client-side ceiling. Without it a NovelAI request that never settles holds this handler
+      // (and the browser's serialized image queue behind it) open for the life of the process.
+      signal: AbortSignal.timeout(NOVELAI_UPSTREAM_TIMEOUT_MS)
+    });
+  } catch (error) {
+    const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+    sendJson(response, timedOut ? 504 : 502, {
+      error: timedOut
+        ? `NovelAI upstream timed out after ${Math.round(NOVELAI_UPSTREAM_TIMEOUT_MS / 1000)}s.`
+        : `NovelAI upstream request failed: ${error?.message ?? "unknown error"}`
+    });
+    return;
+  }
   const bytes = Buffer.from(await upstream.arrayBuffer());
   console.log(
     `[novelai-timing] generate-image status=${upstream.status} bodyKB=${Math.round(requestBody.length / 1024)} upstreamMs=${Date.now() - upstreamStartedAt}`
@@ -227,6 +243,181 @@ async function proxyNovelAiGenerateImage(request, response) {
     "content-length": String(bytes.byteLength)
   });
   response.end(bytes);
+}
+
+// Hosts the LLM chat proxy is allowed to reach. DynamicChat runs in the browser, and virtually no inference
+// vendor serves CORS headers for a web origin, so an open-model provider is unreachable without a relay.
+// The list is an allow-list rather than an open relay: this server would otherwise be an SSRF hop into the
+// user's own network. Self-hosted endpoints (Ollama, LM Studio, vLLM) do allow the page origin and are
+// called directly by the client, so they are deliberately absent.
+const LLM_PROXY_ALLOWED_HOSTS = new Set([
+  "api.openai.com",
+  "api.anthropic.com",
+  "generativelanguage.googleapis.com",
+  "api.deepseek.com",
+  "api.moonshot.ai",
+  "api.moonshot.cn",
+  "dashscope-intl.aliyuncs.com",
+  "dashscope.aliyuncs.com",
+  "dashscope-us.aliyuncs.com",
+  "api.z.ai",
+  "open.bigmodel.cn",
+  "openrouter.ai",
+  "api.groq.com",
+  "api.together.xyz",
+  "api.fireworks.ai"
+]);
+const LLM_PROXY_TIMEOUT_MS = 300_000;
+const LLM_PROXY_EXTRA_ENV_HOSTS = (process.env.DYNAMICCHAT_LLM_PROXY_HOSTS ?? "")
+  .split(",")
+  .map((host) => host.trim().toLowerCase())
+  .filter(Boolean);
+
+function isAllowedLlmProxyHost(hostname) {
+  const host = hostname.toLowerCase();
+  return LLM_PROXY_ALLOWED_HOSTS.has(host) || LLM_PROXY_EXTRA_ENV_HOSTS.includes(host);
+}
+
+/**
+ * Relays one OpenAI-compatible chat request to a vendor the browser cannot reach directly.
+ *
+ * The API key travels in the Authorization header exactly as the client sent it; this server never stores it
+ * for the proxied call. Streaming responses are piped through byte-for-byte so SSE still arrives incrementally.
+ */
+class LlmProxyRedirectError extends Error {}
+
+/**
+ * Follows redirects MANUALLY, re-checking the allow-list on every hop.
+ *
+ * With fetch's default redirect:"follow" the allow-list only ever covered the first URL, so any 30x from an
+ * allowed host — an open redirect, a vendor's marketing hop, a hijacked path — would be followed to an
+ * arbitrary destination, including the loopback interface or a cloud metadata endpoint. Since this route
+ * answers any origin, that made the proxy an SSRF hop into the user's own network.
+ */
+async function fetchAllowedUpstream(url, method, headers, body, hop = 0) {
+  if (hop > 3) {
+    throw new LlmProxyRedirectError("LLM proxy: too many redirects.");
+  }
+  const response = await fetch(url.toString(), {
+    method,
+    headers,
+    body,
+    redirect: "manual",
+    signal: AbortSignal.timeout(LLM_PROXY_TIMEOUT_MS)
+  });
+  if (response.status < 300 || response.status > 399) {
+    return response;
+  }
+  const location = response.headers.get("location");
+  if (!location) {
+    return response;
+  }
+  const next = new URL(location, url);
+  if (next.protocol !== "https:" || !isAllowedLlmProxyHost(next.hostname)) {
+    throw new LlmProxyRedirectError(
+      `LLM proxy refused a redirect to ${next.protocol}//${next.hostname}, which is not in the allow-list.`
+    );
+  }
+  return fetchAllowedUpstream(next, method, headers, body, hop + 1);
+}
+
+async function proxyLlmChat(request, response) {
+  const token = readBearerToken(request);
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch {
+    sendJson(response, 400, { error: "Invalid JSON body." });
+    return;
+  }
+
+  const targetUrl = typeof body.url === "string" ? body.url.trim() : "";
+  if (!targetUrl) {
+    sendJson(response, 400, { error: "url is required." });
+    return;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(targetUrl);
+  } catch {
+    sendJson(response, 400, { error: "url is not a valid absolute URL." });
+    return;
+  }
+  if (parsedUrl.protocol !== "https:") {
+    sendJson(response, 400, { error: "Only https upstreams are proxied." });
+    return;
+  }
+  if (!isAllowedLlmProxyHost(parsedUrl.hostname)) {
+    sendJson(response, 403, {
+      error: `Host ${parsedUrl.hostname} is not in the LLM proxy allow-list. Set DYNAMICCHAT_LLM_PROXY_HOSTS to add it.`
+    });
+    return;
+  }
+
+  const upstreamHeaders = { "content-type": "application/json" };
+  if (token) {
+    upstreamHeaders.authorization = `Bearer ${token}`;
+  }
+  // Provider-specific headers the preset declares (OpenRouter attribution, Anthropic's browser opt-in).
+  // Hop-by-hop and host headers are never forwarded.
+  if (body.headers && typeof body.headers === "object" && !Array.isArray(body.headers)) {
+    for (const [key, value] of Object.entries(body.headers)) {
+      const name = String(key).toLowerCase();
+      if (typeof value === "string" && !["host", "content-length", "connection", "authorization"].includes(name)) {
+        upstreamHeaders[name] = value;
+      }
+    }
+  }
+
+  // Key verification probes a listing endpoint with GET; generation posts a chat body. Everything else is
+  // rejected so this cannot be used as a general-purpose request forwarder.
+  const upstreamMethod = body.method === "GET" ? "GET" : "POST";
+  const upstreamBody = upstreamMethod === "GET" ? undefined : JSON.stringify(body.body ?? {});
+  let upstream;
+  try {
+    upstream = await fetchAllowedUpstream(parsedUrl, upstreamMethod, upstreamHeaders, upstreamBody);
+  } catch (error) {
+    if (error instanceof LlmProxyRedirectError) {
+      sendJson(response, 403, { error: error.message });
+      return;
+    }
+    const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+    sendJson(response, timedOut ? 504 : 502, {
+      error: timedOut
+        ? `LLM upstream timed out after ${Math.round(LLM_PROXY_TIMEOUT_MS / 1000)}s.`
+        : `LLM upstream request failed: ${error?.message ?? "unknown error"}`
+    });
+    return;
+  }
+
+  const contentType = upstream.headers.get("content-type") ?? "application/json";
+  // Stream SSE straight through so the caller still sees tokens as they arrive; buffer everything else.
+  if (upstream.body && contentType.includes("text/event-stream")) {
+    response.writeHead(upstream.status, {
+      ...corsHeaders,
+      "content-type": contentType,
+      "cache-control": "no-cache",
+      connection: "keep-alive"
+    });
+    try {
+      for await (const chunk of upstream.body) {
+        response.write(Buffer.from(chunk));
+      }
+    } catch {
+      /* client disconnected or upstream aborted mid-stream */
+    }
+    response.end();
+    return;
+  }
+
+  const text = await upstream.text().catch(() => "");
+  response.writeHead(upstream.status, {
+    ...corsHeaders,
+    "content-type": contentType,
+    "content-length": String(Buffer.byteLength(text))
+  });
+  response.end(text);
 }
 
 async function proxyNovelAiEncodeVibe(request, response) {
@@ -840,7 +1031,54 @@ async function saveSimulationState(request, response, [simulationId]) {
   send(response, 204);
 }
 
+/**
+ * Rejects a browser request that did not come from this machine's own app.
+ *
+ * The vault answers with DECODED provider keys and the NovelAI token (decodeSecretRecord base64-decodes
+ * `encodedSecret` back to plaintext), the endpoint has no authentication, and `ownerId` falls back to
+ * "local_user" — the very owner the app itself writes under. With access-control-allow-origin defaulting to
+ * "*", a credential-less GET is a simple request that any page the user happens to be visiting could make
+ * against 127.0.0.1 and then READ, lifting every stored API key.
+ *
+ * Origin is the right discriminator: browsers attach it to every cross-origin fetch and cannot be made to
+ * forge it, while the app's own traffic carries either a localhost origin or (for non-browser callers such
+ * as the eval scripts) none at all. DYNAMICCHAT_CORS_ORIGIN, when set, is honoured as an extra allowed
+ * origin so a configured deployment keeps working.
+ */
+function isLocalBrowserOrigin(origin) {
+  if (!origin) {
+    // No Origin header: a same-origin navigation or a non-browser client (curl, the eval harness). A
+    // cross-origin fetch always carries one, so this is not a bypass.
+    return true;
+  }
+  const configured = process.env.DYNAMICCHAT_CORS_ORIGIN;
+  if (configured && configured !== "*" && origin === configured) {
+    return true;
+  }
+  try {
+    const { hostname, protocol } = new URL(origin);
+    return (protocol === "http:" || protocol === "https:") && (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1");
+  } catch {
+    // Opaque origins ("null" from a sandboxed iframe or a file:// page) are not the local app.
+    return false;
+  }
+}
+
+function rejectNonLocalSecretRequest(request, response) {
+  if (isLocalBrowserOrigin(request.headers.origin?.toString())) {
+    return false;
+  }
+  sendJson(response, 403, {
+    error: "forbidden_origin",
+    message: "개인 API 보관함은 이 컴퓨터의 DynamicChat 앱에서만 접근할 수 있습니다."
+  });
+  return true;
+}
+
 async function getPersonalApiVault(request, response) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const scope = readRequestScope(request);
   const secrets = await readSecretStore();
   const ownerSecrets = secrets.owners?.[scope.ownerId] ?? {};
@@ -849,6 +1087,9 @@ async function getPersonalApiVault(request, response) {
 }
 
 async function savePersonalApiVault(request, response) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const scope = readRequestScope(request);
   const vault = await readJsonBody(request);
   const secrets = await readSecretStore();

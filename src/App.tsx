@@ -1,10 +1,11 @@
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
+  Bell,
   Bot,
   Boxes,
   Brain,
-  Bell,
   Check,
   ChevronDown,
   ChevronRight,
@@ -20,30 +21,31 @@ import {
   Layers,
   MessageSquareText,
   Minus,
+  Moon,
   MoreHorizontal,
   Network,
   Parentheses,
   Pencil,
-  Plus,
   Play,
+  Plus,
   RefreshCcw,
+  RotateCcw,
   Save,
   Search,
   Send,
   Settings2,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Square,
-  SlidersHorizontal,
   Sun,
-  Moon,
-  RotateCcw,
-  Type as TypeIcon,
   ThumbsDown,
   ThumbsUp,
   Trash2,
+  Type as TypeIcon,
   UserRound,
-  WandSparkles
+  WandSparkles,
+  X
 } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -53,11 +55,12 @@ import type {
   DragEvent as ReactDragEvent,
   FormEvent,
   PointerEvent as ReactPointerEvent,
+  ReactElement,
   ReactNode,
   SetStateAction,
   WheelEvent as ReactWheelEvent
 } from "react";
-import { Component, createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, cloneElement, createContext, isValidElement, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { builtInSimulationStates, createStateFromDraft, hydrateState, seedState, type SimulationDraft } from "./data/seed";
 import { createId } from "./lib/id";
@@ -66,9 +69,11 @@ import {
   MAX_MAIN_PROMPT_BODY_CHARS,
   promptModuleBodyCharLimit
 } from "./lib/promptLimits";
-import { normalizeApiToken, validateLlmApi, validateNovelAiApi } from "./services/apiValidation";
+import { listLocalLlmModels, normalizeApiToken, validateLlmApi, validateNovelAiApi } from "./services/apiValidation";
 import { executeImageJob, planImageJob, shouldAutoRunImageJob } from "./services/imageOrchestrator";
-import { generateAssistantText } from "./services/llmClient";
+import { generateAssistantText, isLlmAbortedError, setActiveTurnAbortSignal } from "./services/llmClient";
+import { LLM_PROVIDER_GROUP_LABELS, LLM_PROVIDER_PRESETS, type LlmProviderPreset } from "./services/llmProviders";
+import { describeImageCueFrame } from "./services/imageFrame";
 import { encodeNovelAiVibe } from "./services/novelAiClient";
 import {
   NeuralMapClient,
@@ -224,141 +229,33 @@ const imageAssetSourceLabels: Record<ImageAsset["source"], string> = {
   fallback: "대체 이미지"
 };
 
-const llmProviderOptions: Array<{
-  value: LlmApiSettings["provider"];
-  label: string;
-  baseUrl: string;
-  defaultModel: string;
-  models: string[];
-  keyPlaceholder: string;
-  advancedBaseUrl: boolean;
-}> = [
-  {
-    value: "mock",
-    label: "Mock",
-    baseUrl: "",
-    defaultModel: "mock-simulation-agent",
-    models: ["mock-simulation-agent"],
-    keyPlaceholder: "API 키 필요 없음",
-    advancedBaseUrl: false
-  },
-  {
-    value: "codex",
-    label: "Codex / OpenAI",
-    baseUrl: "https://api.openai.com/v1",
-    defaultModel: "gpt-5-mini",
-    models: ["gpt-5", "gpt-5-mini", "o4-mini", "gpt-4.1", "gpt-4.1-mini"],
-    keyPlaceholder: "sk-...",
-    advancedBaseUrl: false
-  },
-  {
-    value: "gemini",
-    label: "Gemini",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-    defaultModel: "gemini-3.7-flash",
-    models: [
-      "gemini-3.7-flash",
-      "gemini-3.7-pro",
-      "gemini-3.1-pro-preview",
-      "gemini-3-pro-preview",
-      "gemini-3-flash-preview",
-      "gemini-3.1-flash-lite-preview",
-      "gemini-2.5-pro",
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-2.0-flash",
-      "gemini-flash-latest"
-    ],
-    keyPlaceholder: "AIza...",
-    advancedBaseUrl: false
-  },
-  {
-    value: "claude",
-    label: "Claude",
-    baseUrl: "https://api.anthropic.com/v1",
-    defaultModel: "claude-sonnet-4-6",
-    models: [
-      "claude-opus-4-7",
-      "claude-sonnet-4-6",
-      "claude-haiku-4-5-20251001",
-      "claude-3-7-sonnet-latest",
-      "claude-3-5-haiku-latest"
-    ],
-    keyPlaceholder: "sk-ant-...",
-    advancedBaseUrl: false
-  },
-  {
-    value: "openai_compatible",
-    label: "Custom compatible",
-    baseUrl: "http://127.0.0.1:8000/v1",
-    defaultModel: "local-model",
-    models: ["local-model", "custom"],
-    keyPlaceholder: "provider key",
-    advancedBaseUrl: true
-  },
-  {
-    value: "claude_cli",
-    label: "Claude 구독 CLI",
-    baseUrl: "",
-    defaultModel: "sonnet",
-    models: ["sonnet", "opus", "haiku", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
-    keyPlaceholder: "구독 CLI — API 키 불필요",
-    advancedBaseUrl: false
-  },
-  {
-    value: "codex_cli",
-    label: "Codex 구독 CLI",
-    baseUrl: "",
-    defaultModel: "gpt-5-codex",
-    models: ["gpt-5-codex", "gpt-5", "gpt-5-mini", "o4-mini"],
-    keyPlaceholder: "구독 CLI — API 키 불필요",
-    advancedBaseUrl: false
-  },
-  {
-    value: "gemini_cli",
-    label: "Gemini 구독 CLI",
-    baseUrl: "",
-    defaultModel: "gemini-3.7-flash",
-    models: [
-      "gemini-3.7-flash",
-      "gemini-3.7-pro",
-      "gemini-3.1-pro-preview",
-      "gemini-3-pro-preview",
-      "gemini-3-flash-preview",
-      "gemini-3.1-flash-lite-preview",
-      "gemini-2.5-pro",
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-2.0-flash"
-    ],
-    keyPlaceholder: "구독 CLI — API 키 불필요",
-    advancedBaseUrl: false
-  },
-  {
-    value: "antigravity_cli",
-    label: "Antigravity CLI (agy)",
-    baseUrl: "",
-    defaultModel: "gemini-3.7-flash-high",
-    models: [
-      "gemini-3.7-flash-high",
-      "gemini-3.7-flash-medium",
-      "gemini-3.7-flash-low",
-      "gemini-3.6-flash-high",
-      "gemini-3.6-flash-medium",
-      "gemini-3.6-flash-low",
-      "gemini-3.5-flash-high",
-      "gemini-3.5-flash-medium",
-      "gemini-3.5-flash-low",
-      "gemini-3.1-pro-high",
-      "gemini-3.1-pro-low",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
-      "gpt-oss-120b-medium"
-    ],
-    keyPlaceholder: "구독 CLI — API 키 불필요 (agy 로그인)",
-    advancedBaseUrl: false
-  }
-];
+// Provider metadata (label, base URL, model list, key placeholder) and runtime capabilities (wire format,
+// JSON mode, temperature ceiling, extra headers/body, CORS routing) live together in one registry so adding
+// a backend is one entry rather than four hand-maintained branch chains.
+const llmProviderOptions = LLM_PROVIDER_PRESETS;
+
+const llmProviderGroupOrder: LlmProviderPreset["group"][] = ["hosted", "open", "local", "cli", "mock"];
+
+// A flat 17-entry list buries the open-model tier among the commercial and CLI backends. Grouping makes the
+// cost/policy tradeoff the list is FOR visible at a glance.
+function LlmProviderOptionGroups() {
+  return (
+    <>
+      {llmProviderGroupOrder.map((group) => {
+        const options = llmProviderOptions.filter((option) => option.group === group);
+        return options.length > 0 ? (
+          <optgroup key={group} label={LLM_PROVIDER_GROUP_LABELS[group]}>
+            {options.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </optgroup>
+        ) : null;
+      })}
+    </>
+  );
+}
 
 type BuilderTab = "overview" | "prompts" | "characters" | "status" | "api" | "review";
 type RightPanel = "image" | "relationship" | "neuralmap" | "memory" | "ops" | "persona" | "settings";
@@ -789,10 +686,18 @@ type PersonalApiVault = {
   updatedAt?: string;
 };
 
+type RuntimeNoticeTone = "info" | "error";
+
 type RuntimeNotice = {
-  id: number;
+  id: string;
   message: string;
+  tone: RuntimeNoticeTone;
 };
+
+/** Errors stay until dismissed; confirmations expire on their own. */
+const RUNTIME_NOTICE_INFO_TTL_MS = 2_800;
+/** Cap so a burst of per-image failures cannot bury the screen. */
+const RUNTIME_NOTICE_LIMIT = 3;
 
 const mainPromptGuide =
   "항상 적용되는 진행 규칙입니다. 응답 언어, 시점, 장면 진행 방식, 출력 형식, 허용/금지 조건, 매 턴 갱신해야 할 상태처럼 LLM이 매번 따라야 하는 운영 지시를 적습니다. 지명, 역사, 세력 같은 배경 자료는 세계관/로어로 분리하는 편이 좋습니다.";
@@ -918,6 +823,18 @@ function CrackMarkerJob({ status }: { status: ImageGenerationJob["status"] }) {
 const dialogueSpanPattern = /(“[^”]*”|「[^」]*」|«[^»]*»|"[^"\n]{0,400}")/u;
 const dialogueSplitPattern = new RegExp(dialogueSpanPattern.source, "gu");
 
+/** Code content is verbatim: dialogue tinting must never reach inside a code span or fenced block. */
+function isCodeLikeMarkdownNode(element: ReactElement<{ className?: string }>): boolean {
+  if (element.type === "code" || element.type === "pre") {
+    return true;
+  }
+  if (element.type === dynamicMarkdownComponents.code || element.type === dynamicMarkdownComponents.pre) {
+    return true;
+  }
+  const className = element.props?.className;
+  return typeof className === "string" && /\brich-code(?:-block)?\b/u.test(className);
+}
+
 function decorateDialogue(children: ReactNode): ReactNode {
   const counter = { value: 0 };
   const transform = (node: ReactNode): ReactNode => {
@@ -939,6 +856,20 @@ function decorateDialogue(children: ReactNode): ReactNode {
     if (Array.isArray(node)) {
       return node.map((child) => transform(child as ReactNode));
     }
+    // Descend into elements so quoted speech inside a bold/italic/link run is still tinted. The
+    // transform used to stop at the first element, so **"가지 마."** silently lost the reader's
+    // dialogue emphasis. Code and pre subtrees are left alone — their content is verbatim.
+    if (isValidElement(node)) {
+      const element = node as ReactElement<{ children?: ReactNode; className?: string }>;
+      // react-markdown renders code/pre through the component map, so element.type is the custom FUNCTION,
+      // never the tag name — comparing against "code"/"pre" matched nothing and quoted text inside inline
+      // code was being tinted as dialogue. Match the configured components (and the class they emit).
+      if (isCodeLikeMarkdownNode(element)) {
+        return node;
+      }
+      const nested = element.props?.children;
+      return nested === undefined ? node : cloneElement(element, undefined, transform(nested));
+    }
     return node;
   };
   return transform(children);
@@ -958,7 +889,11 @@ const dynamicMarkdownComponents: Components = {
   ),
   strong: ({ node: _node, ...props }) => <strong className="rich-strong" {...props} />,
   em: ({ node: _node, ...props }) => <em className="rich-emphasis" {...props} />,
-  blockquote: ({ node: _node, ...props }) => <blockquote className="rich-quote" {...props} />,
+  blockquote: ({ node: _node, children, ...props }) => (
+    <blockquote className="rich-quote" {...props}>
+      {decorateDialogue(children)}
+    </blockquote>
+  ),
   ul: ({ node: _node, ...props }) => <ul className="rich-list" {...props} />,
   ol: ({ node: _node, ...props }) => <ol className="rich-list ordered" {...props} />,
   li: ({ node: _node, children, ...props }) => (
@@ -973,7 +908,11 @@ const dynamicMarkdownComponents: Components = {
     </div>
   ),
   th: ({ node: _node, ...props }) => <th className="rich-table-head" {...props} />,
-  td: ({ node: _node, ...props }) => <td className="rich-table-cell" {...props} />,
+  td: ({ node: _node, children, ...props }) => (
+    <td className="rich-table-cell" {...props}>
+      {decorateDialogue(children)}
+    </td>
+  ),
   code: ({ node: _node, className, ...props }) => <code className={["rich-code", className].filter(Boolean).join(" ")} {...props} />,
   pre: ({ node: _node, ...props }) => <pre className="rich-code-block" {...props} />,
   a: ({ node: _node, ...props }) => <a className="rich-link" rel="noreferrer" target="_blank" {...props} />
@@ -992,8 +931,25 @@ function readMarkdownTableCells(line: string): string[] {
   return withoutEdgePipes.split("|").map((cell) => cell.trim());
 }
 
+/**
+ * Strict GFM table-row test.
+ *
+ * This used to return true for ANY line containing a single pipe with one non-empty cell, which is how
+ * ordinary Korean dialogue ("준비됐어?" 그가 물었다 | 나는 고개를 저었다) ended up rendered as a table. It also
+ * matched a table's OWN delimiter row, so a perfectly valid table was treated as a header needing another
+ * delimiter and got shredded into two. A real GFM row is fenced by pipes and has at least two cells, and a
+ * list/blockquote/heading marker rules the line out entirely.
+ */
 function isMarkdownTableRow(line: string): boolean {
-  return readMarkdownTableCells(line).some(Boolean);
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) {
+    return false;
+  }
+  if (/^[-*>#]|^\d+[.)]/u.test(trimmed.slice(1).trim())) {
+    return false;
+  }
+  const cells = readMarkdownTableCells(trimmed);
+  return cells.length >= 2 && cells.some(Boolean);
 }
 
 function isMarkdownTableDelimiter(line: string): boolean {
@@ -1092,72 +1048,18 @@ function separateAdjacentMarkdownTables(lines: string[]): string[] {
   return normalizedLines;
 }
 
-function createMarkdownTableDelimiterRow(columnCount: number): string {
-  const cells = Array.from({ length: Math.max(1, columnCount) }, () => "---");
-  return `| ${cells.join(" | ")} |`;
-}
-
-function insertMissingMarkdownTableDelimiters(lines: string[]): string[] {
-  const normalizedLines: string[] = [];
-  let inFence = false;
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (/^\s*```/u.test(line)) {
-      inFence = !inFence;
-      normalizedLines.push(line);
-      continue;
-    }
-
-    if (!inFence && isMarkdownTableRow(line)) {
-      const nextLine = readNextNonEmptyLine(lines, index + 1);
-      if (nextLine && isMarkdownTableRow(nextLine) && !isMarkdownTableDelimiter(nextLine)) {
-        normalizedLines.push(line);
-        normalizedLines.push(createMarkdownTableDelimiterRow(readMarkdownTableCells(line).length));
-        continue;
-      }
-    }
-
-    normalizedLines.push(line);
-  }
-
-  return normalizedLines;
-}
-
+/**
+ * Repairs only the loose spacing around tables the model actually wrote. It never INVENTS table structure.
+ *
+ * Two passes used to sit here that did: one synthesized a `| --- | --- |` delimiter whenever two adjacent
+ * lines "looked like" table rows, and one deleted blank lines between any two such lines. Together with the
+ * over-permissive row test they turned ordinary prose into tables and split real tables into pieces — and
+ * because a synthesized delimiter is itself a "row", the transform was not even idempotent, while the app
+ * ran it twice on the same string. Structure now comes from the model; this only fixes whitespace.
+ */
 function normalizeLooseMarkdownTables(content: string): string {
   const lines = content.replace(/\r\n/gu, "\n").split("\n");
-  return separateAdjacentMarkdownTables(
-    removeLooseMarkdownTableHeaderGaps(collapseBlankLinesWithinTables(insertMissingMarkdownTableDelimiters(lines)))
-  ).join("\n");
-}
-
-// Removes blank lines that sit BETWEEN two table rows so a "loose" table stays one contiguous block. Without this the
-// blank-line chunk splitter (and remark-gfm) would treat the body rows as a separate paragraph, so the table renders as
-// a plain block instead of a real table. Genuine table-to-table gaps are restored later by separateAdjacentMarkdownTables.
-function collapseBlankLinesWithinTables(lines: string[]): string[] {
-  const normalizedLines: string[] = [];
-  let inFence = false;
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (/^\s*```/u.test(line)) {
-      inFence = !inFence;
-      normalizedLines.push(line);
-      continue;
-    }
-
-    if (!inFence && !line.trim()) {
-      const previousLine = readPreviousNonEmptyLine(normalizedLines);
-      const nextLine = readNextNonEmptyLine(lines, index + 1);
-      if (previousLine && nextLine && isMarkdownTableRow(previousLine) && isMarkdownTableRow(nextLine)) {
-        continue;
-      }
-    }
-
-    normalizedLines.push(line);
-  }
-
-  return normalizedLines;
+  return separateAdjacentMarkdownTables(removeLooseMarkdownTableHeaderGaps(lines)).join("\n");
 }
 
 function formatActivationTags(tags: string[]): string {
@@ -2284,6 +2186,10 @@ function createLlmProviderPatch(provider: LlmApiSettings["provider"]): Partial<L
     enabled: provider !== "mock",
     baseUrl: option.baseUrl,
     model: option.defaultModel,
+    // Reset with the rest of the connection. A context size is a property of the backend, not of the app:
+    // leaving a hosted provider's 128k behind when switching to a local one made that number the prompt
+    // budget AND Ollama's num_ctx, so the request was built for a window the model does not have.
+    contextTokens: option.contextTokens,
     registrationStatus: provider === "mock" ? "registered" : "idle",
     verifiedAt: provider === "mock" ? new Date().toISOString() : undefined,
     verificationMessage: provider === "mock" ? "Mock 모드로 등록되었습니다." : ""
@@ -3994,6 +3900,15 @@ function normalizeDynamicTextBlockKind(value: string): DynamicTextBlockKind | un
   return dynamicTextBlockAliases[normalized];
 }
 
+/**
+ * Recognises the bracket form ("[Status] ...") only.
+ *
+ * The bare-label form ("Status: ...", "Note - ...") used to be accepted too, which quietly reclassified any
+ * narrative line that happened to begin with one of the block words followed by a colon — and because a
+ * directive with no inline content swallows every following non-empty line, it could take a paragraph of
+ * prose with it. With effect blocks now carrying real styling, that misfire is visible as well as wrong, so
+ * only the explicit forms remain: [Kind], ::kind[...], ::kind ... ::, and ```kind fences.
+ */
 function parseLooseDynamicTextDirective(line: string): { kind: DynamicTextBlockKind; content?: string } | undefined {
   const bracketMatch = line.match(/^\s*\[([\p{L}\p{N}_-]+)\]\s*(.*)\s*$/u);
   if (bracketMatch) {
@@ -4002,17 +3917,6 @@ function parseLooseDynamicTextDirective(line: string): { kind: DynamicTextBlockK
       return {
         kind: bracketKind,
         content: bracketMatch[2]?.trim()
-      };
-    }
-  }
-
-  const labelMatch = line.match(/^\s*([\p{L}\p{N}_-]+)(?:(?:\s*[:：]\s*)|(?:\s+[-–—]\s+))(.*)\s*$/u);
-  if (labelMatch) {
-    const labelKind = normalizeDynamicTextBlockKind(labelMatch[1]);
-    if (labelKind) {
-      return {
-        kind: labelKind,
-        content: labelMatch[2]?.trim()
       };
     }
   }
@@ -4054,7 +3958,9 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
       segments.push({
         id: `${fenceKind}-${segments.length}`,
         kind: fenceKind,
-        content: blockLines.join("\n").trim()
+        // Effect-block bodies are markdown too, and MarkdownStageText is now a pure renderer, so
+        // they are normalized here rather than at render time (where it ran twice on the prose path).
+        content: normalizeLooseMarkdownTables(blockLines.join("\n").trim())
       });
       continue;
     }
@@ -4066,7 +3972,7 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
       segments.push({
         id: `${shortDirectiveKind}-${segments.length}`,
         kind: shortDirectiveKind,
-        content: shortDirectiveMatch?.[2].trim() ?? ""
+        content: normalizeLooseMarkdownTables(shortDirectiveMatch?.[2].trim() ?? "")
       });
       continue;
     }
@@ -4084,7 +3990,7 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
       segments.push({
         id: `${openDirectiveKind}-${segments.length}`,
         kind: openDirectiveKind,
-        content: blockLines.join("\n").trim()
+        content: normalizeLooseMarkdownTables(blockLines.join("\n").trim())
       });
       continue;
     }
@@ -4107,7 +4013,7 @@ function parseDynamicRichText(content: string): DynamicTextSegment[] {
         segments.push({
           id: `${looseDirective.kind}-${segments.length}`,
           kind: looseDirective.kind,
-          content: blockLines.join("\n").trim()
+          content: normalizeLooseMarkdownTables(blockLines.join("\n").trim())
         });
         continue;
       }
@@ -4507,6 +4413,29 @@ function applyTurnResultToState(baseState: AppState, result: TurnResult): AppSta
 // at the exact turn the handoff fires. Instead, layer ONLY the reset's new-session deltas (new activeSessionId,
 // handoff record + memory event, new-session system message, reset Context Pack, continuity check) on top of
 // the richer live React state. Idempotent: safe to apply once during streaming and again at final commit.
+/**
+ * Which run a piece of in-flight work belongs to.
+ *
+ * The app keeps ONE React state object for whichever simulation + progress run is open, and every async
+ * completion writes into it. Simulation id alone is not the identity of a run: switching progress runs keeps
+ * `simulation.id` constant while swapping the whole messages / traces / assets set, so a turn or an image
+ * started in run A used to commit straight into run B — and because hydrateState re-snapshots the top-level
+ * arrays into the active run on every write, the leak was permanent rather than transient.
+ */
+interface RunOwner {
+  simulationId: string;
+  progressRunId: string;
+}
+
+function readRunOwner(state: AppState): RunOwner {
+  return { simulationId: state.simulation.id, progressRunId: state.activeProgressRunId };
+}
+
+/** True when `current` is still the run that started the work. Every post-await setState must check this. */
+function ownsActiveRun(current: AppState, owner: RunOwner): boolean {
+  return current.simulation.id === owner.simulationId && current.activeProgressRunId === owner.progressRunId;
+}
+
 function layerSessionResetOntoLiveState(liveState: AppState, resetState: AppState): AppState {
   const liveMessageIds = new Set(liveState.messages.map((message) => message.id));
   const liveMemoryEventIds = new Set(liveState.memoryEvents.map((event) => event.id));
@@ -4779,6 +4708,13 @@ function App() {
       return hydrateState(nextState);
     });
   }, []);
+  // Live view of the current run, readable from async callbacks that closed over an older `state`. Used to
+  // decide whether long-running work (image planning, provider calls) still belongs to the run on screen
+  // BEFORE spending on it, rather than only discarding the result afterwards.
+  const latestStateRef = useRef(state);
+  useEffect(() => {
+    latestStateRef.current = state;
+  }, [state]);
   const [simulationLibrary, setSimulationLibrary] = useState<SimulationLibrary>(() => loadSimulationLibrary(hydrateState(loadState())));
   const [view, setView] = useState<"home" | "create" | "simulation">("home");
   const [builderMode, setBuilderMode] = useState<BuilderMode>("create");
@@ -4786,6 +4722,10 @@ function App() {
   const [draft, setDraft] = useState("");
   const [pendingUserText, setPendingUserText] = useState("");
   const [isSending, setIsSending] = useState(false);
+  // Which run the in-flight turn belongs to. `isSending` stays app-wide because it also guards against two
+  // concurrent turns, but the VISIBLE progress (pending bubble, phase card, composer lock) must belong to the
+  // run that started it — otherwise simulation A's turn appears to be running inside simulation B.
+  const [activeTurnOwner, setActiveTurnOwner] = useState<RunOwner | undefined>(undefined);
   const [isResetting, setIsResetting] = useState(false);
   const [personalSettingsOpen, setPersonalSettingsOpen] = useState(false);
   const [manualImage, setManualImage] = useState(false);
@@ -4795,11 +4735,17 @@ function App() {
   // Coarse current-turn phase, surfaced in the chat thread so the user can see what the turn is doing
   // (context retrieval → response generation → image generation) instead of one opaque "진행 중".
   const [turnPhase, setTurnPhase] = useState<TurnPhase | undefined>(undefined);
+  const turnAbortRef = useRef<AbortController | undefined>(undefined);
   const autoProgressStopRef = useRef(false);
+  const autoProgressOwnerRef = useRef<RunOwner | undefined>(undefined);
   const autoProgressActiveRef = useRef(false);
   const autoProgressResumeAttemptedRef = useRef(false);
   const [rightPanel, setRightPanel] = useState<RightPanel>("neuralmap");
-  const [runtimeNotice, setRuntimeNotice] = useState<RuntimeNotice | undefined>();
+  // A queue, not a single slot. One 2.4-second slot was the app's entire feedback channel, so a failure
+  // notice was routinely overwritten by the next success before it could be read — which is why image and
+  // provider errors felt invisible.
+  const [runtimeNotices, setRuntimeNotices] = useState<RuntimeNotice[]>([]);
+  const runtimeNoticeTimersRef = useRef<Map<string, number>>(new Map());
   const [storageReady, setStorageReady] = useState(false);
   const imageJobQueueRef = useRef<Promise<void>>(Promise.resolve());
   const imageAssetHydrationAttemptsRef = useRef<Map<string, number>>(new Map());
@@ -4809,40 +4755,59 @@ function App() {
   // Claims each turn+cue exactly once so the early (mid-stream) and post-turn dispatch paths can never
   // both fire a paid image request for the same cut. Keyed by createImageJobDispatchKey.
   const dispatchedImageCueKeysRef = useRef<Set<string>>(new Set());
-  const pendingStateSaveRef = useRef<AppState | undefined>(undefined);
-  const pendingStateSaveOptionsRef = useRef<SaveStateOptions>({});
+  // Pending saves, keyed by simulation id. It used to be a single last-write-wins slot, which silently
+  // coalesced two DIFFERENT simulations into one save: switching simulations while a save was pending
+  // dropped the outgoing simulation's last change entirely.
+  const pendingStateSavesRef = useRef<Map<string, { snapshot: AppState; options: SaveStateOptions }>>(new Map());
   const stateSaveScheduledRef = useRef(false);
 
-  const showRuntimeNotice = useCallback((message: string) => {
-    setRuntimeNotice({ id: Date.now(), message });
+  const pushRuntimeNotice = useCallback((message: string, tone: RuntimeNoticeTone) => {
+    setRuntimeNotices((current) => [...current, { id: createId("notice"), message, tone }].slice(-RUNTIME_NOTICE_LIMIT));
+  }, []);
+
+  const showRuntimeNotice = useCallback(
+    (message: string) => {
+      // Anything the app itself phrases as a failure is an error, whoever called it — the ~10 call sites
+      // predate the tone parameter and all use the same wording. 중지 is deliberately NOT in this list: the
+      // auto-progress start/stop confirmations all contain it and are purely informational.
+      pushRuntimeNotice(message, /실패|오류|없습니다|초과/u.test(message) ? "error" : "info");
+    },
+    [pushRuntimeNotice]
+  );
+
+  const dismissRuntimeNotice = useCallback((noticeId: string) => {
+    setRuntimeNotices((current) => current.filter((notice) => notice.id !== noticeId));
+  }, []);
+
+  const flushPendingStateSaves = useCallback(() => {
+    const pending = [...pendingStateSavesRef.current.values()];
+    pendingStateSavesRef.current.clear();
+    stateSaveScheduledRef.current = false;
+    for (const entry of pending) {
+      saveStateSnapshot(entry.snapshot, entry.options);
+    }
   }, []);
 
   const scheduleStatePersistence = useCallback((snapshot: AppState, options: SaveStateOptions = {}) => {
-    pendingStateSaveRef.current = snapshot;
-    pendingStateSaveOptionsRef.current = {
-      ...pendingStateSaveOptionsRef.current,
-      ...options,
-      includeImagePayloads:
-        pendingStateSaveOptionsRef.current.includeImagePayloads === true ||
-        options.includeImagePayloads === true
-    };
+    const key = snapshot.simulation.id;
+    const existing = pendingStateSavesRef.current.get(key);
+    pendingStateSavesRef.current.set(key, {
+      snapshot,
+      options: {
+        ...existing?.options,
+        ...options,
+        includeImagePayloads:
+          existing?.options.includeImagePayloads === true || options.includeImagePayloads === true
+      }
+    });
 
     if (stateSaveScheduledRef.current) {
       return;
     }
 
     stateSaveScheduledRef.current = true;
-    scheduleIdleTask(() => {
-      const stateToSave = pendingStateSaveRef.current;
-      const saveOptions = pendingStateSaveOptionsRef.current;
-      pendingStateSaveRef.current = undefined;
-      pendingStateSaveOptionsRef.current = {};
-      stateSaveScheduledRef.current = false;
-      if (stateToSave) {
-        saveStateSnapshot(stateToSave, saveOptions);
-      }
-    });
-  }, []);
+    scheduleIdleTask(flushPendingStateSaves);
+  }, [flushPendingStateSaves]);
 
   const primeNeuralMapSimulation = useCallback(
     (targetState: AppState) => {
@@ -5224,17 +5189,43 @@ function App() {
     saveSimulationLibrary(simulationLibrary);
   }, [simulationLibrary]);
 
+  // Only info notices expire. An error stays until the user dismisses it, so a failure that happened while
+  // the user was looking elsewhere is still there when they look back.
+  //
+  // One timer per notice id, kept in a ref. Scheduling them from an effect that depends on the whole array
+  // meant every new notice cancelled and recreated the timers for all the live ones, so a steady drip of
+  // messages kept info toasts on screen indefinitely instead of for RUNTIME_NOTICE_INFO_TTL_MS.
   useEffect(() => {
-    if (!runtimeNotice) {
-      return undefined;
+    const timers = runtimeNoticeTimersRef.current;
+    for (const notice of runtimeNotices) {
+      if (notice.tone !== "info" || timers.has(notice.id)) {
+        continue;
+      }
+      timers.set(
+        notice.id,
+        window.setTimeout(() => {
+          timers.delete(notice.id);
+          setRuntimeNotices((current) => current.filter((candidate) => candidate.id !== notice.id));
+        }, RUNTIME_NOTICE_INFO_TTL_MS)
+      );
     }
+    // Drop timers for notices that were dismissed before they expired.
+    const liveIds = new Set(runtimeNotices.map((notice) => notice.id));
+    for (const [id, timeoutId] of timers) {
+      if (!liveIds.has(id)) {
+        window.clearTimeout(timeoutId);
+        timers.delete(id);
+      }
+    }
+  }, [runtimeNotices]);
 
-    const timeoutId = window.setTimeout(() => {
-      setRuntimeNotice((current) => (current?.id === runtimeNotice.id ? undefined : current));
-    }, 2400);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [runtimeNotice]);
+  useEffect(() => {
+    const timers = runtimeNoticeTimersRef.current;
+    return () => {
+      timers.forEach((timeoutId) => window.clearTimeout(timeoutId));
+      timers.clear();
+    };
+  }, []);
 
   const selectedModule = useMemo(
     () => state.modules.find((module) => module.id === state.selectedModuleId) ?? state.modules[0],
@@ -5507,6 +5498,11 @@ function App() {
 
   const runQueuedImageJob = useCallback((job: ImageGenerationJob, snapshot: AppState, confirmed = false): Promise<void> => {
     const run = async () => {
+    // Image generation is the longest-running async path in the app — a NovelAI round-trip behind a serialized
+    // queue — so it is the most likely to outlive a navigation, and it was the only major path with no
+    // ownership check at all. Every setState below is gated on the job still belonging to the open run;
+    // without this, assets and jobs from simulation A appeared in simulation B's library.
+    const jobOwner = readRunOwner(snapshot);
     const executableJob = confirmed
       ? {
           ...job,
@@ -5523,7 +5519,7 @@ function App() {
     }
 
     const markJob = (patch: Partial<ImageGenerationJob>) => {
-      setState((current) => ({
+      setState((current) => (!ownsActiveRun(current, jobOwner) ? current : {
         ...current,
         imageJobs: current.imageJobs.map((candidate) =>
           candidate.id === executableJob.id && candidate.status !== "canceled"
@@ -5551,6 +5547,9 @@ function App() {
             representativeAssetId: progressAssets[0]?.id ?? progress.job.representativeAssetId
           };
           setState((current) => {
+            if (!ownsActiveRun(current, jobOwner)) {
+              return current;
+            }
             const existing = current.imageJobs.find((candidate) => candidate.id === progressJob.id);
             if (existing?.status === "canceled") {
               return current;
@@ -5608,6 +5607,13 @@ function App() {
       return;
     }
 
+    // executeImageJob reports provider errors by RETURNING a failed job rather than throwing (the policy-block
+    // and partial-variant paths both do), so the catch above never saw them. Those failures were completely
+    // silent in auto mode — the only trace was a status chip in a panel the user may not have open.
+    if (result.job.status === "failed") {
+      showRuntimeNotice(`NovelAI 이미지 생성 실패: ${result.job.error ?? "알 수 없는 오류"}`);
+    }
+
     const resultAssets = await persistRuntimeImagePayloads(snapshot.simulation.id, result.assets);
     result = {
       ...result,
@@ -5620,6 +5626,9 @@ function App() {
     };
 
     setState((current) => {
+      if (!ownsActiveRun(current, jobOwner)) {
+        return current;
+      }
       const existing = current.imageJobs.find((candidate) => candidate.id === executableJob.id);
       if (existing?.status === "canceled") {
         return current;
@@ -5917,8 +5926,17 @@ function App() {
       // Expansion handles distinct appended tail cues (their cueIndex restarts at 0) that the early path
       // never touched, so it keeps the original append behavior and is exempt from the claim.
       const claimTurnId = result.assistantMessage.id;
+      // Image planning is fire-and-forget from the turn loop and involves an LLM round-trip plus provider
+      // calls, so it routinely resolves long after the user has moved on. Without an owner it appended this
+      // turn's jobs, traces and audit events into whatever run happened to be open — the most visible form of
+      // "the run I started follows me into another simulation".
+      const imageOwner = readRunOwner(snapshot);
       try {
         const runtimeSnapshot = preResolvedSnapshot ?? (await resolveStateWithRuntimeSecrets(snapshot));
+        if (!ownsActiveRun(latestStateRef.current, imageOwner)) {
+          // The user left this run before anything was dispatched — do not spend on provider calls at all.
+          return;
+        }
         const imagePlan = await planImageJobForCompletedTurn(runtimeSnapshot, {
           userMessage: result.userMessage,
           assistantMessage: result.assistantMessage,
@@ -5958,6 +5976,9 @@ function App() {
         );
 
         setState((current) => {
+          if (!ownsActiveRun(current, imageOwner)) {
+            return current;
+          }
           const existingJobIds = new Set(current.imageJobs.map((job) => job.id));
           const newImageJobs = imageJobs.filter((job) => !existingJobIds.has(job.id));
           return {
@@ -6006,8 +6027,17 @@ function App() {
           };
         });
 
-        if (manual && imageJobs.length === 0 && reusedAssetIds.length === 0) {
-          showRuntimeNotice(imagePlan.imageCue.suppressionReason ?? "이미지 cue가 렌더 가능한 NAI 태그를 만들지 못해 작업을 만들지 않았습니다.");
+        // Announce a suppressed image whether or not the user asked for it explicitly. Gating this on `manual`
+        // meant that in auto mode — where almost all images are produced — a cue that was blocked by policy or
+        // arrived without renderable tags simply produced nothing, with no way to tell it apart from a turn
+        // the model judged non-visual.
+        if (imageJobs.length === 0 && reusedAssetIds.length === 0 && plannedImageJobs.length === 0) {
+          const suppressionReason = imagePlan.imageCue.suppressionReason;
+          if (manual) {
+            showRuntimeNotice(suppressionReason ?? "이미지 cue가 렌더 가능한 NAI 태그를 만들지 못해 작업을 만들지 않았습니다.");
+          } else if (suppressionReason) {
+            showRuntimeNotice(`이미지 생성 건너뜀: ${suppressionReason}`);
+          }
         }
 
         const runnableImageJobs = imageJobs.filter(shouldAutoRunImageJob);
@@ -6044,7 +6074,11 @@ function App() {
             )
           };
 
-          void runRunnableImageJobs(runnableImageJobs, snapshotWithImageJobs, runQueuedImageJob);
+          // Returned, not voided, so the caller's `await imagePlanning` genuinely covers every job of this
+          // turn. Previously auto-progress awaited `imageJobQueueRef.current` instead — a moving chain tail
+          // that only covered the jobs already handed to the runner, so on the paragraph cadence (up to 8
+          // cuts) most of the turn's images were outside the barrier and the loop raced ahead of them.
+          await runRunnableImageJobs(runnableImageJobs, snapshotWithImageJobs, runQueuedImageJob);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : "이미지 작업 계획 중 알 수 없는 오류가 발생했습니다.";
@@ -6107,7 +6141,17 @@ function App() {
     ): Promise<AppState | null> => {
       const shouldPlanManualImage = options.manualImage ?? false;
       const sourceState = options.baseState ?? state;
+      // One controller per turn, so 중지 actually aborts the provider request instead of merely ignoring
+      // its result. Cleared in the finally block below.
+      const turnAbortController = new AbortController();
+      turnAbortRef.current = turnAbortController;
+      setActiveTurnAbortSignal(turnAbortController.signal);
+      let streamedTurnMessageIds: string[] = [];
+      // Hoisted so the catch can reach it. An auto session reset changes the session id but never the
+      // simulation or progress-run id, so this is the same owner the guards inside the try use.
+      const runOwner = readRunOwner(sourceState);
       setIsSending(true);
+      setActiveTurnOwner(runOwner);
       setPendingUserText(text);
       setTurnPhase("retrieving");
       try {
@@ -6122,11 +6166,11 @@ function App() {
           ? await createResetSessionState(runtimeState)
           : runtimeState;
         const autoResetApplied = turnBaseState.simulation.activeSessionId !== runtimeState.simulation.activeSessionId;
-        // This turn belongs to ONE simulation. If the user navigates to a different simulation while the
-        // turn is still streaming/committing, every setState below must no-op instead of merging this
-        // turn's messages/result into whatever simulation is now active (otherwise the old run "continues"
-        // in the new simulation). The id is stable across an auto session reset (same simulation.id).
-        const turnSimulationId = turnBaseState.simulation.id;
+        // This turn belongs to ONE simulation AND one progress run. If the user navigates elsewhere while the
+        // turn is still streaming/committing, every setState below must no-op instead of merging this turn's
+        // messages/result into whatever run is now active (otherwise the old run "continues" in the new one).
+        // Both ids are stable across an auto session reset.
+        const turnOwner = readRunOwner(turnBaseState);
         const result = await runSimulationTurn(turnBaseState, text, shouldPlanManualImage, {
           deferImagePlanning: true,
           deferMemoryIngest: true,
@@ -6141,8 +6185,12 @@ function App() {
           },
           onAssistantText: ({ userMessage, assistantMessage }) => {
             setTurnPhase("generating");
+            // Remembered so a cancel can roll the partial turn back out: the narrative streams into state
+            // every ~220ms, so by the time the user hits 중지 both messages are already on screen, and
+            // leaving them there commits a truncated turn as if it had completed.
+            streamedTurnMessageIds = [userMessage.id, assistantMessage.id];
             setState((current) => {
-              if (current.simulation.id !== turnSimulationId) {
+              if (!ownsActiveRun(current, turnOwner)) {
                 return current;
               }
               const baseState =
@@ -6154,7 +6202,7 @@ function App() {
           },
           onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
             setState((current) =>
-              current.simulation.id !== turnSimulationId
+              !ownsActiveRun(current, turnOwner)
                 ? current
                 : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
             );
@@ -6162,7 +6210,7 @@ function App() {
         });
         const committedTurnState = applyTurnResultToState(turnBaseState, result);
         setState((current) => {
-          if (current.simulation.id !== turnSimulationId) {
+          if (!ownsActiveRun(current, turnOwner)) {
             return current;
           }
           const baseState = autoResetApplied ? layerSessionResetOntoLiveState(current, turnBaseState) : current;
@@ -6180,7 +6228,6 @@ function App() {
           // per job, so never let them reject the turn.
           try {
             await imagePlanning;
-            await imageJobQueueRef.current;
           } catch {
             /* per-job errors already handled in runQueuedImageJob */
           }
@@ -6193,14 +6240,38 @@ function App() {
         if (result.sidecarTrace.source !== "llm") {
           showRuntimeNotice(createLlmFallbackNotice("LLM 응답 fallback", result.sidecarTrace));
         }
+        // The annotation pass authors both the image cues and the state deltas, so its failure produces a
+        // turn with no image and no state update that is otherwise indistinguishable from a non-visual beat.
+        if (result.annotationFailureReason) {
+          pushRuntimeNotice(result.annotationFailureReason, "error");
+        }
         return committedTurnState;
       } catch (error) {
+        if (isLlmAbortedError(error) || turnAbortController.signal.aborted) {
+          // A cancel is a user decision, not a failure — say so plainly and do not colour it as an error.
+          // Drop whatever streamed in before the abort so the cancelled turn leaves no half-written reply.
+          if (streamedTurnMessageIds.length > 0) {
+            const discardedIds = new Set(streamedTurnMessageIds);
+            setState((current) =>
+              ownsActiveRun(current, runOwner)
+                ? { ...current, messages: current.messages.filter((message) => !discardedIds.has(message.id)) }
+                : current
+            );
+          }
+          pushRuntimeNotice("진행을 취소했습니다.", "info");
+          return null;
+        }
         const message = error instanceof Error ? error.message : "시뮬레이션 턴 실행 중 알 수 없는 오류가 발생했습니다.";
         showRuntimeNotice(`시뮬레이션 진행 실패: ${message}`);
         return null;
       } finally {
+        if (turnAbortRef.current === turnAbortController) {
+          turnAbortRef.current = undefined;
+          setActiveTurnAbortSignal(undefined);
+        }
         setPendingUserText("");
         setIsSending(false);
+        setActiveTurnOwner(undefined);
         setTurnPhase(undefined);
       }
     },
@@ -6233,10 +6304,14 @@ function App() {
       const total = Math.max(1, Math.min(100, Math.round(Number(turns) || 0)));
       autoProgressStopRef.current = false;
       autoProgressActiveRef.current = true;
+      // Record which run the loop belongs to so ANY later navigation stops it — see the effect below.
+      // Stopping used to be wired to one specific handler (openSimulation), so creating, copying, resetting,
+      // or switching progress run all left the loop running against the previous run's threaded state.
+      autoProgressOwnerRef.current = readRunOwner(state);
       setIsAutoProgressing(true);
       setAutoProgressTotal(total);
       setAutoProgressRemaining(total);
-      showRuntimeNotice(`자동 진행을 시작합니다 (${total}턴). 중지 버튼으로 멈출 수 있습니다.`);
+      pushRuntimeNotice(`자동 진행을 시작합니다 (${total}턴). 중지 버튼으로 멈출 수 있습니다.`, "info");
       // Persist the "keep going" intent so a page refresh mid-run resumes instead of silently dropping the
       // remaining turns. Keyed to the live run (sim/session/progress run) it is progressing.
       const persistIntent = (referenceState: AppState, remaining: number) => {
@@ -6281,13 +6356,46 @@ function App() {
         setAutoProgressTotal(0);
         // The run reached its planned end (or was stopped/aborted); never auto-resume it after the next reload.
         clearAutoProgressIntent();
-        showRuntimeNotice(
-          stopped ? `자동 진행을 중지했습니다 (${completed}턴 진행).` : `자동 진행을 완료했습니다 (${completed}턴).`
+        pushRuntimeNotice(
+          stopped ? `자동 진행을 중지했습니다 (${completed}턴 진행).` : `자동 진행을 완료했습니다 (${completed}턴).`,
+          "info"
         );
       }
     },
-    [isResetting, isSending, runTurnFromText, showRuntimeNotice, state]
+    [isResetting, isSending, pushRuntimeNotice, runTurnFromText, showRuntimeNotice, state]
   );
+
+  // Any change of the active run stops an in-flight auto-progress loop. The loop threads its own working
+  // state and never re-reads React state, so without this it is structurally detached from what the user is
+  // looking at: it keeps burning provider calls on a run that is no longer on screen.
+  useEffect(() => {
+    const owner = autoProgressOwnerRef.current;
+    if (!autoProgressActiveRef.current || !owner) {
+      return;
+    }
+    if (!ownsActiveRun(state, owner)) {
+      autoProgressStopRef.current = true;
+      clearAutoProgressIntent();
+    }
+  }, [state]);
+
+  // The dispatch-claim set keys off assistant-message ids, so it cannot collide across runs — but it is
+  // never emptied either, and it grows for the lifetime of the mount. Clear it whenever the run changes,
+  // where the claims from the outgoing run can no longer be relevant.
+  useEffect(() => {
+    dispatchedImageCueKeysRef.current.clear();
+  }, [state.simulation.id, state.activeProgressRunId]);
+
+  const cancelActiveTurn = useCallback(() => {
+    if (!turnAbortRef.current) {
+      return;
+    }
+    // Stop the next auto-progress turn too: cancelling the visible turn and then watching the loop start
+    // another one is not what "중지" means.
+    autoProgressStopRef.current = true;
+    clearAutoProgressIntent();
+    turnAbortRef.current.abort();
+  }, []);
 
   const stopAutoProgress = useCallback(() => {
     if (!autoProgressActiveRef.current) {
@@ -6297,8 +6405,8 @@ function App() {
     // Clear the persisted intent right away so refreshing before the in-flight turn settles does not resume a
     // run the user just asked to stop.
     clearAutoProgressIntent();
-    showRuntimeNotice("자동 진행 중지 요청됨. 현재 턴을 마치면 멈춥니다.");
-  }, [showRuntimeNotice]);
+    pushRuntimeNotice("자동 진행 중지 요청됨. 현재 턴을 마치면 멈춥니다.", "info");
+  }, [pushRuntimeNotice]);
 
   // Resume auto-progress after a page refresh/reload. Once storage has been restored, if a persisted intent
   // still points at the now-active simulation/session/progress run, relaunch the loop for the remaining turns so
@@ -6339,7 +6447,17 @@ function App() {
         return;
       }
 
+      // Same controller lifecycle as a normal turn: the composer replaces send with 중지 whenever a turn is
+      // in flight, and a regeneration IS one — without this the stop button sat there doing nothing for the
+      // whole regeneration.
+      const turnAbortController = new AbortController();
+      turnAbortRef.current = turnAbortController;
+      setActiveTurnAbortSignal(turnAbortController.signal);
       setIsSending(true);
+      // The run this regeneration belongs to. Needed again in the catch below, which is why it is read here
+      // rather than inside the try — the failure rollback must not land on whatever run is active by then.
+      const regenerationOwner = readRunOwner(state);
+      setActiveTurnOwner(regenerationOwner);
       setPendingUserText(regeneration.userMessage.content);
       setDraft(regeneration.userMessage.content);
       setState(regeneration.baseState);
@@ -6351,15 +6469,15 @@ function App() {
           ? await createResetSessionState(runtimeBaseState)
           : runtimeBaseState;
         const autoResetApplied = turnBaseState.simulation.activeSessionId !== runtimeBaseState.simulation.activeSessionId;
-        // Same simulation-id guard as runTurnFromText: drop these updates if the user switched simulations
-        // mid-regeneration so the regenerated turn never bleeds into another simulation.
-        const turnSimulationId = turnBaseState.simulation.id;
+        // Same ownership guard as runTurnFromText: drop these updates if the user switched simulation OR
+        // progress run mid-regeneration, so the regenerated turn never bleeds into another run.
+        const turnOwner = readRunOwner(turnBaseState);
         const result = await runSimulationTurn(turnBaseState, regeneration.userMessage.content, regeneration.manualImage, {
           deferImagePlanning: true,
           deferMemoryIngest: true,
           onAssistantText: ({ userMessage, assistantMessage }) => {
             setState((current) => {
-              if (current.simulation.id !== turnSimulationId) {
+              if (!ownsActiveRun(current, turnOwner)) {
                 return current;
               }
               const baseState =
@@ -6371,7 +6489,7 @@ function App() {
           },
           onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
             setState((current) =>
-              current.simulation.id !== turnSimulationId
+              !ownsActiveRun(current, turnOwner)
                 ? current
                 : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
             );
@@ -6379,7 +6497,7 @@ function App() {
         });
         const committedTurnState = applyTurnResultToState(turnBaseState, result);
         setState((current) =>
-          current.simulation.id !== turnSimulationId
+          !ownsActiveRun(current, turnOwner)
             ? current
             : applyTurnResultToState(autoResetApplied ? layerSessionResetOntoLiveState(current, turnBaseState) : current, result)
         );
@@ -6395,17 +6513,33 @@ function App() {
           showRuntimeNotice("응답을 다시 생성했습니다.");
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : "응답 재생성 중 알 수 없는 오류가 발생했습니다.";
-        setState(state);
-        showRuntimeNotice(`응답 재생성 실패: ${message}`);
+        // A cancel restores the pre-regeneration state rather than reporting a failure — the original
+        // response is still the one the user has.
+        //
+        // Guarded like every other write in this function: an unguarded restore replaced the WHOLE live
+        // state with this closure's snapshot, so a regeneration that failed after the user moved to another
+        // progress run overwrote that run's messages with the old one's. Comparing simulation.id alone would
+        // not catch it — a progress-run switch keeps simulation.id and swaps only the arrays.
+        setState((current) => (ownsActiveRun(current, regenerationOwner) ? state : current));
+        if (isLlmAbortedError(error) || turnAbortController.signal.aborted) {
+          pushRuntimeNotice("응답 재생성을 취소했습니다.", "info");
+        } else {
+          const message = error instanceof Error ? error.message : "응답 재생성 중 알 수 없는 오류가 발생했습니다.";
+          showRuntimeNotice(`응답 재생성 실패: ${message}`);
+        }
       } finally {
+        if (turnAbortRef.current === turnAbortController) {
+          turnAbortRef.current = undefined;
+          setActiveTurnAbortSignal(undefined);
+        }
         setPendingUserText("");
         setDraft("");
         setManualImage(false);
+        setActiveTurnOwner(undefined);
         setIsSending(false);
       }
     },
-    [dispatchEarlyTurnImages, isResetting, isSending, planTurnImagesWithExpansion, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
+    [dispatchEarlyTurnImages, isResetting, isSending, planTurnImagesWithExpansion, pushRuntimeNotice, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
   );
 
   const resetSession = useCallback(async () => {
@@ -6427,6 +6561,9 @@ function App() {
     }
   }, [isResetting, isSending, showRuntimeNotice, state]);
 
+  // Irreversible: wipes local storage and every simulation in the library, restoring the built-in demo.
+  // It used to fire on a single click of a neutral button carrying a Save (floppy-disk) icon labelled
+  // "데모 초기화", two clicks from anywhere. The caller now confirms first (see requestResetDemo).
   const resetDemo = useCallback(() => {
     const activeVault = getActivePersonalApiVault();
     clearState();
@@ -6434,7 +6571,28 @@ function App() {
     setState(applyPersonalApiVault(seedState, activeVault));
     setSimulationLibrary(builtInSimulationStates.map(stripLibrarySecrets));
     setView("home");
-  }, [getActivePersonalApiVault]);
+    showRuntimeNotice("로컬 데이터를 모두 삭제하고 기본 시뮬레이션으로 되돌렸습니다.");
+  }, [getActivePersonalApiVault, showRuntimeNotice]);
+
+  const requestResetDemo = useCallback(() => {
+    const summary = [
+      `시뮬레이션 ${simulationLibrary.length}개`,
+      `대화 ${state.messages.length}턴`,
+      `이미지 ${state.imageAssets.length}장`
+    ].join(" · ");
+    const confirmed = window.confirm(
+      [
+        "이 브라우저에 저장된 DynamicChat 로컬 데이터를 모두 삭제하고 기본 데모 상태로 되돌립니다.",
+        "",
+        `삭제 대상: ${summary}`,
+        "",
+        "이 작업은 되돌릴 수 없습니다. 계속할까요?"
+      ].join("\n")
+    );
+    if (confirmed) {
+      resetDemo();
+    }
+  }, [resetDemo, simulationLibrary.length, state.imageAssets.length, state.messages.length]);
 
   const startNewSimulationRun = useCallback(
     (simulationId?: string) => {
@@ -6566,13 +6724,16 @@ function App() {
       // simulation, otherwise the loop keeps running on the previous simulation's threaded state and its turns
       // land in the one just opened.
       autoProgressStopRef.current = true;
+      // Make the outgoing simulation durable BEFORE the swap: a pending idle-time save would otherwise run
+      // after the state object has already been replaced.
+      flushPendingStateSaves();
       const selected = simulationLibrary.find((item) => item.simulation.id === simulationId);
       if (selected) {
         setState(applyPersonalApiVault(hydrateState(selected), getActivePersonalApiVault()));
       }
       setView("simulation");
     },
-    [getActivePersonalApiVault, simulationLibrary, state.simulation.id]
+    [flushPendingStateSaves, getActivePersonalApiVault, simulationLibrary, state.simulation.id]
   );
 
   const editSimulation = useCallback(
@@ -6699,7 +6860,10 @@ function App() {
             latestAssets={latestAssets}
             draft={draft}
             pendingUserText={pendingUserText}
-            isSending={isSending}
+            // Show turn progress only in the run that owns it. The composer is still locked everywhere
+            // (isSendingGlobal below) because two concurrent turns are not supported.
+            isSending={isSending && (!activeTurnOwner || ownsActiveRun(state, activeTurnOwner))}
+            isSendingGlobal={isSending}
             isResetting={isResetting}
             manualImage={manualImage}
             rightPanel={rightPanel}
@@ -6718,7 +6882,7 @@ function App() {
             onOpenPersonalSettings={() => setPersonalSettingsOpen(true)}
             onRegenerateAssistantMessage={regenerateAssistantResponse}
             onRegenerateImageJob={regenerateImageJob}
-            onResetDemo={resetDemo}
+            onResetDemo={requestResetDemo}
             onResetSession={resetSession}
             onStartNewRun={() => startNewSimulationRun(state.simulation.id)}
             onRedactMemory={redactMemoryEvent}
@@ -6733,10 +6897,11 @@ function App() {
             turnPhase={turnPhase}
             onStartAutoProgress={startAutoProgress}
             onStopAutoProgress={stopAutoProgress}
+            onCancelTurn={cancelActiveTurn}
           />
         </SimulationRunErrorBoundary>
       )}
-      <RuntimeNoticeToast notice={runtimeNotice} />
+      <RuntimeNoticeToast notices={runtimeNotices} onDismiss={dismissRuntimeNotice} />
     </main>
   );
 }
@@ -6774,15 +6939,24 @@ class SimulationRunErrorBoundary extends Component<
   }
 }
 
-function RuntimeNoticeToast({ notice }: { notice?: RuntimeNotice }) {
+function RuntimeNoticeToast({
+  notices,
+  onDismiss
+}: {
+  notices: RuntimeNotice[];
+  onDismiss: (noticeId: string) => void;
+}) {
   return (
-    <div className="runtime-toast-region" aria-live="polite" aria-atomic="true">
-      {notice ? (
-        <div className="runtime-toast" key={notice.id}>
-          <Check size={16} />
+    <div className="runtime-toast-region" aria-live="polite">
+      {notices.map((notice) => (
+        <div className={`runtime-toast tone-${notice.tone}`} key={notice.id} role={notice.tone === "error" ? "alert" : undefined}>
+          {notice.tone === "error" ? <AlertTriangle size={16} /> : <Check size={16} />}
           <span>{notice.message}</span>
+          <button type="button" onClick={() => onDismiss(notice.id)} aria-label="알림 닫기">
+            <X size={14} />
+          </button>
         </div>
-      ) : null}
+      ))}
     </div>
   );
 }
@@ -6981,6 +7155,7 @@ function CrackSimulationRunPage({
   draft,
   pendingUserText,
   isSending,
+  isSendingGlobal,
   isResetting,
   manualImage,
   rightPanel,
@@ -7013,13 +7188,17 @@ function CrackSimulationRunPage({
   autoProgressTotal,
   turnPhase,
   onStartAutoProgress,
-  onStopAutoProgress
+  onStopAutoProgress,
+  onCancelTurn
 }: {
   state: AppState;
   latestAssets: ImageAsset[];
   draft: string;
   pendingUserText: string;
+  /** True only in the run that owns the in-flight turn — drives the pending bubble and phase card. */
   isSending: boolean;
+  /** True while ANY run has a turn in flight — drives the composer/controls lock. */
+  isSendingGlobal: boolean;
   isResetting: boolean;
   manualImage: boolean;
   rightPanel: RightPanel;
@@ -7029,6 +7208,8 @@ function CrackSimulationRunPage({
   turnPhase?: TurnPhase;
   onStartAutoProgress: (turns: number) => void;
   onStopAutoProgress: () => void;
+  /** Aborts the in-flight turn's provider request. */
+  onCancelTurn: () => void;
   onCancelImageJob: (jobId: string) => void;
   onDeleteImageAsset: (assetId: string) => void;
   onDraftChange: (value: string) => void;
@@ -7064,6 +7245,14 @@ function CrackSimulationRunPage({
     setReaderSettings(next);
     saveReaderSettings(next);
   }, []);
+  // The reader theme was scoped to the story column, so choosing Night repainted the prose and left the
+  // topbar, rails, and composer chrome glaring white around it. Mirroring the attribute onto the document
+  // root lets the chrome follow, while every existing `.crack-story-stage[data-reader-theme=…]` rule keeps
+  // working unchanged. Cleared on unmount so the builder/home views are never left themed by a run.
+  useEffect(() => {
+    document.documentElement.setAttribute("data-reader-theme", readerSettings.theme);
+    return () => document.documentElement.removeAttribute("data-reader-theme");
+  }, [readerSettings.theme]);
   const storyScrollRef = useRef<HTMLDivElement>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const assetsById = useMemo(() => new Map(state.imageAssets.map((asset) => [asset.id, asset])), [state.imageAssets]);
@@ -7120,7 +7309,7 @@ function CrackSimulationRunPage({
   };
 
   const handleDeleteProgressRun = (item: (typeof historyItems)[number]) => {
-    if (!item.canDelete || isSending || isResetting) {
+    if (!item.canDelete || isSendingGlobal || isResetting) {
       return;
     }
 
@@ -7256,6 +7445,25 @@ function CrackSimulationRunPage({
           <ChevronRight size={15} />
         </button>
         <div className="crack-episode-actions">
+          {/* The progress-run rail is display:none below 1180px, so on a narrow laptop the active run was
+              neither visible nor switchable. This select is the always-available fallback and doubles as the
+              only on-screen indication of WHICH run you are in once the rail is gone. */}
+          {historyItems.length > 1 ? (
+            <label className="crack-run-select" title="진행 전환">
+              <span className="visually-hidden">진행 전환</span>
+              <select
+                value={historyItems.find((item) => item.active)?.id ?? ""}
+                disabled={isSendingGlobal || isResetting}
+                onChange={(event) => onOpenProgressRun(event.target.value)}
+              >
+                {historyItems.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <ReaderSettingsControl settings={readerSettings} onChange={handleReaderSettingsChange} />
           <button
             className={`crack-square-select ${manualImage ? "active" : ""}`}
@@ -7267,7 +7475,7 @@ function CrackSimulationRunPage({
             <span>{manualImage ? <Check size={13} /> : <Square size={15} />}</span>
             <ChevronDown size={15} />
           </button>
-          <button className="icon-text-button" type="button" onClick={onResetSession} disabled={isResetting || isSending}>
+          <button className="icon-text-button" type="button" onClick={onResetSession} disabled={isResetting || isSendingGlobal}>
             <RefreshCcw size={15} />
             {isResetting ? "handoff 중" : "에이전트 세션 초기화"}
           </button>
@@ -7299,9 +7507,9 @@ function CrackSimulationRunPage({
                 <Plus size={15} />
                 새 진행 시작
               </button>
-              <button type="button" onClick={onResetDemo}>
-                <Save size={15} />
-                데모 초기화
+              <button className="danger-action" type="button" onClick={onResetDemo}>
+                <Trash2 size={15} />
+                모든 로컬 데이터 삭제
               </button>
               <small>{rightMenuStatus} · {formatAutoResetDetail(autoResetDecision)} · {latestImageJob ? getImageJobStatusLabel(latestImageJob.status) : "작업 없음"}</small>
             </div>
@@ -7329,9 +7537,9 @@ function CrackSimulationRunPage({
                     className="crack-history-delete"
                     type="button"
                     onClick={() => handleDeleteProgressRun(item)}
-                    disabled={isSending || isResetting}
+                    disabled={isSendingGlobal || isResetting}
                     aria-label={`${item.label} 삭제`}
-                    title={isSending || isResetting ? "진행 중에는 삭제할 수 없습니다" : "진행 삭제"}
+                    title={isSendingGlobal || isResetting ? "진행 중에는 삭제할 수 없습니다" : "진행 삭제"}
                   >
                     <Trash2 size={14} />
                   </button>
@@ -7373,7 +7581,7 @@ function CrackSimulationRunPage({
                 onRegenerateImageJob={onRegenerateImageJob}
                 onRegenerateResponse={onRegenerateAssistantMessage}
                 onRunJob={onRunImageJob}
-                regenerationDisabled={isSending || isResetting}
+                regenerationDisabled={isSendingGlobal || isResetting}
               />
             ))}
             {isSending ? <CrackPendingTurn userText={activePendingUserText} state={state} manualImage={manualImage} turnPhase={turnPhase} /> : null}
@@ -7383,7 +7591,7 @@ function CrackSimulationRunPage({
             <textarea
               ref={composerTextareaRef}
               aria-label="메시지 보내기"
-              disabled={isSending || isResetting || isAutoProgressing}
+              disabled={isSendingGlobal || isResetting || isAutoProgressing}
               value={draft}
               onChange={(event) => onDraftChange(event.target.value)}
               onKeyDown={(event) => {
@@ -7437,7 +7645,7 @@ function CrackSimulationRunPage({
                   type="button"
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={handleInsertActionNotation}
-                  disabled={isSending || isResetting || isAutoProgressing}
+                  disabled={isSendingGlobal || isResetting || isAutoProgressing}
                   aria-label="행동 입력 괄호 삽입"
                   title="행동 입력 *()* 삽입"
                 >
@@ -7462,22 +7670,37 @@ function CrackSimulationRunPage({
                       min="1"
                       max="100"
                       value={autoProgressTurns}
-                      disabled={isSending || isResetting}
+                      disabled={isSendingGlobal || isResetting}
                       onChange={(event) => setAutoProgressTurns(Math.max(1, Math.min(100, Number(event.target.value) || 1)))}
                     />
                     <button
                       type="button"
                       onClick={() => onStartAutoProgress(autoProgressTurns)}
-                      disabled={isSending || isResetting}
+                      disabled={isSendingGlobal || isResetting}
                     >
                       자동진행
                     </button>
                   </div>
                 )}
               </div>
-              <button className="crack-send-button" disabled={isSending || isResetting || isAutoProgressing} type="submit" aria-label="전송">
-                {isSending || isResetting || isAutoProgressing ? <Activity size={18} /> : <Play size={18} fill="currentColor" />}
-              </button>
+              {/* While a turn is running the send button becomes a stop button. Previously the composer just
+                  locked, so a turn that hung on a slow provider could only be escaped by reloading the page —
+                  which also lost the draft and left the provider call running. */}
+              {isSendingGlobal ? (
+                <button
+                  className="crack-send-button is-stop"
+                  type="button"
+                  onClick={onCancelTurn}
+                  aria-label="진행 중지"
+                  title="진행 중지"
+                >
+                  <Square size={16} fill="currentColor" />
+                </button>
+              ) : (
+                <button className="crack-send-button" disabled={isResetting || isAutoProgressing} type="submit" aria-label="전송">
+                  {isResetting || isAutoProgressing ? <Activity size={18} /> : <Play size={18} fill="currentColor" />}
+                </button>
+              )}
             </div>
           </form>
         </section>
@@ -7489,7 +7712,7 @@ function CrackSimulationRunPage({
             onPointerDown={handleOpsRailResizePointerDown}
             aria-label="오른쪽 운영 패널 크기 조절"
           />
-          <div className="tabs" role="tablist" aria-label="오른쪽 패널">
+          <div className="tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="오른쪽 패널">
             <TabButton active={rightPanel === "image"} icon={<ImageIcon size={17} />} label="이미지" onClick={() => onRightPanelChange("image")} />
             <TabButton active={rightPanel === "relationship"} icon={<Network size={17} />} label="관계" onClick={() => onRightPanelChange("relationship")} />
             <TabButton active={rightPanel === "neuralmap"} icon={<Database size={17} />} label="Neural" onClick={() => onRightPanelChange("neuralmap")} />
@@ -7669,12 +7892,15 @@ function MobileOpsDock({
 
   return (
     <div className={`mobile-ops ${open ? "open" : ""}`}>
-      <div className="mobile-ops-tabs" role="tablist" aria-label="모바일 운영 패널">
+      <div className="mobile-ops-tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="모바일 운영 패널">
         {tabs.map((tab) => (
           <button
             className={activePanel === tab.panel ? "active" : ""}
             key={tab.panel}
             type="button"
+            role="tab"
+            aria-selected={activePanel === tab.panel}
+            tabIndex={activePanel === tab.panel ? 0 : -1}
             onClick={() => onSelectPanel(tab.panel)}
           >
             {tab.icon}
@@ -7799,22 +8025,24 @@ function DynamicRichText({ content }: { content: string }) {
   );
 }
 
+// Pure renderer: every caller normalizes once in parseDynamicRichText (prose via flushMarkdown, effect-block
+// bodies where their segments are built). Normalizing again here was a second, compounding pass.
 const MarkdownStageText = memo(function MarkdownStageText({ content }: { content: string }) {
-  const normalizedContent = useMemo(() => normalizeLooseMarkdownTables(content), [content]);
-
   return (
     <ReactMarkdown components={dynamicMarkdownComponents} remarkPlugins={markdownRemarkPlugins}>
-      {normalizedContent}
+      {content}
     </ReactMarkdown>
   );
 });
 
-const DynamicTextEffectBlock = memo(function DynamicTextEffectBlock({ content, kind: _kind }: { content: string; kind: DynamicTextBlockKind }) {
-  // Blocks are unwrapped to plain prose — no aside chrome, no per-kind visual treatment.
-  // The component still exists so the fence parser can route ```status / ```impact fences
-  // here instead of falling through to the <pre.rich-code-block> renderer.
+// Only `status` and `choice` carry a visual identity (see narrative-output.css); every other kind is
+// unwrapped to plain narrative prose. The component still intercepts all of them so a ```status fence never
+// falls through to the monospace <pre.rich-code-block> renderer.
+const STYLED_DYNAMIC_TEXT_BLOCK_KINDS = new Set<DynamicTextBlockKind>(["status", "choice"]);
+
+const DynamicTextEffectBlock = memo(function DynamicTextEffectBlock({ content, kind }: { content: string; kind: DynamicTextBlockKind }) {
   return (
-    <div className="dynamic-text-block">
+    <div className="dynamic-text-block" data-kind={STYLED_DYNAMIC_TEXT_BLOCK_KINDS.has(kind) ? kind : undefined}>
       <div className="dynamic-text-content">
         <MarkdownStageText content={content} />
       </div>
@@ -8276,7 +8504,7 @@ function SimulationRunPage({
       </section>
 
       <aside className="right-rail story-tool-panel">
-        <div className="tabs" role="tablist" aria-label="오른쪽 패널">
+        <div className="tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="오른쪽 패널">
           <TabButton active={rightPanel === "image"} icon={<ImageIcon size={17} />} label="이미지" onClick={() => onRightPanelChange("image")} />
           <TabButton active={rightPanel === "relationship"} icon={<Network size={17} />} label="관계" onClick={() => onRightPanelChange("relationship")} />
           <TabButton active={rightPanel === "neuralmap"} icon={<Database size={17} />} label="Neural" onClick={() => onRightPanelChange("neuralmap")} />
@@ -9794,7 +10022,7 @@ function CreateSimulationPage({
         </div>
       </div>
 
-      <div className="builder-tabs" role="tablist" aria-label="시뮬레이션 제작 단계">
+      <div className="builder-tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="시뮬레이션 제작 단계">
         <BuilderTabButton active={activeTab === "overview"} icon={<Boxes size={18} />} label="기본" metric="개요" onClick={() => setActiveTab("overview")} />
         <BuilderTabButton active={activeTab === "prompts"} icon={<Layers size={18} />} label="프롬프트 트리" metric={`${draft.modules.length}개`} onClick={() => setActiveTab("prompts")} />
         <BuilderTabButton active={activeTab === "characters"} icon={<ImageIcon size={18} />} label="캐릭터/이미지" metric={draft.imageProfile.triggerMode} onClick={() => setActiveTab("characters")} />
@@ -10646,7 +10874,14 @@ function BuilderTabButton({
   onClick: () => void;
 }) {
   return (
-    <button className={`builder-tab ${active ? "active" : ""}`} type="button" onClick={onClick}>
+    <button
+      className={`builder-tab ${active ? "active" : ""}`}
+      type="button"
+      role="tab"
+      aria-selected={active}
+      tabIndex={active ? 0 : -1}
+      onClick={onClick}
+    >
       <span>{icon}</span>
       <strong>{label}</strong>
       <small>{metric}</small>
@@ -11242,6 +11477,15 @@ function ImagePanel({
             <Metric label="CFG" value={(promptScale ?? state.imageProfile.promptGuidance).toString()} />
             <Metric label="시드" value={promptSeed?.toString() ?? "자동"} />
           </div>
+          {inspectedJob.error ? (
+            <p className="image-job-error" role="alert">
+              <AlertTriangle size={14} />
+              {inspectedJob.error}
+            </p>
+          ) : null}
+          {inspectedCue?.frame ? (
+            <p className="image-job-frame">구도: {describeImageCueFrame(inspectedCue.frame)}</p>
+          ) : null}
           <ImagePromptBlock label="프롬프트" value={inspectedJob.prompt} />
           <ImagePromptBlock label="Negative" value={inspectedJob.negativePrompt} muted />
           {novelAiV4CaptionDebug ? <ImagePromptBlock label="NAI v4 captions" value={novelAiV4CaptionDebug} muted /> : null}
@@ -11293,14 +11537,29 @@ function ImagePanel({
           </div>
         </section>
       ) : null}
-      <div className="job-list">
-        {jobs.slice(-4).reverse().map((job) => (
-          <div className={`job-row image-job-row ${job.id === inspectedJob?.id ? "active" : ""}`} key={job.id}>
+      {/* Every job, newest first, in a scrollable list. It used to show the last four with a check mark on
+          each row regardless of status and the error text only when there was no prompt — so a failed job
+          looked identical to a successful one, and a run of failures scrolled out of reach. */}
+      <div className="job-list image-job-list">
+        {[...jobs].reverse().map((job) => (
+          <div
+            className={`job-row image-job-row ${job.id === inspectedJob?.id ? "active" : ""}`}
+            data-status={job.status}
+            key={job.id}
+          >
             <button className="job-row-main" type="button" onClick={() => inspectJob(job)} aria-label={`${job.reason} 작업 보기`}>
-              <Check size={15} />
+              {job.status === "failed" ? (
+                <AlertTriangle size={15} />
+              ) : job.status === "canceled" ? (
+                <X size={15} />
+              ) : job.status === "completed" ? (
+                <Check size={15} />
+              ) : (
+                <Activity size={15} />
+              )}
               <span>
                 {job.reason}
-                <small>{job.prompt ? job.prompt.slice(0, 130) : job.error}</small>
+                <small>{job.error ?? job.prompt?.slice(0, 130)}</small>
               </span>
             </button>
             <div className="job-actions">
@@ -13964,12 +14223,9 @@ function PersonalSettingsDialog({
             <label>
               공급자
               <select value={llmDraft.provider} onChange={(event) => changeLlmProvider(event.target.value as LlmApiSettings["provider"])}>
-                {llmProviderOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
+                <LlmProviderOptionGroups />
               </select>
+              {llmProvider.hint ? <small className="provider-hint">{llmProvider.hint}</small> : null}
             </label>
             {llmProvider.advancedBaseUrl ? (
               <label>
@@ -14328,11 +14584,7 @@ function SettingsPanel({
   const [vibeEncodeStatus, setVibeEncodeStatus] = useState<Record<string, { state: "encoding" | "error"; message?: string }>>({});
   const [dynamicChatApiBaseUrl, setDynamicChatApiBaseUrl] = useState(() => getConfiguredDynamicChatApiBaseUrl());
   const llmProvider = getLlmProviderOption(state.llm.provider);
-  const availableLlmModels = llmProvider.models.filter((model) => model !== "custom");
-  const selectedLlmModel = availableLlmModels.includes(state.llm.model) ? state.llm.model : "custom";
   const imageTagLlmProvider = getLlmProviderOption(state.imageTagLlm.provider);
-  const availableImageTagLlmModels = imageTagLlmProvider.models.filter((model) => model !== "custom");
-  const selectedImageTagLlmModel = availableImageTagLlmModels.includes(state.imageTagLlm.model) ? state.imageTagLlm.model : "custom";
   const activeRuntimeResolution = resolutionPresets.some((preset) => preset.width === state.imageProfile.width && preset.height === state.imageProfile.height)
     ? `${state.imageProfile.width}x${state.imageProfile.height}`
     : "custom";
@@ -14356,6 +14608,63 @@ function SettingsPanel({
   const novelAiStatusLabel = !state.novelAi.enabled ? "비활성" : state.novelAi.requestMode === "mock" ? "mock" : novelAiHasSecret ? "토큰 등록됨" : "토큰 필요";
   const activeContentRatingOption = contentRatingOptions.find((option) => option.value === state.simulation.contentRating) ?? contentRatingOptions[0];
   const notifyApplied = useCallback((message: string) => onNotify?.(message), [onNotify]);
+  // Models discovered from a running local server, merged into the preset list. Keeps the keyless local
+  // path usable without asking the user to type an exact model id from memory.
+  const [discoveredLocalModels, setDiscoveredLocalModels] = useState<string[]>([]);
+  const [isLoadingLocalModels, setIsLoadingLocalModels] = useState(false);
+  const availableLlmModels = uniqueIds([...discoveredLocalModels, ...llmProvider.models]).filter(
+    (model) => model !== "custom"
+  );
+  const selectedLlmModel = availableLlmModels.includes(state.llm.model) ? state.llm.model : "custom";
+  const loadLocalModels = useCallback(async () => {
+    setIsLoadingLocalModels(true);
+    try {
+      const models = await listLocalLlmModels(state.llm);
+      setDiscoveredLocalModels(models);
+      notifyApplied(
+        models.length > 0
+          ? `로컬 서버에서 모델 ${models.length}개를 불러왔습니다.`
+          : "로컬 서버에서 모델 목록을 가져오지 못했습니다. 서버가 실행 중인지, 기본 URL이 맞는지 확인하세요."
+      );
+    } finally {
+      setIsLoadingLocalModels(false);
+    }
+  }, [notifyApplied, state.llm]);
+  // A provider switch invalidates whatever was discovered for the previous one.
+  useEffect(() => {
+    setDiscoveredLocalModels([]);
+  }, [state.llm.provider, state.llm.baseUrl]);
+  // The image-tag model gets its own discovery and its own context size. Running the tag pass on a second,
+  // smaller local model is the setup that makes a high-density cadence affordable — but it only works if
+  // that model can be picked and sized independently, which previously it could not.
+  const [discoveredImageTagLocalModels, setDiscoveredImageTagLocalModels] = useState<string[]>([]);
+  const [isLoadingImageTagLocalModels, setIsLoadingImageTagLocalModels] = useState(false);
+  const loadImageTagLocalModels = useCallback(async () => {
+    setIsLoadingImageTagLocalModels(true);
+    try {
+      const models = await listLocalLlmModels(state.imageTagLlm);
+      setDiscoveredImageTagLocalModels(models);
+      notifyApplied(
+        models.length > 0
+          ? `이미지 태그 모델 목록 ${models.length}개를 불러왔습니다.`
+          : "로컬 서버에서 모델 목록을 가져오지 못했습니다. 서버가 실행 중인지, 기본 URL이 맞는지 확인하세요."
+      );
+    } finally {
+      setIsLoadingImageTagLocalModels(false);
+    }
+  }, [notifyApplied, state.imageTagLlm]);
+  useEffect(() => {
+    setDiscoveredImageTagLocalModels([]);
+  }, [state.imageTagLlm.provider, state.imageTagLlm.baseUrl]);
+  // Declared after the discovery state it reads: as a plain const in the component body this is evaluated on
+  // every render, so hoisting it above the useState would be a temporal-dead-zone throw, not a warning.
+  const availableImageTagLlmModels = uniqueIds([
+    ...discoveredImageTagLocalModels,
+    ...imageTagLlmProvider.models
+  ]).filter((model) => model !== "custom");
+  const selectedImageTagLlmModel = availableImageTagLlmModels.includes(state.imageTagLlm.model)
+    ? state.imageTagLlm.model
+    : "custom";
   const applyImageProfileChange = useCallback(
     (patch: Partial<ImageGenerationProfile>, message: string) => {
       onImageProfileChange(patch);
@@ -14731,12 +15040,9 @@ function SettingsPanel({
               applyLlmChange(createLlmProviderPatch(provider), `${getLlmProviderOption(provider).label} 공급자가 적용되었습니다.`);
             }}
           >
-            {llmProviderOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
+            <LlmProviderOptionGroups />
           </select>
+          {llmProvider.hint ? <small className="provider-hint">{llmProvider.hint}</small> : null}
         </label>
         {llmProvider.advancedBaseUrl ? (
           <label>
@@ -14768,6 +15074,31 @@ function SettingsPanel({
               ))}
               <option value="custom">직접 입력</option>
             </select>
+          </label>
+          {/* Local backends are the keyless path, so there is no vendor console to copy a model id from and
+              a typo surfaces as an opaque upstream 404. Every local server implements GET /v1/models. */}
+          {llmProvider.group === "local" ? (
+            <label>
+              설치된 모델 불러오기
+              <button className="icon-text-button full" type="button" onClick={loadLocalModels} disabled={isLoadingLocalModels}>
+                <RefreshCcw size={15} />
+                {isLoadingLocalModels ? "불러오는 중…" : "로컬 서버에서 불러오기"}
+              </button>
+            </label>
+          ) : null}
+          {/* Ollama serves every model at a 4096-token context unless told otherwise, so the same model name
+              can mean 4k or 32k. The prompt is sized from this and the native transport passes it as
+              num_ctx, which is what makes the annotation pass fit at all on a local setup. */}
+          <label>
+            컨텍스트 (토큰)
+            <input
+              type="number"
+              min="2048"
+              step="1024"
+              value={state.llm.contextTokens ?? llmProvider.contextTokens}
+              onChange={(event) => onLlmChange({ contextTokens: Math.max(2048, Number(event.target.value) || 0) })}
+              onBlur={() => notifyApplied("LLM 컨텍스트 크기가 적용되었습니다.")}
+            />
           </label>
           <label>
             직접 입력
@@ -14857,11 +15188,7 @@ function SettingsPanel({
                   onImageTagLlmChange(createLlmProviderPatch(provider));
                 }}
               >
-                {llmProviderOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
+                <LlmProviderOptionGroups />
               </select>
             </label>
             {imageTagLlmProvider.advancedBaseUrl ? (
@@ -14903,6 +15230,35 @@ function SettingsPanel({
                 />
               </label>
             </div>
+            {imageTagLlmProvider.group === "local" ? (
+              <label>
+                설치된 모델 불러오기
+                <button
+                  className="icon-text-button full"
+                  type="button"
+                  onClick={loadImageTagLocalModels}
+                  disabled={isLoadingImageTagLocalModels}
+                >
+                  <RefreshCcw size={15} />
+                  {isLoadingImageTagLocalModels ? "불러오는 중…" : "로컬 서버에서 불러오기"}
+                </button>
+              </label>
+            ) : null}
+            {/* The annotation pass is the largest prompt of the turn, so this value — not the main model's —
+                is what decides its detail tier. Sharing the main model's context here silently mis-sized it. */}
+            <label>
+              컨텍스트 (토큰)
+              <input
+                type="number"
+                min="2048"
+                step="1024"
+                value={state.imageTagLlm.contextTokens ?? imageTagLlmProvider.contextTokens}
+                onChange={(event) =>
+                  onImageTagLlmChange({ contextTokens: Math.max(2048, Number(event.target.value) || 0) })
+                }
+                onBlur={() => notifyApplied("이미지 태그 모델 컨텍스트 크기가 적용되었습니다.")}
+              />
+            </label>
             <label>
               API 키
               <input
@@ -15395,10 +15751,14 @@ function SettingsPanel({
           onBlur={() => notifyApplied("NeuralMap token budget이 적용되었습니다.")}
         />
       </label>
-      <button className="icon-text-button full" type="button" onClick={onResetDemo}>
-        <Save size={16} />
-        데모 상태 초기화
-      </button>
+      <div className="danger-zone">
+        <strong>위험 구역</strong>
+        <p>이 브라우저에 저장된 모든 시뮬레이션과 생성 이미지를 삭제하고 기본 데모 상태로 되돌립니다.</p>
+        <button className="icon-text-button full danger-action" type="button" onClick={onResetDemo}>
+          <Trash2 size={16} />
+          모든 로컬 데이터 삭제
+        </button>
+      </div>
     </div>
   );
 }
@@ -15524,13 +15884,51 @@ function Capability({ label, value }: { label: string; value: string }) {
   );
 }
 
+// The containers are already role="tablist", but their children were plain buttons — no role="tab", no
+// aria-selected, and every tab in the natural tab order, so reaching the seventh ops panel took seven Tab
+// presses. Roving tabIndex plus the arrow-key handler on the list makes one Tab reach the group and the
+// arrows move within it, which is what a tablist promises.
 function TabButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactNode; label: string; onClick: () => void }) {
   return (
-    <button className={`tab-button ${active ? "active" : ""}`} type="button" onClick={onClick}>
+    <button
+      className={`tab-button ${active ? "active" : ""}`}
+      type="button"
+      role="tab"
+      aria-selected={active}
+      tabIndex={active ? 0 : -1}
+      onClick={onClick}
+    >
       {icon}
       {label}
     </button>
   );
+}
+
+/**
+ * ArrowLeft/ArrowRight/Home/End roving focus for a `role="tablist"` container. Attach to the container;
+ * it moves focus between the enabled `role="tab"` children and activates the one it lands on.
+ */
+function handleTablistKeyDown(event: React.KeyboardEvent<HTMLElement>): void {
+  const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+  if (!keys.includes(event.key)) {
+    return;
+  }
+  const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]:not([disabled])')];
+  if (tabs.length === 0) {
+    return;
+  }
+  const currentIndex = tabs.findIndex((tab) => tab === document.activeElement);
+  const nextIndex =
+    event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? tabs.length - 1
+        : currentIndex < 0
+          ? 0
+          : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  event.preventDefault();
+  tabs[nextIndex]?.focus();
+  tabs[nextIndex]?.click();
 }
 
 function SectionTitle({ icon, title }: { icon: React.ReactNode; title: string }) {

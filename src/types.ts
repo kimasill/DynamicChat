@@ -27,6 +27,18 @@ export type LlmProvider =
   | "codex"
   | "gemini"
   | "claude"
+  // Open-weight / open-source model endpoints. All speak the OpenAI chat-completions shape; their
+  // per-provider quirks (thinking toggles, JSON mode, temperature ceilings, extra headers, CORS) live in
+  // LLM_PROVIDER_PRESETS rather than in request-builder branches.
+  | "deepseek"
+  | "moonshot"
+  | "dashscope"
+  | "zhipu"
+  | "openrouter"
+  | "groq"
+  | "together"
+  | "ollama"
+  | "lmstudio"
   | "openai_compatible"
   | "claude_cli"
   | "codex_cli"
@@ -400,6 +412,30 @@ export interface AssistantMemoryEventDraft {
   confidence?: number;
 }
 
+/** Which crop the cut uses. Decided before any other tag; everything else is filtered against it. */
+export type ImageCueShot = "close_up" | "face_focus" | "upper_body" | "cowboy_shot" | "full_body" | "wide_shot";
+
+/** Where the camera stands relative to the subject. Governs whether the face is renderable at all. */
+export type ImageCueViewpoint = "front" | "side" | "from_behind" | "pov" | "over_the_shoulder";
+
+/** Body regions a crop can show. A tag whose region is absent never reaches NovelAI. */
+export type ImageCueBodyRegion = "head" | "torso" | "hips" | "legs" | "feet";
+
+/**
+ * The cut's composition, authored by the image-tag LLM before it picks any tag.
+ *
+ * This exists so frame consistency stops being an unverifiable claim about the model's private reasoning.
+ * With it, DynamicChat can drop what the crop cannot show — footwear in a face close-up, an expression on a
+ * figure facing away — both in the authored caption and in the appearance/outfit/continuity tags it injects
+ * locally, which were previously frame-blind by construction.
+ */
+export interface ImageCueFrame {
+  shot: ImageCueShot;
+  viewpoint: ImageCueViewpoint;
+  angle?: "eye_level" | "from_above" | "from_below" | "dutch_angle";
+  visibleRegions: ImageCueBodyRegion[];
+}
+
 export interface AssistantImageCueDraft {
   shouldGenerate: boolean;
   reason: string;
@@ -416,6 +452,7 @@ export interface AssistantImageCueDraft {
   anchorText?: string;
   cueType?: string;
   priority?: number;
+  frame?: ImageCueFrame;
 }
 
 export interface AssistantSidecar {
@@ -505,6 +542,7 @@ export interface ImageCue {
   scene: string;
   suppressionReason?: string;
   visualContext?: string;
+  frame?: ImageCueFrame;
 }
 
 export interface ImageCueCharacterPrompt {
@@ -599,6 +637,14 @@ export interface LlmApiSettings {
   model: string;
   temperature: number;
   maxTokens: number;
+  /**
+   * Usable context window of the configured model, in tokens. Overrides the provider preset's default.
+   *
+   * Matters most for local backends: Ollama serves every model with a 4096-token context unless told
+   * otherwise, so the same model name can mean 4k or 32k depending on how it was loaded. The prompt is
+   * sized from this, and the Ollama transport also passes it as num_ctx.
+   */
+  contextTokens?: number;
   systemPrompt: string;
   registrationStatus: ApiRegistrationStatus;
   verifiedAt?: string;
@@ -706,4 +752,10 @@ export interface TurnResult {
   // Resolves with an expanded sidecar when image_cues are completed in the background
   // (realtime image pipeline started generation with the initial cues for speed).
   sidecarExpansion?: Promise<AssistantSidecar | undefined>;
+  /**
+   * Set when the annotation pass failed rather than deciding the turn was non-visual. That call authors
+   * BOTH the image cues and the state deltas, so its failure is invisible on screen — the turn just quietly
+   * produces no image and no state update. Surfaced to the user by the caller.
+   */
+  annotationFailureReason?: string;
 }

@@ -175,7 +175,7 @@ export async function runSimulationTurn(
     evidence: contextPack.evidence,
     fallback: fallbackContent,
     manualImage,
-    // Image tags are authored by a SEPARATE image-cue LLM call (requestTurnImageCues) after the narrative, so the
+    // Image tags are authored by a SEPARATE annotation LLM call (requestTurnAnnotations) after the narrative, so the
     // narrative model is never polluted by tag rules. No mid-stream early dispatch in this mode.
     separateImageCues: true,
     onAssistantText: options.onAssistantText
@@ -201,7 +201,22 @@ export async function runSimulationTurn(
   // and (when image generation is active) authors image_cues. Runs even when images are off so the
   // relationship tab and stateMemory stay current. The narrative call has zero tag vocabulary; all state
   // extraction happens here so the narrative model never enters annotation mode.
-  const annotationResult = await requestTurnAnnotations(state, { userText, assistantText: assistantContent, manualImage });
+  //
+  // The snapshot MUST carry this turn's messages. Every derived context block inside the annotation prompt
+  // (scene cast, scene briefing, visual-profile reference, ongoing visual state, scene tag presets) is
+  // computed from state.messages — handing it the pre-turn state made all of them describe the PREVIOUS
+  // turn, so a character who first appears in the narrative we are annotating had no identity/outfit
+  // reference and the creator's keyword→tag presets were matched against the wrong text. Memory events are
+  // deliberately NOT added here: this call is what produces them.
+  const annotationState: AppState = {
+    ...state,
+    messages: [...state.messages, userMessage, { ...assistantMessageBase, content: assistantContent }]
+  };
+  const annotationResult = await requestTurnAnnotations(annotationState, {
+    userText,
+    assistantText: assistantContent,
+    manualImage
+  });
 
   // Merge annotation results into the sidecar before memory compilation so both semantic events (from the
   // narrative) and state events (from the annotation) flow through a single memoryCompiler pass.
@@ -304,6 +319,7 @@ export async function runSimulationTurn(
       sidecarTrace,
       sidecar: mergedSidecar,
       sidecarExpansion: assistantGeneration.sidecarExpansion,
+    annotationFailureReason: annotationResult.failureReason,
       imageCue,
       turnTrace,
       imageJob: job,
@@ -347,6 +363,7 @@ export async function runSimulationTurn(
     // it the narrative sidecar handed the App an empty cue list and no image was ever dispatched.
     sidecar: mergedSidecar,
     sidecarExpansion: assistantGeneration.sidecarExpansion,
+    annotationFailureReason: annotationResult.failureReason,
     imageCue,
     turnTrace,
     imageJobs: jobs,
@@ -530,7 +547,11 @@ function isImageGenerationRequestedByDraft(state: AppState, draft: ImageRuleBack
 
 function hasLlmAuthoredImageTags(draft: ImageRuleBackedCueDraft | AssistantImageCueDraft): boolean {
   const backedDraft = draft as ImageRuleBackedCueDraft;
-  if (draft.suppressionReason) {
+  // suppression_reason is a FREE-TEXT field the prompt teaches the model to write next to
+  // should_generate=false. Models routinely echo it on generating cues too ("none", "n/a", "visual beat"),
+  // and treating its mere presence as "the model declined" threw away fully-tagged cuts — silently, since
+  // the only notice for that path is gated on manual mode. Only an actual decline suppresses now.
+  if (draft.suppressionReason && draft.shouldGenerate !== true) {
     return false;
   }
   return (
@@ -2297,6 +2318,10 @@ function planImageCue(
     baseTags,
     characterPrompts,
     scene,
+    // The crop the model committed to. Without this the frame-aware layer had to re-guess the composition
+    // from the tags on every cut, so the model's declared viewpoint, angle and visible regions were never
+    // applied — and a cut whose base tags omit a shot tag got no frame filtering at all.
+    frame: draft.frame,
     suppressionReason: shouldGenerate
       ? draft.suppressionReason
       : draft.suppressionReason ?? "메인 LLM이 이미지 생성을 생략함",

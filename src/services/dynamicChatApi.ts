@@ -128,6 +128,15 @@ export function getLlmCliAgentProxyUrl(): string {
   return `${readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL}/llm/cli-agent`;
 }
 
+/**
+ * Relay for provider APIs the browser cannot call directly. Nearly every inference vendor serves no CORS
+ * headers for a web origin, so an open-model preset routes its chat request through the DynamicChat API
+ * server instead of failing in preflight.
+ */
+export function getLlmChatProxyUrl(): string {
+  return `${readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL}/llm/chat`;
+}
+
 export function createDynamicChatApiClient(baseUrl = readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL): DynamicChatApiClient {
   return {
     async listSimulations() {

@@ -1,0 +1,555 @@
+/* ============================================================================================
+   NARRATIVE OUTPUT — consolidated block system
+   --------------------------------------------------------------------------------------------
+   Everything the assistant's reply renders as, defined once, against tokens.
+
+   styles.css has been re-skinned several times without deleting the previous skins, so the
+   structural pieces of the reply body (tables, code, links, dividers, headings) ended up as one
+   set of hard-coded light-mode literals with no Sepia or Night counterpart: on the Night theme a
+   table header was near-black text on a near-black page and the divider was invisible. Weight was
+   doing no work either — headings, bold runs and table headers all used font-weight 950, which
+   flattens hierarchy instead of expressing it.
+
+   This file is imported AFTER styles.css so it wins on source order without disturbing the
+   earlier layers the other views still depend on. New rules for the reply body belong here.
+   ============================================================================================ */
+
+.crack-story-stage {
+  /* Structural palette for the reply body. Redefined per reader theme below. */
+  --rich-ink: #202724;
+  --rich-ink-strong: #101817;
+  --rich-ink-soft: #5c6a66;
+  --rich-rule: rgb(17 22 26 / 14%);
+  --rich-rule-strong: rgb(17 22 26 / 28%);
+  --rich-fill: rgb(17 22 26 / 4%);
+  --rich-accent: #1f6f66;
+  --rich-quote-bar: rgb(31 111 102 / 45%);
+}
+
+.crack-story-stage[data-reader-theme="sepia"] {
+  --rich-ink: #463420;
+  --rich-ink-strong: #2f2310;
+  --rich-ink-soft: #7d6642;
+  --rich-rule: rgb(90 64 28 / 20%);
+  --rich-rule-strong: rgb(90 64 28 / 38%);
+  --rich-fill: rgb(120 88 40 / 7%);
+  --rich-accent: #8a5a23;
+  --rich-quote-bar: rgb(138 90 35 / 45%);
+}
+
+.crack-story-stage[data-reader-theme="night"] {
+  --rich-ink: #d5dde2;
+  --rich-ink-strong: #f2f6f8;
+  --rich-ink-soft: #93a3ad;
+  --rich-rule: rgb(210 228 240 / 16%);
+  --rich-rule-strong: rgb(210 228 240 / 34%);
+  --rich-fill: rgb(210 228 240 / 6%);
+  --rich-accent: #7fd3c4;
+  --rich-quote-bar: rgb(127 211 196 / 45%);
+}
+
+/* --- Prose rhythm -------------------------------------------------------------------------- */
+
+/* Soft line breaks are markdown's to interpret. `pre-wrap` turned every source newline into a
+   forced visual break, so naturally wrapped Korean prose arrived as ragged short lines — a large
+   part of why the output read as crude — and it fought the `word-break: keep-all` on the same
+   element. */
+.crack-markdown p {
+  white-space: normal;
+}
+
+/* Each paragraph is its own markdown root (per-beat image anchoring needs the split), which makes
+   `:last-child` universally true and zeroes every paragraph margin. Spacing therefore belongs to
+   the container gap — expressed in the reader's own line-height so the reading controls actually
+   change the rhythm instead of being overridden by a fixed 18px. */
+.crack-narration-block {
+  gap: calc(var(--reader-line, 1.9) * 0.62em);
+}
+
+/* --- Headings ------------------------------------------------------------------------------ */
+
+.crack-story-stage .rich-heading {
+  margin: 1.5em 0 0.45em;
+  color: var(--rich-ink-strong);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  font-weight: 760;
+}
+
+.crack-story-stage .rich-heading:first-child {
+  margin-top: 0;
+}
+
+.crack-story-stage .rich-heading.level-1 {
+  font-size: 1.5em;
+}
+
+.crack-story-stage .rich-heading.level-2 {
+  font-size: 1.28em;
+}
+
+.crack-story-stage .rich-heading.level-3 {
+  font-size: 1.1em;
+}
+
+/* --- Inline emphasis ----------------------------------------------------------------------- */
+
+.crack-story-stage .rich-strong {
+  color: var(--rich-ink-strong);
+  font-weight: 700;
+}
+
+.crack-story-stage .rich-emphasis {
+  color: inherit;
+  font-style: italic;
+  opacity: 0.92;
+}
+
+/* --- Quote --------------------------------------------------------------------------------- */
+
+.crack-story-stage .rich-quote {
+  margin: 1em 0;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 2px solid var(--rich-quote-bar);
+  color: var(--rich-ink-soft);
+  font-style: italic;
+}
+
+/* --- Lists --------------------------------------------------------------------------------- */
+
+.crack-story-stage .rich-list {
+  display: block;
+  margin: 0.6em 0;
+  padding-left: 1.4em;
+}
+
+.crack-story-stage .rich-list-item {
+  margin-bottom: 0.35em;
+  padding-left: 0.15em;
+}
+
+.crack-story-stage .rich-list-item::marker {
+  color: var(--rich-ink-soft);
+}
+
+/* --- Divider ------------------------------------------------------------------------------- */
+
+.crack-story-stage .rich-divider {
+  height: 1px;
+  margin: 1.8em 0;
+  border: 0;
+  background: linear-gradient(90deg, transparent, var(--rich-rule-strong), transparent);
+}
+
+/* --- Code ---------------------------------------------------------------------------------- */
+
+.crack-story-stage .rich-code,
+.crack-story-stage .rich-code-block {
+  border: 1px solid var(--rich-rule);
+  border-radius: 6px;
+  color: var(--rich-ink);
+  background: var(--rich-fill);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.crack-story-stage .rich-code {
+  padding: 0.1em 0.35em;
+  font-size: 0.86em;
+}
+
+.crack-story-stage .rich-code-block {
+  overflow-x: auto;
+  margin: 0.9em 0;
+  padding: 0.85em 1em;
+  font-size: 0.86em;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.crack-story-stage .rich-code-block .rich-code {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 1em;
+}
+
+/* --- Link ---------------------------------------------------------------------------------- */
+
+.crack-story-stage .rich-link {
+  color: var(--rich-accent);
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* --- Table --------------------------------------------------------------------------------- */
+
+/* A status table is a typographic panel, not a pasted-in widget: no border box, no header fill,
+   one rule under the header and hairlines between rows. Type tracks the reader's own scale
+   (0.94em) rather than a fixed 14px, which sat 4px and half a line off the surrounding prose. */
+.crack-story-stage .rich-table-wrap {
+  overflow-x: auto;
+  margin: 1em 0;
+  border: 0;
+}
+
+.crack-story-stage .rich-table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.94em;
+  line-height: 1.6;
+}
+
+.crack-story-stage .rich-table-head,
+.crack-story-stage .rich-table-cell {
+  padding: 0.45em 0.9em 0.45em 0;
+  border-bottom: 1px solid var(--rich-rule);
+  text-align: left;
+  vertical-align: top;
+}
+
+.crack-story-stage .rich-table-head {
+  color: var(--rich-ink-soft);
+  border-bottom: 2px solid var(--rich-rule-strong);
+  background: none;
+  font-size: 0.92em;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.crack-story-stage .rich-table-wrap tr:last-child .rich-table-cell {
+  border-bottom: 0;
+}
+
+/* --- Effect blocks -------------------------------------------------------------------------- */
+
+/* `status` and `choice` are the only blocks with a visual identity; every other kind the parser
+   recognises is unwrapped to plain narrative prose, unchanged from before. Neither is a table —
+   putting key/value state into a <table> is what made ordinary status lines read as a spreadsheet. */
+.crack-story-stage .dynamic-text-block[data-kind="status"] {
+  margin: 1em 0;
+  padding: 0.85em 1.1em;
+  border: 1px solid var(--rich-rule);
+  border-left: 3px solid var(--rich-accent);
+  border-radius: 8px;
+  background: var(--rich-fill);
+  font-size: 0.94em;
+}
+
+.crack-story-stage .dynamic-text-block[data-kind="status"] .rich-paragraph {
+  margin-bottom: 0.3em;
+}
+
+.crack-story-stage .dynamic-text-block[data-kind="choice"] {
+  margin: 1em 0;
+}
+
+.crack-story-stage .dynamic-text-block[data-kind="choice"] .rich-list {
+  display: grid;
+  gap: 0.45em;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.crack-story-stage .dynamic-text-block[data-kind="choice"] .rich-list-item {
+  margin: 0;
+  padding: 0.55em 0.9em;
+  border: 1px solid var(--rich-rule);
+  border-radius: 8px;
+  background: var(--rich-fill);
+}
+
+/* --- Runtime notices ------------------------------------------------------------------------ */
+
+/* The notice region is now a stack of up to three, and errors persist until dismissed. It used to be a
+   single 2.4-second slot used for BOTH confirmations and failures, so the messages that mattered most were
+   the ones most likely to be overwritten before they could be read. */
+.runtime-toast-region {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+.runtime-toast {
+  pointer-events: auto;
+  align-items: flex-start;
+  gap: 10px;
+  padding-right: 8px;
+}
+
+.runtime-toast span {
+  flex: 1;
+  min-width: 0;
+}
+
+.runtime-toast > svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.runtime-toast > button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: none;
+  opacity: 0.6;
+  transition: opacity 140ms ease, background 140ms ease;
+}
+
+.runtime-toast > button:hover {
+  background: rgb(17 22 26 / 8%);
+  opacity: 1;
+}
+
+.runtime-toast.tone-error {
+  border-color: rgb(178 60 44 / 42%);
+  background: #fff6f3;
+  color: #6d2417;
+}
+
+.runtime-toast.tone-error > svg {
+  color: #b23c2c;
+}
+
+.crack-story-stage[data-reader-theme="night"] .runtime-toast.tone-error {
+  border-color: rgb(255 138 116 / 45%);
+  background: #2a1a17;
+  color: #ffd9cf;
+}
+
+/* --- Destructive actions --------------------------------------------------------------------- */
+
+/* The local-data wipe used to be a neutral button carrying a Save (floppy-disk) icon, which reads as
+   "save my work". It is now visibly destructive and confirmed before it runs. */
+.danger-action {
+  color: #a3341f;
+}
+
+.danger-action:hover {
+  border-color: rgb(163 52 31 / 45%);
+  color: #7d2415;
+  background: rgb(163 52 31 / 8%);
+}
+
+.danger-zone {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+  padding: 14px;
+  border: 1px solid rgb(163 52 31 / 28%);
+  border-radius: 10px;
+  background: rgb(163 52 31 / 4%);
+}
+
+.danger-zone strong {
+  color: #a3341f;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.danger-zone p {
+  margin: 0;
+  color: var(--dc-muted, #61605a);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* --- Image job list ---------------------------------------------------------------------------- */
+
+/* All jobs, scrollable, with the status readable at a glance. The list previously showed the last four
+   rows with a check mark on every one, so a failed job was indistinguishable from a finished one. */
+.image-job-list {
+  overflow-y: auto;
+  max-height: 320px;
+}
+
+.image-job-row[data-status="failed"] .job-row-main > svg {
+  color: #b23c2c;
+}
+
+.image-job-row[data-status="failed"] {
+  border-color: rgb(178 60 44 / 30%);
+  background: rgb(178 60 44 / 5%);
+}
+
+.image-job-row[data-status="canceled"] .job-row-main {
+  opacity: 0.62;
+}
+
+.image-job-row[data-status="generating"] .job-row-main > svg,
+.image-job-row[data-status="queued"] .job-row-main > svg {
+  color: var(--dc-copper, #b4502f);
+}
+
+.image-job-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0 0 10px;
+  padding: 9px 11px;
+  border: 1px solid rgb(178 60 44 / 32%);
+  border-radius: 8px;
+  color: #7d2415;
+  background: rgb(178 60 44 / 6%);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.image-job-error > svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* Surfaces the crop the image-tag model committed to, so a wrong-looking image can be traced to its
+   composition rather than guessed at. */
+.image-job-frame {
+  margin: 0 0 10px;
+  color: var(--dc-muted, #61605a);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Composer stop control ------------------------------------------------------------------- */
+
+/* The send button becomes a stop button while a turn is in flight. Before this the composer simply
+   locked, so a turn stuck on a slow provider could only be escaped by reloading the page. */
+.crack-send-button.is-stop {
+  border-color: rgb(163 52 31 / 45%);
+  color: #ffffff;
+  background: #b23c2c;
+}
+
+.crack-send-button.is-stop:hover {
+  border-color: #8d2b1d;
+  background: #9c3122;
+}
+
+/* --- Utilities ------------------------------------------------------------------------------- */
+
+.visually-hidden {
+  position: absolute;
+  overflow: hidden;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+/* --- Progress-run selector -------------------------------------------------------------------- */
+
+/* Always-available run switcher. The left history rail is hidden below 1180px, which used to remove both
+   the run list and any indication of which run was open. */
+.crack-run-select select {
+  max-width: 190px;
+  height: 30px;
+  padding: 0 26px 0 10px;
+  border: 1px solid var(--dc-line, rgb(17 22 26 / 14%));
+  border-radius: 8px;
+  color: inherit;
+  background: var(--dc-paper, #ffffff);
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+
+.crack-run-select select:disabled {
+  opacity: 0.5;
+}
+
+@media (min-width: 1181px) {
+  /* The rail already shows the run list here, so the select is redundant chrome. */
+  .crack-run-select {
+    display: none;
+  }
+}
+
+/* --- Focus indicator --------------------------------------------------------------------------- */
+
+/* WCAG 1.4.11 wants 3:1 against the adjacent surface; the previous global ring was a translucent tint of
+   the brand amber measuring roughly 1.34:1, i.e. invisible on the panels it was drawn on. A solid dark
+   amber plus a light halo reads on both the light panels and the dark history rail. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid #7a4a00;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgb(255 255 255 / 85%);
+}
+
+.crack-history-rail :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible,
+.crack-story-stage[data-reader-theme="night"] :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline-color: #ffc978;
+  box-shadow: 0 0 0 4px rgb(0 0 0 / 55%);
+}
+
+/* --- Night theme: application chrome ---------------------------------------------------------- */
+
+/* The reader theme was scoped to the story column, so Night repainted the prose and left the topbar, the
+   rails, and the composer chrome glaring white around it — the single most jarring thing about the dark
+   mode. The attribute is now mirrored onto <html>, and these rules carry the surrounding surfaces with it.
+   Scoped to the surface tokens rather than rewritten per component, so the ~10k lines of earlier CSS that
+   consume them follow along. */
+:root[data-reader-theme="night"] {
+  color-scheme: dark;
+
+  --surface: #171b20;
+  --surface-2: #1c2127;
+  --paper: #12161a;
+  --line: rgb(210 228 240 / 14%);
+  --ink: #dfe6ea;
+  --muted: #97a4ad;
+  --night: #0d1014;
+
+  --dc-paper: #171b20;
+  --dc-surface: #1c2127;
+  --dc-ink: #dfe6ea;
+  --dc-muted: #97a4ad;
+  --dc-muted-2: #7d8a93;
+  --dc-line: rgb(210 228 240 / 14%);
+}
+
+:root[data-reader-theme="night"] body {
+  color: var(--ink);
+  background: #12161a;
+}
+
+/* Media and imagery keep their own colour; only the chrome is repainted. */
+:root[data-reader-theme="night"] .topbar {
+  border-bottom-color: var(--line);
+  background: rgb(23 27 32 / 92%);
+}
+
+:root[data-reader-theme="night"] :is(input, select, textarea) {
+  border-color: var(--line);
+  color: var(--ink);
+  background: var(--paper);
+}
+
+:root[data-reader-theme="night"] :is(input, select, textarea)::placeholder {
+  color: var(--dc-muted-2);
+}
+
+/* --- Provider hint --------------------------------------------------------------------------- */
+
+/* One line explaining what each backend is good for, next to the select. The open-model tier is the whole
+   point of the list and needs a reason to pick one over another. */
+.provider-hint {
+  display: block;
+  margin-top: 5px;
+  color: var(--dc-muted, #61605a);
+  font-size: 11.5px;
+  line-height: 1.5;
+  word-break: keep-all;
+}

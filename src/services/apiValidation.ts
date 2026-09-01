@@ -1,12 +1,45 @@
 import type { LlmApiSettings, NovelAiApiSettings } from "../types";
 import { cliAgentKindForProvider } from "../types";
-import { getLlmCliAgentProxyUrl, getNovelAiSubscriptionProxyUrl } from "./dynamicChatApi";
+import { getLlmChatProxyUrl, getLlmCliAgentProxyUrl, getNovelAiSubscriptionProxyUrl } from "./dynamicChatApi";
+import { getLlmProviderPreset, type LlmProviderPreset } from "./llmProviders";
 
 export interface ApiValidationResult {
   ok: boolean;
   message: string;
   verifiedAt?: string;
   details?: Record<string, string>;
+}
+
+/**
+ * Lists the models a local OpenAI-compatible server is actually serving.
+ *
+ * Local backends are the keyless path, so the user has no vendor console to copy a model id from — and a
+ * mistyped id surfaces as an opaque upstream 404. Every local server in the preset list (Ollama, LM Studio,
+ * llama.cpp, vLLM) implements GET /v1/models, so one call covers them all. Returns [] rather than throwing:
+ * a server that does not implement it should degrade to manual entry, not block the settings panel.
+ */
+export async function listLocalLlmModels(settings: LlmApiSettings): Promise<string[]> {
+  const baseUrl = settings.baseUrl.replace(/\/$/u, "");
+  if (!baseUrl) {
+    return [];
+  }
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl}/models`,
+      { method: "GET", headers: settings.apiKey.trim() ? { authorization: `Bearer ${settings.apiKey}` } : {} },
+      8_000
+    );
+    if (!response.ok) {
+      return [];
+    }
+    const data = (await response.json()) as { data?: Array<{ id?: unknown }> };
+    return (data.data ?? [])
+      .map((entry) => (typeof entry.id === "string" ? entry.id.trim() : ""))
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right));
+  } catch {
+    return [];
+  }
 }
 
 export async function validateLlmApi(settings: LlmApiSettings): Promise<ApiValidationResult> {
@@ -54,7 +87,8 @@ export async function validateLlmApi(settings: LlmApiSettings): Promise<ApiValid
     }
   }
 
-  if (!settings.apiKey.trim()) {
+  // Local servers accept unauthenticated requests, so a missing key is not a configuration error for them.
+  if (!settings.apiKey.trim() && getLlmProviderPreset(settings.provider).requiresApiKey) {
     return {
       ok: false,
       message: "API 키를 먼저 입력하세요."
@@ -87,7 +121,10 @@ export async function validateLlmApi(settings: LlmApiSettings): Promise<ApiValid
         headers: {
           "content-type": "application/json",
           "x-api-key": settings.apiKey,
-          "anthropic-version": "2023-06-01"
+          "anthropic-version": "2023-06-01",
+          // Same header the runtime path sends. Without it Anthropic refuses a browser Origin, so a valid
+          // key failed verification while generation with that same key worked.
+          ...(getLlmProviderPreset(settings.provider).extraHeaders ?? {})
         },
         body: JSON.stringify({
           model: settings.model,
@@ -100,20 +137,72 @@ export async function validateLlmApi(settings: LlmApiSettings): Promise<ApiValid
       return response.ok ? success("Claude API 키 검증 및 등록이 완료되었습니다.") : failure("Claude", response.status);
     }
 
-    const response = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${settings.apiKey}`
-      },
-      body: JSON.stringify({
-        model: settings.model,
-        temperature: 0,
-        max_tokens: 8,
-        messages: [{ role: "user", content: "Reply with OK only." }]
-      })
-    });
-    return response.ok ? success("LLM API 키 검증 및 등록이 완료되었습니다.") : failure("LLM", response.status);
+    if (!settings.model.trim()) {
+      return { ok: false, message: "모델 이름이 비어 있습니다. 모델을 선택하거나 직접 입력하세요." };
+    }
+
+    const preset = getLlmProviderPreset(settings.provider);
+    // Prefer the model listing: it proves the key works without paying for a completion, and — unlike an
+    // 8-token probe — a reasoning model cannot fail it by spending the whole budget on hidden thinking.
+    // It is only conclusive where the endpoint actually requires auth: OpenRouter serves /models publicly,
+    // so a 200 there would "verify" any typo'd key and leave the settings panel green while every turn 401s.
+    const listingProvesAuth = !PUBLIC_MODEL_LISTING_PROVIDERS.has(settings.provider);
+    const listing = await requestOpenAiCompatible(
+      preset,
+      `${baseUrl}/models`,
+      settings.apiKey,
+      undefined,
+      20_000
+    ).catch(() => undefined);
+    if (listing?.ok && listingProvesAuth) {
+      return success(`${preset.label} API 키 검증 및 등록이 완료되었습니다.`);
+    }
+    if (listing && isAuthFailureStatus(listing.status)) {
+      return failure(preset.label, listing.status);
+    }
+    if (listing?.ok && !listingProvesAuth) {
+      // Reachable but unproven — fall through to the (tiny, authenticated) completion probe below.
+    }
+    if (listing?.status === 429) {
+      return {
+        ok: true,
+        message: `${preset.label}이(가) 요청 제한(HTTP 429)을 반환했습니다. 키는 저장하고 등록 완료로 처리했으며, 실제 생성은 할당량이 회복된 뒤 동작합니다.`,
+        verifiedAt: new Date().toISOString(),
+        details: { warning: "rate_limited" }
+      };
+    }
+
+    // No usable /models endpoint (some self-hosted servers omit it): fall back to a tiny completion. The
+    // budget is generous enough that a reasoning model still emits an answer token, and the timeout matches
+    // the CLI-agent path since open-model endpoints can be slow to first byte.
+    const probeBody: Record<string, unknown> = {
+      model: settings.model,
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Reply with OK only." }],
+      ...(preset.extraBody ?? {})
+    };
+    if (preset.sendTemperature) {
+      probeBody.temperature = 0;
+    }
+    const response = await requestOpenAiCompatible(
+      preset,
+      `${baseUrl}/chat/completions`,
+      settings.apiKey,
+      probeBody,
+      60_000
+    );
+    if (response.ok) {
+      return success(`${preset.label} API 키 검증 및 등록이 완료되었습니다.`);
+    }
+    if (response.status === 429) {
+      return {
+        ok: true,
+        message: `${preset.label}이(가) 요청 제한(HTTP 429)을 반환했습니다. 키는 저장하고 등록 완료로 처리했습니다.`,
+        verifiedAt: new Date().toISOString(),
+        details: { warning: "rate_limited" }
+      };
+    }
+    return failure(preset.label, response.status);
   } catch (error) {
     return {
       ok: false,
@@ -316,6 +405,59 @@ function failure(name: string, status: number): ApiValidationResult {
     ok: false,
     message: `${name} 검증 실패: HTTP ${status}`
   };
+}
+
+/**
+ * Providers whose `/models` endpoint answers 200 without an Authorization header. A listing success proves
+ * only reachability there, never that the key is valid.
+ */
+const PUBLIC_MODEL_LISTING_PROVIDERS = new Set<LlmApiSettings["provider"]>(["openrouter", "ollama", "lmstudio"]);
+
+/** 401/403 mean the key itself is wrong; anything else is worth a second, different probe. */
+function isAuthFailureStatus(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+/**
+ * Issues one verification request, going through the DynamicChat API server when the preset declares
+ * `requiresProxy` — the same relay the runtime uses, so verification and generation can never disagree about
+ * whether a provider is reachable from the browser.
+ */
+async function requestOpenAiCompatible(
+  preset: LlmProviderPreset,
+  url: string,
+  apiKey: string,
+  body: Record<string, unknown> | undefined,
+  timeoutMs: number
+): Promise<Response> {
+  const providerHeaders = preset.extraHeaders ?? {};
+  if (!preset.requiresProxy) {
+    return fetchWithTimeout(
+      url,
+      body
+        ? {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}`, ...providerHeaders },
+            body: JSON.stringify(body)
+          }
+        : {
+            method: "GET",
+            headers: { authorization: `Bearer ${apiKey}`, ...providerHeaders }
+          },
+      timeoutMs
+    );
+  }
+
+  // The proxy only speaks POST, so a listing probe is expressed as a POST carrying the target URL.
+  return fetchWithTimeout(
+    getLlmChatProxyUrl(),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ url, headers: providerHeaders, body: body ?? {}, method: body ? "POST" : "GET" })
+    },
+    timeoutMs
+  );
 }
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs = 12000): Promise<Response> {

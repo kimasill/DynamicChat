@@ -6,3 +6,6 @@ dist/
 
 # Local runtime data — simulations, sessions, generated images, API secrets, backups
 .dynamicchat-data/
+
+# Scratch output from local eval/measurement runs
+scratch-*

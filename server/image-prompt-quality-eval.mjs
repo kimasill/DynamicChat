@@ -36,6 +36,7 @@ try {
   await evaluatePersonaCharacterImageCueScoping(seedState, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateLlmImageStateTagCarryover(seedState, planImageJob, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateImageDetailStateContinuity(seedState, planImageJobForCompletedTurn);
+  await evaluateFrameConsistency(seedState, planImageJobForCompletedTurn);
   await evaluateLlmNaiTagPreservation(seedState, planImageJob, generateNovelAiImages);
   evaluateNameAndBodyInventoryCleanup(seedState, planImageJob);
   await evaluateActorTargetCharacterDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn);
@@ -2363,7 +2364,12 @@ async function evaluateImageDetailStateContinuity(seedState, planImageJobForComp
   assertCheck("context.detail_continuity", /bloody lip/iu.test(composed), "Persisted physical-detail tags carry into a close-up cut that omitted them.");
   assertCheck("context.detail_continuity", /bruised cheek/iu.test(composed), "All persisted physical-detail tags carry, not just the first one.");
   assertCheck("context.detail_continuity", /holding notebook/iu.test(composed), "Persisted held-item tags carry into a cut that omitted them.");
-  assertCheck("context.detail_continuity", /straddling/iu.test(composed), "Persisted interaction posture carries into a cut with no posture of its own.");
+  // Frame test, not a blanket carry. A face close-up genuinely cannot show a whole-body posture, so
+  // re-injecting one produced a portrait with a body position that is nowhere in the picture. Head-region
+  // continuity (bloody lip, bruised cheek — asserted above) still carries, which is what keeps the crop from
+  // silently healing the character.
+  assertCheck("context.detail_continuity", !/straddling/iu.test(composed), "A face close-up does not re-inject whole-body posture the crop cannot show.");
+  assertCheck("context.detail_continuity", !/\bboots?\b|\bshoes?\b|thighhigh/iu.test(composed), "A face close-up does not inject footwear or leg-region garments.");
 
   const changedCue = {
     ...closeUpCue,
@@ -2399,8 +2405,299 @@ async function evaluateImageDetailStateContinuity(seedState, planImageJobForComp
   const secondComposed = composedFor(progressionPlan, 1);
   assertCheck("context.detail_continuity", progressionPlan.imageJobs.length === 2, "Both cuts in one output are planned as separate jobs.");
   assertCheck("context.detail_continuity", /blood on lip/iu.test(secondComposed), "A detail introduced in an earlier cut carries into a later cut in the same output.");
-  assertCheck("context.detail_continuity", /torn blouse/iu.test(secondComposed), "An outfit change in an earlier cut carries into a later cut in the same output.");
-  assertCheck("context.detail_continuity", /straddling/iu.test(secondComposed), "A posture established in an earlier cut carries into a later cut in the same output.");
+  // The second cut is a close-up: the torso garment and the whole-body posture established by the first cut
+  // are outside its frame, so they are correctly absent. The state itself is unchanged — a later wide cut
+  // gets both back (asserted in evaluateFrameConsistency).
+  assertCheck("context.detail_continuity", !/torn blouse/iu.test(secondComposed), "A close-up does not inject a torso garment from an earlier cut.");
+  assertCheck("context.detail_continuity", !/straddling/iu.test(secondComposed), "A close-up does not inject a posture established by an earlier cut.");
+
+  const wideCut = {
+    shouldGenerate: true,
+    reason: "wide cut",
+    characters: ["char_detail"],
+    tags: [],
+    baseTags: ["full body", "indoors"],
+    characterPrompts: [{ characterId: "char_detail", prompt: "looking down" }],
+    scene: "current simulation scene",
+    visualContext: ""
+  };
+  const widePlan = await planTurn([cutOne, wideCut], createPlayableState(seedState, { ...baseOverrides, memoryEvents: [] }));
+  const wideComposed = composedFor(widePlan, 1);
+  assertCheck("context.detail_continuity", /torn blouse/iu.test(wideComposed), "A full-body cut still inherits the torso garment established by an earlier cut.");
+  assertCheck("context.detail_continuity", /straddling/iu.test(wideComposed), "A full-body cut still inherits the posture established by an earlier cut.");
+}
+
+/**
+ * Frame consistency: the cut's crop decides which tags may appear.
+ *
+ * This is the dimension the suite never covered, and its absence is why the pipeline could inject a full
+ * wardrobe (footwear included) into a face close-up and a facing-camera expression onto a figure seen from
+ * behind. The checks below assert the crop rules on the ACTUAL composed prompt, so both the LLM contract and
+ * the local injection layer are held to them.
+ */
+async function evaluateFrameConsistency(seedState, planImageJobForCompletedTurn) {
+  const characters = [
+    {
+      id: "char_frame",
+      simulationId: seedState.simulation.id,
+      name: "Rin",
+      role: "heroine",
+      summary: "lead",
+      relationship: "",
+      currentMood: "calm"
+    }
+  ];
+  const visualProfiles = [
+    {
+      id: "visual_frame",
+      simulationId: seedState.simulation.id,
+      characterId: "char_frame",
+      positivePrompt: "1girl, long black hair, red eyes, pale skin",
+      negativePrompt: "",
+      defaultOutfitPrompt: "sailor uniform, pleated skirt, black thighhighs, brown loafers",
+      outfitPrompts: {}
+    }
+  ];
+  const overrides = {
+    characters,
+    visualProfiles,
+    imageProfile: { ...seedState.imageProfile, triggerMode: "realtime_auto", cooldownTurns: 0, generationCadence: "rich" }
+  };
+
+  const planCut = async (cue) => {
+    const state = createPlayableState(seedState, { ...overrides, memoryEvents: [] });
+    const userMessage = createUserMessage(state, "장면을 이어가");
+    const assistantMessage = createAssistantMessage(state, "Rin turns in the quiet hallway.");
+    const plan = await planImageJobForCompletedTurn(
+      { ...state, messages: [...state.messages, userMessage, assistantMessage] },
+      {
+        userMessage,
+        assistantMessage,
+        contextPack: createContextPack(state),
+        promptModuleUsages: [],
+        sidecar: { assistantText: assistantMessage.content, memoryEvents: [], imageCue: cue, imageCues: [cue] },
+        manualImage: false
+      }
+    );
+    const job = plan.imageJobs[0];
+    const captions = (job?.providerPayload?.characterPrompts ?? []).map((entry) => entry.prompt).join(", ");
+    return { job, composed: `${job?.prompt ?? ""}, ${captions}`, negative: job?.negativePrompt ?? "" };
+  };
+
+  const baseCue = {
+    shouldGenerate: true,
+    characters: ["char_frame"],
+    tags: [],
+    scene: "current simulation scene",
+    visualContext: "",
+    reason: "frame check"
+  };
+
+  // 1. A face close-up shows the head only: no footwear, no leg garments, no skirt.
+  const closeUp = await planCut({
+    ...baseCue,
+    baseTags: ["face focus", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "looking at viewer, parted lips" }],
+    frame: { shot: "face_focus", viewpoint: "front", visibleRegions: ["head"] }
+  });
+  assertCheck("frame.crop", !/loafers|thighhighs|pleated skirt/iu.test(closeUp.composed), "A face close-up does not inject footwear or leg-region garments from the saved outfit.");
+  assertCheck("frame.crop", /long black hair/iu.test(closeUp.composed), "A face close-up still injects head-region identity so the character stays recognisable.");
+  assertCheck("frame.crop", /1girl/iu.test(closeUp.composed), "The subject/gender tag is never filtered out by the crop.");
+  assertCheck("frame.crop", /full body|feet|shoes/iu.test(closeUp.negative), "A tight crop states the excluded framing negatively so NovelAI does not drift back to a full body.");
+
+  // 2. A from-behind cut cannot show a face: no expression, no gaze, no eye colour.
+  const fromBehind = await planCut({
+    ...baseCue,
+    baseTags: ["upper body", "from behind", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "arms at sides" }],
+    frame: { shot: "upper_body", viewpoint: "from_behind", visibleRegions: ["head", "torso"] }
+  });
+  assertCheck("frame.facing", !/red eyes/iu.test(fromBehind.composed), "A from-behind cut does not inject the saved eye colour.");
+  assertCheck("frame.facing", !/looking at viewer/iu.test(fromBehind.composed), "A from-behind cut carries no facing-camera gaze tag.");
+  assertCheck("frame.facing", /looking at viewer|facing viewer/iu.test(fromBehind.negative), "A from-behind cut negates facing-camera framing.");
+
+  // 2b. The crop governs the SHARED base caption too, not only the per-character ones. Frame filtering used
+  //     to run exclusively inside composeCharacterPrompt, so a model that wrote a facing-camera gaze or an
+  //     out-of-crop garment into base_tags bypassed the frame completely.
+  const baseTagLeak = await planCut({
+    ...baseCue,
+    baseTags: ["upper body", "from behind", "looking at viewer", "brown loafers", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "arms at sides" }],
+    frame: { shot: "upper_body", viewpoint: "from_behind", visibleRegions: ["head", "torso"] }
+  });
+  assertCheck("frame.facing", !/looking at viewer/iu.test(baseTagLeak.composed), "A facing-camera gaze written into base_tags is dropped by a from-behind crop.");
+  assertCheck("frame.crop", !/loafers/iu.test(baseTagLeak.composed), "A garment written into base_tags is dropped when its region is outside the crop.");
+  assertCheck("frame.crop", /indoors/iu.test(baseTagLeak.composed), "Frame filtering of base_tags keeps regionless scene tags.");
+  assertCheck("frame.crop", /1girl/iu.test(baseTagLeak.composed), "Frame filtering of base_tags never removes the subject-count tag.");
+
+  // 2c. A model that omits `viewpoint`, or writes a synonym the enum does not carry, must not be recorded as
+  //     facing the camera — the frame is then re-derived from the cut's own tags. Getting this wrong deleted
+  //     the authored "from behind" tag for conflicting with the invented front-facing frame AND re-admitted
+  //     the face tags, so the cut rendered face-on.
+  const impliedViewpoint = await planCut({
+    ...baseCue,
+    baseTags: ["upper body", "from behind", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "arms at sides" }],
+    frame: { shot: "upper_body", visibleRegions: ["head", "torso"] }
+  });
+  assertCheck("frame.facing", !/red eyes/iu.test(impliedViewpoint.composed), "A cue whose frame omits viewpoint takes it from its own tags, so no eye colour is injected behind the subject.");
+  assertCheck("frame.facing", /from behind/iu.test(impliedViewpoint.composed), "The authored from-behind tag survives instead of being stripped as conflicting.");
+
+  // 3. A full-body cut shows everything: the whole saved outfit is present.
+  const fullBody = await planCut({
+    ...baseCue,
+    baseTags: ["full body", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "standing, looking at viewer" }],
+    frame: { shot: "full_body", viewpoint: "front", visibleRegions: ["head", "torso", "hips", "legs", "feet"] }
+  });
+  assertCheck("frame.crop", /loafers/iu.test(fullBody.composed), "A full-body cut does inject footwear — the filter is the crop, not a blanket ban.");
+  assertCheck("frame.crop", /pleated skirt/iu.test(fullBody.composed), "A full-body cut injects the full saved outfit.");
+  assertCheck("frame.crop", /red eyes/iu.test(fullBody.composed), "A front-facing cut injects the saved eye colour.");
+
+  // 4. With no explicit frame object the crop is inferred from the composition tags, so an older cue shape
+  //    (or a model that omits the field) still gets frame-consistent injection.
+  const inferred = await planCut({
+    ...baseCue,
+    baseTags: ["close-up", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "parted lips" }]
+  });
+  assertCheck("frame.infer", !/loafers|thighhighs/iu.test(inferred.composed), "A cue with no frame object still filters by the crop inferred from its own tags.");
+
+  // 5. A POV cut shows the SUBJECT facing the camera — the observer is the one off-frame — so expression,
+  //    gaze and eye colour must survive. Treating pov as face-hidden emptied the most common composition in
+  //    the shipped simulations.
+  const pov = await planCut({
+    ...baseCue,
+    baseTags: ["close-up", "pov", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "looking at viewer, blush, parted lips" }]
+  });
+  assertCheck("frame.facing", /looking at viewer/iu.test(pov.composed), "A POV cut keeps the subject's facing-camera gaze.");
+  assertCheck("frame.facing", /blush/iu.test(pov.composed), "A POV cut keeps the subject's expression.");
+  assertCheck("frame.facing", /red eyes/iu.test(pov.composed), "A POV cut keeps the saved eye colour.");
+
+  // 6. The raw snake_case shape the model emits must be normalized, not trusted verbatim — reading
+  //    `visibleRegions` off it would throw and fail the whole image job.
+  const rawShape = await planCut({
+    ...baseCue,
+    baseTags: ["face focus", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "parted lips" }],
+    frame: { shot: "face_focus", viewpoint: "front", visible_regions: ["head"] }
+  });
+  assertCheck("frame.infer", Boolean(rawShape.job), "A cue carrying the model's raw snake_case frame still plans a job.");
+  assertCheck("frame.crop", !/loafers|thighhighs/iu.test(rawShape.composed), "A raw-shape frame is normalized and still filters by crop.");
+
+  // 7. A deliberate body-region close-up is a real shot the contract asks for: its declared region wins over
+  //    the shot label's default of head-only.
+  const regionCloseUp = await planCut({
+    ...baseCue,
+    baseTags: ["close-up", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "hand on thigh" }],
+    frame: { shot: "close_up", viewpoint: "front", visibleRegions: ["legs"] }
+  });
+  assertCheck("frame.crop", /thighhighs/iu.test(regionCloseUp.composed), "A declared leg-region close-up injects the leg garments it actually shows.");
+  assertCheck("frame.crop", !/loafers/iu.test(regionCloseUp.composed), "A leg-region close-up still excludes footwear.");
+
+  // 8. A garment the MODEL wrote outside the crop is still dropped — the one case where the author does not
+  //    get the benefit of the doubt, because it is objective and it is what a reader notices. An authored
+  //    body DETAIL at the same crop is kept, because that is a judgement the author may have made on purpose.
+  const authoredOutOfFrame = await planCut({
+    ...baseCue,
+    baseTags: ["upper body", "indoors", "1girl"],
+    characterPrompts: [
+      { characterId: "char_frame", prompt: "walking slowly, black thighhighs, brown loafers, blood on arm, looking at viewer" }
+    ],
+    frame: { shot: "upper_body", viewpoint: "front", visibleRegions: ["head", "torso"] }
+  });
+  assertCheck("frame.crop", !/thighhighs|loafers/iu.test(authoredOutOfFrame.composed), "A garment the model wrote outside the crop is dropped.");
+  assertCheck("frame.crop", /blood on arm/iu.test(authoredOutOfFrame.composed), "An authored body detail at the same crop is kept.");
+  assertCheck("frame.crop", /walking slowly/iu.test(authoredOutOfFrame.composed), "An authored action at the same crop is kept.");
+
+  // 9. A per-character tag left in base_tags can only be absorbed by a character entry when there is exactly
+  //    one subject to attribute it to. With two entries it must stay in the base caption — filtering it out
+  //    of both sides deleted it from the prompt entirely.
+  const twoSubject = await planCut({
+    ...baseCue,
+    characters: ["char_frame"],
+    baseTags: ["2girls", "upper body", "school uniform", "indoors"],
+    characterPrompts: [
+      { characterId: "char_frame", prompt: "smiling, hand raised" },
+      { prompt: "1girl, short brown hair, standing beside" }
+    ],
+    frame: { shot: "upper_body", viewpoint: "front", visibleRegions: ["head", "torso"] }
+  });
+  assertCheck("frame.tags", /school uniform/iu.test(twoSubject.composed), "A per-character tag in base_tags survives when there are multiple subjects to attribute it to.");
+  assertCheck("frame.tags", /2girls/iu.test(twoSubject.composed), "The subject-count tag stays in the base caption.");
+
+  // 10. The crop must reach the PROMPT, not just the frame object — NovelAI never sees the object. A cue that
+  //     declares a frame but forgets to mirror the shot tag still renders at the declared crop.
+  const declaredOnly = await planCut({
+    ...baseCue,
+    baseTags: ["indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "parted lips" }],
+    frame: { shot: "face_focus", viewpoint: "from_behind", visibleRegions: ["head"] }
+  });
+  assertCheck("frame.compose", /face focus/iu.test(declaredOnly.job?.prompt ?? ""), "선언된 shot이 프롬프트 태그로 반영된다.");
+  assertCheck("frame.compose", /from behind/iu.test(declaredOnly.job?.prompt ?? ""), "선언된 viewpoint가 프롬프트 태그로 반영된다.");
+  assertCheck("frame.compose", !/loafers|thighhighs/iu.test(declaredOnly.composed), "선언만 된 frame도 주입 필터에 적용된다.");
+
+  // 11. The frame is the authority for the crop. A creator style module or preset carrying its own baked-in
+  //     shot tag (the shipped style module has "environmental portrait, close-up") must not end up beside
+  //     the derived one — `close-up, wide shot` in the same prompt leaves NovelAI to pick.
+  const conflictState = createPlayableState(seedState, {
+    ...overrides,
+    memoryEvents: [],
+    modules: [
+      ...createPlayableState(seedState, overrides).modules.filter((module) => module.kind !== "image_prompt_profile"),
+      {
+        id: "mod_style_conflict",
+        simulationId: seedState.simulation.id,
+        title: "이미지 스타일",
+        kind: "image_prompt_profile",
+        body: "cinematic anime illustration, environmental portrait, close-up, atmospheric lighting",
+        enabled: true,
+        priority: 5,
+        tokenPolicy: "always",
+        activationTags: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    ]
+  });
+  const conflictUser = createUserMessage(conflictState, "장면을 이어가");
+  const conflictAssistant = createAssistantMessage(conflictState, "Rin turns in the hallway.");
+  const conflictCue = {
+    ...baseCue,
+    baseTags: ["full body", "indoors", "1girl"],
+    characterPrompts: [{ characterId: "char_frame", prompt: "standing" }],
+    frame: { shot: "full_body", viewpoint: "front", visibleRegions: ["head", "torso", "hips", "legs", "feet"] }
+  };
+  const conflictPlan = await planImageJobForCompletedTurn(
+    { ...conflictState, messages: [...conflictState.messages, conflictUser, conflictAssistant] },
+    {
+      userMessage: conflictUser,
+      assistantMessage: conflictAssistant,
+      contextPack: createContextPack(conflictState),
+      promptModuleUsages: [],
+      sidecar: { assistantText: conflictAssistant.content, memoryEvents: [], imageCue: conflictCue, imageCues: [conflictCue] },
+      manualImage: false
+    }
+  );
+  const conflictPrompt = conflictPlan.imageJobs[0]?.prompt ?? "";
+  assertCheck("frame.compose", /full body/iu.test(conflictPrompt), "선언된 구도 태그는 프롬프트에 남는다.");
+  assertCheck("frame.compose", !/close-?up/iu.test(conflictPrompt), "화풍 모듈의 상충하는 구도 태그는 제거된다.");
+  assertCheck("frame.compose", !/environmental portrait/iu.test(conflictPrompt), "상충하는 구도 동의어도 제거된다.");
+  assertCheck("frame.compose", /cinematic anime illustration/iu.test(conflictPrompt), "구도가 아닌 화풍 태그는 보존된다.");
+
+  // 12. Tag ORDER: NovelAI weights earlier tokens more, so the picture's priority order must hold.
+  const orderIndex = (tag) => fullBody.job?.prompt?.toLowerCase().indexOf(tag) ?? -1;
+  const countIndex = orderIndex("1girl");
+  const cameraIndex = orderIndex("full body");
+  const settingIndex = orderIndex("indoors");
+  assertCheck(
+    "frame.order",
+    countIndex >= 0 && cameraIndex >= 0 && settingIndex >= 0 && countIndex < cameraIndex && cameraIndex < settingIndex,
+    "Base prompt orders subject count before camera/framing, and both before the setting."
+  );
 }
 
 async function evaluateFallbackImageCueSuppression(seedState, runSimulationTurn) {

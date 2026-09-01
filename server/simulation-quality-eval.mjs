@@ -96,8 +96,8 @@ async function readSourceChecks() {
       llmClient.includes("default outfit tags") &&
         llmClient.includes("outfit keyword mappings") &&
         llmClient.includes("state_type='Wearing'") &&
-        llmClient.includes("state_type='StatusTags'"),
-      "LLM prompt persists character outfit and visual status tags."
+        llmClient.includes("'StatusTags'"),
+      "Annotation prompt persists character outfit and visual status tags."
     ),
     assertCheck(
       "source.relationship",
@@ -154,12 +154,12 @@ async function readSourceChecks() {
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("NovelAI V4 prompt split") &&
-        llmClient.includes("one separate entry per character") &&
-        llmClient.includes("Image cue ownership: this main response owns final image_cues") &&
+      llmClient.includes("char_caption[0], char_caption[1]") &&
+        llmClient.includes("WHO IS IN FRAME IS YOUR CALL") &&
+        llmClient.includes("PEOPLE IN CONTACT STAY SEPARATE") &&
         llmClient.includes("Image cue authoring reference") &&
         imageOrchestrator.includes("getNovelAiPositiveTagRank"),
-      "Main simulation LLM keeps the structural NAI V4 split contract, ownership, and authoring reference."
+      "Annotation tag contract keeps the NAI V4 per-character split and never merges two people into one entry."
     ),
     assertCheck(
       "source.image",
@@ -213,14 +213,14 @@ async function readSourceChecks() {
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("One character_prompt per visible character") &&
+      llmClient.includes("REGISTERED CHARACTERS: SET THE ID") &&
         llmClient.includes("Character identity lock") &&
-        llmClient.includes("DynamicChat injects that character's saved base appearance and current outfit") &&
-        llmClient.includes("follow the image prompt user rules and the situational tag keyword presets") &&
+        llmClient.includes("injects their saved appearance and current outfit") &&
+        llmClient.includes("DETAIL FOLLOWS THE CROP") &&
         !llmClient.includes("NovelAI/Danbooru tag conversion rules") &&
         !llmClient.includes("Good action tags look like") &&
         !llmClient.includes("Use this strict tag order for every generated cue"),
-      "Main image cue contract keeps per-character separation, injects saved character appearance/outfit, and defers tag vocabulary to user rules/presets."
+      "Annotation tag contract keeps per-character separation, injects saved appearance/outfit, and scales detail to the crop."
     ),
     assertCheck(
       "source.image",
@@ -232,17 +232,16 @@ async function readSourceChecks() {
     ),
     assertCheck(
       "source.image",
-      llmClient.includes("2girls/3girls") &&
-        llmClient.includes("Registered vs unregistered characters") &&
-        llmClient.includes("Character identity lock") &&
+      llmClient.includes("SUBJECT COUNT IS MANDATORY") &&
+        llmClient.includes("1girl, 1boy") &&
+        llmClient.includes("EVERY ENTRY'S GENDER MUST BE UNAMBIGUOUS") &&
         llmClient.includes("required_identity_tags"),
-      "Main image cue prompt guards subject counts and character identity/metadata scoping."
+      "Annotation tag contract makes the subject-count tag mandatory and every entry's gender explicit."
     ),
     assertCheck(
       "source.image",
       sceneCast.includes("collectRecentImageCharacterIds") &&
         sceneCast.includes("shouldUseImageCastContinuity") &&
-        llmClient.includes("Character ambiguity rule") &&
         llmClient.includes("latest image/assistant beat"),
       "Image cue character scoping preserves recent visible cast for pronoun-only continuations."
     ),

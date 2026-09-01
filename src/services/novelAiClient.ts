@@ -10,14 +10,40 @@ interface NovelAiImageResult {
   payload: Record<string, unknown>;
 }
 
+/**
+ * Hard ceiling for one NovelAI generation. Without it a request that never settles (a dropped connection, or
+ * NovelAI holding the socket open) leaves the image queue's promise chain pending forever, which silently
+ * wedges every image for the rest of the session — the "images just stop appearing" failure.
+ */
+const NOVELAI_REQUEST_TIMEOUT_MS = 180_000;
+/** Transient upstream conditions: concurrency limit, gateway hiccup, rate limit. */
+const NOVELAI_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+const NOVELAI_MAX_ATTEMPTS = 3;
+const NOVELAI_RETRY_BASE_DELAY_MS = 2_500;
+
+class NovelAiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryable: boolean
+  ) {
+    super(message);
+    this.name = "NovelAiRequestError";
+  }
+}
+
 export async function generateNovelAiImages(input: {
   state: AppState;
   prompt: string;
   negativePrompt: string;
   cue: ImageCue;
   count: number;
+  signal?: AbortSignal;
 }): Promise<NovelAiImageResult> {
   const { state } = input;
+  // Disabled / mock is a DRY RUN: the assembled payload is returned with no images so the prompt pipeline
+  // (and the prompt-quality evals) can be inspected without calling the provider. Nothing downstream should
+  // reach here expecting pixels — shouldPlanImageJob refuses to plan a job while NovelAI is off, and says so.
   if (!state.novelAi.enabled || state.novelAi.requestMode === "mock") {
     return {
       dataUrls: [],
@@ -38,15 +64,49 @@ export async function generateNovelAiImages(input: {
     headers.authorization = `Bearer ${normalizeApiToken(state.novelAi.apiKey)}`;
   }
 
+  const body = JSON.stringify(payload);
+  let lastError: unknown;
+
+  // NovelAI routinely answers a burst of requests with 429 (concurrent generation limit) or a transient 5xx.
+  // A single attempt turned every one of those into a permanently failed job, which is the single largest
+  // cause of an image "sometimes" not appearing. Authentication and prompt errors are NOT retried.
+  for (let attempt = 1; attempt <= NOVELAI_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await requestNovelAiImages(endpoint, headers, body, payload, input.signal);
+    } catch (error) {
+      lastError = error;
+      const retryable = error instanceof NovelAiRequestError ? error.retryable : isTransientNetworkError(error);
+      if (!retryable || attempt === NOVELAI_MAX_ATTEMPTS || input.signal?.aborted) {
+        throw error;
+      }
+      await delay(NOVELAI_RETRY_BASE_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("NovelAI request failed.");
+}
+
+async function requestNovelAiImages(
+  endpoint: string,
+  headers: Record<string, string>,
+  body: string,
+  payload: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<NovelAiImageResult> {
   const response = await fetch(endpoint, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload)
+    body,
+    signal: withRequestTimeout(signal)
   });
 
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw new Error(`NovelAI request failed: ${response.status}${detail ? ` ${detail.slice(0, 500)}` : ""}`);
+    throw new NovelAiRequestError(
+      `NovelAI request failed: ${response.status}${detail ? ` ${detail.slice(0, 500)}` : ""}`,
+      response.status,
+      NOVELAI_RETRYABLE_STATUS.has(response.status)
+    );
   }
 
   const contentType = response.headers.get("content-type") ?? "";
@@ -65,6 +125,35 @@ export async function generateNovelAiImages(input: {
     dataUrls: [await bytesToDataUrl(bytes, mimeType)],
     payload
   };
+}
+
+/** Combines the caller's cancellation signal (if any) with the per-request timeout. */
+function withRequestTimeout(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(NOVELAI_REQUEST_TIMEOUT_MS);
+  if (!signal) {
+    return timeout;
+  }
+  // AbortSignal.any is available in every browser that ships AbortSignal.timeout; guard anyway so an older
+  // runtime degrades to timeout-only rather than throwing.
+  return typeof AbortSignal.any === "function" ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function isTransientNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  // A user-initiated cancel and a request timeout both surface as AbortError; neither should be retried
+  // here (the timeout already consumed the full budget).
+  if (error.name === "AbortError" || error.name === "TimeoutError") {
+    return false;
+  }
+  return error.name === "TypeError" || /network|fetch failed|ECONNRESET|socket/iu.test(error.message);
+}
+
+function delay(durationMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, durationMs);
+  });
 }
 
 const NOVELAI_ENCODE_VIBE_DIRECT_URL = "https://image.novelai.net/ai/encode-vibe";

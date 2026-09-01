@@ -4,10 +4,19 @@ import type {
   ImageAsset,
   ImageCue,
   ImageCueCharacterPrompt,
+  ImageCueFrame,
   ImageGenerationProfile,
   ImageGenerationJob,
   PromptModule
 } from "../types";
+import {
+  createFrameCompositionTags,
+  createFrameNegativeTags,
+  stripConflictingCompositionTags,
+  filterTagsForFrame,
+  normalizeImageCueFrame,
+  resolveImageCueFrame
+} from "./imageFrame";
 import { generateNovelAiImages } from "./novelAiClient";
 import { resolveNovelAiModelName } from "./novelAiModels";
 import {
@@ -194,7 +203,10 @@ export function planImageJob(
       characterPrompts: promptPlan.characterPrompts,
       characters: scopedCue.characters,
       visualContext: scopedCue.visualContext,
-      suppressionReason: scopedCue.suppressionReason
+      suppressionReason: scopedCue.suppressionReason,
+      // Persisted with the job so a regenerated or re-inspected cut reuses the SAME crop instead of
+      // re-guessing it, and so the inspector can show what the composition actually was.
+      frame: resolveImageCueFrame(scopedCue)
     }
   };
 
@@ -361,7 +373,7 @@ export async function executeImageJob(
           cue: variant.cue,
           count: 1
         });
-        assertNovelAiResultHasImages(result.dataUrls, variant.label);
+        assertNovelAiResultHasImages(state, result.dataUrls, variant.label);
         dataUrls.push(...result.dataUrls.slice(0, 1));
         variantResults.push({
           label: variant.label,
@@ -437,7 +449,7 @@ export async function executeImageJob(
           cue: variant.cue,
           count: 1
         });
-        assertNovelAiResultHasImages(result.dataUrls, `${variant.label}-${requestIndex + 1}`);
+        assertNovelAiResultHasImages(state, result.dataUrls, `${variant.label}-${requestIndex + 1}`);
         dataUrls.push(...result.dataUrls.slice(0, 1));
         variantResults.push({
           label: `${variant.label}-${requestIndex + 1}`,
@@ -509,7 +521,7 @@ export async function executeImageJob(
         cue,
         count: 1
       });
-      assertNovelAiResultHasImages(result.dataUrls);
+      assertNovelAiResultHasImages(state, result.dataUrls);
       dataUrls = result.dataUrls;
       providerPayload = {
         ...job.providerPayload,
@@ -570,10 +582,21 @@ export async function executeImageJob(
   };
 }
 
-function assertNovelAiResultHasImages(dataUrls: string[], label = "main"): void {
-  if (dataUrls.length === 0) {
-    throw new Error(`NovelAI response contained no image files for ${label}.`);
+// `state` is threaded in so the empty-result case can name the real cause. NovelAI returns no images for two
+// very different reasons — the provider genuinely sent none, or DynamicChat is in dry-run because the
+// integration is switched off — and reporting the second as "NovelAI returned no images" blames the provider
+// for a local setting the user can fix in one click.
+function assertNovelAiResultHasImages(state: AppState, dataUrls: string[], label = "main"): void {
+  if (dataUrls.length > 0) {
+    return;
   }
+  if (!state.novelAi.enabled) {
+    throw new Error("NovelAI 연동이 꺼져 있어 이미지를 생성하지 않았습니다. 개인 설정에서 NovelAI를 활성화하세요.");
+  }
+  if (state.novelAi.requestMode === "mock") {
+    throw new Error("NovelAI가 mock 모드입니다. 실제 이미지를 생성하려면 요청 모드를 proxy 또는 direct로 바꾸세요.");
+  }
+  throw new Error(`NovelAI response contained no image files for ${label}.`);
 }
 
 async function waitForSequentialNovelAiSlot(state: AppState, requestIndex: number): Promise<void> {
@@ -1148,8 +1171,19 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
   const styleTags = splitPromptField(profile.stylePrompt);
   const artistTags = splitPromptField(profile.artistPrompt);
   const rawImageProfileTags = splitPromptTagGroups(imageProfileModules.map((module) => module.body));
+  const cueFrame = resolveImageCueFrame(scopedCue);
   const characterPrompts = createCueCharacterPrompts(state, scopedCue);
-  const contextTags = createContextTags(state, scopedCue, characterPrompts.length > 0);
+  // Which per-character tags scraped out of base_tags were actually absorbed by a character entry. With a
+  // single subject they all are; with several they cannot be attributed to anyone, so they must stay in the
+  // base caption. Filtering the base caption by "looks per-character" alone deleted them from BOTH sides.
+  const absorbedCharacterTags = characterPrompts.length === 1 ? readLegacyCharacterTags(scopedCue) : [];
+  const contextTags = createContextTags(state, scopedCue, characterPrompts.length > 0, absorbedCharacterTags, cueFrame);
+  // The crop only exists in the picture if it exists in the tags. Derived rather than trusted: a live
+  // open-weight model declared a frame on every cue but mirrored the shot tag into base_tags only about
+  // half the time, leaving the other half of the crops decided but not rendered.
+  const frameCompositionTags = createFrameCompositionTags(cueFrame).filter(
+    (tag) => !contextTags.some((existing) => stripNovelAiTagWeight(existing) === tag)
+  );
   const characterPromptTags = uniqueStrings(characterPrompts.flatMap((prompt) => promptToTags(prompt.prompt)));
   const imageProfileTags = {
     positive: rawImageProfileTags.positive,
@@ -1163,14 +1197,15 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
     artist: artistTags.positive,
     imageProfiles: imageProfileTags.positive,
     characters: characterPromptTags,
-    context: contextTags,
+    context: uniqueStrings([...frameCompositionTags, ...contextTags]),
     userRules: userRuleTags.positive
   };
-  const generatedCandidates = uniqueStrings([
-    ...layers.imageProfiles,
-    ...layers.context,
-    ...layers.userRules
-  ]);
+  // The frame is the authority for the crop, so any conflicting shot tag carried by the style module, the
+  // scene presets or the user rules is removed here rather than left for NovelAI to reconcile.
+  const generatedCandidates = stripConflictingCompositionTags(
+    uniqueStrings([...layers.imageProfiles, ...layers.context, ...layers.userRules]),
+    cueFrame
+  );
   const positiveCandidates = uniqueStrings([
     ...layers.artist,
     ...layers.quality,
@@ -1206,6 +1241,9 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
     ...imageProfileTags.negative,
     ...userRuleTags.negative,
     ...reroutedNegativeTags,
+    // NovelAI drifts a declared close-up back out toward a full body unless the excluded framing is also
+    // stated negatively. Saying what the crop is NOT is what makes the crop hold.
+    ...createFrameNegativeTags(cueFrame),
     ...promptToTags(profile.negativePrompt)
   ].map(normalizeNegativePromptTag)).filter((tag) => tag && !positiveTags.includes(tag));
 
@@ -1250,16 +1288,26 @@ function getImagePromptProfileModules(state: AppState): PromptModule[] {
   );
 }
 
+/** Per-character tags the model left in the flat/base tag lists instead of in a character entry. */
+function readLegacyCharacterTags(cue: ImageCue): string[] {
+  const allCueTags = uniqueStrings([...(cue.baseTags ?? []), ...(cue.tags ?? [])]);
+  return uniqueStrings(allCueTags.flatMap((tag) => promptToTags(tag)).filter(isCharacterPromptTag));
+}
+
 function createCueCharacterPrompts(state: AppState, cue: ImageCue): ImageCueCharacterPrompt[] {
   const explicitPrompts = (cue.characterPrompts ?? [])
     .map((prompt, index) => normalizeCueCharacterPrompt(prompt, index))
     .filter((prompt): prompt is ImageCueCharacterPrompt => Boolean(prompt));
-  const allCueTags = uniqueStrings([...(cue.baseTags ?? []), ...(cue.tags ?? [])]);
-  const legacyCharacterTags = uniqueStrings(allCueTags.flatMap((tag) => promptToTags(tag)).filter(isCharacterPromptTag));
+  const legacyCharacterTags = readLegacyCharacterTags(cue);
+  const frame = resolveImageCueFrame(cue);
 
   if (explicitPrompts.length > 0) {
+    // Residual per-character tags scraped out of base_tags cannot be attributed to a specific person, so
+    // gluing them onto entry 0 mislabels whoever happens to be first. With several entries they stay in the
+    // base caption instead; only a single-subject cut can safely absorb them.
+    const absorbLegacyTags = explicitPrompts.length === 1;
     const composed = explicitPrompts.map((prompt, index) =>
-      composeCharacterPrompt(state, prompt, index === 0 ? legacyCharacterTags : [])
+      composeCharacterPrompt(state, prompt, absorbLegacyTags && index === 0 ? legacyCharacterTags : [], frame)
     );
     return rebalanceCharacterCenters(composed.filter((prompt) => prompt.prompt.trim()));
   }
@@ -1287,9 +1335,15 @@ const MAX_AUTHORED_CHARACTER_PROMPT_TAGS = 45;
 function composeCharacterPrompt(
   state: AppState,
   prompt: ImageCueCharacterPrompt,
-  extraLeadingTags: string[]
+  extraLeadingTags: string[],
+  frame?: ImageCueFrame
 ): ImageCueCharacterPrompt {
-  const llmTags = promptToTags(prompt.prompt).slice(0, MAX_AUTHORED_CHARACTER_PROMPT_TAGS);
+  // The author's own tags win: they encode a deliberate reading of the scene, so the only thing removed from
+  // them is what the crop makes flatly impossible (a facing-camera expression on a figure turned away).
+  const llmTags = filterTagsForFrame(promptToTags(prompt.prompt), frame, { authored: true }).slice(
+    0,
+    MAX_AUTHORED_CHARACTER_PROMPT_TAGS
+  );
   // Only the saved IDENTITY (hair/eyes/face/body) is locally injected so the visible character stays the
   // right person. Outfit/exposure tags are authored by the LLM based on composition and current action —
   // the stored default outfit and outfit_keyword_mappings are surfaced to the LLM as reference only, never
@@ -1320,29 +1374,44 @@ function composeCharacterPrompt(
   // details (injury, blood, bodily fluids, sweat/wetness, held prop) that this cut omitted, so the figure keeps
   // performing the scene's action and keeps its established body/clothing-damage state instead of silently resetting.
   // Any explicit posture or per-detail tag the LLM wrote always wins (see resolvePersistedCharacterContinuityTags).
+  //
+  // Frame filter: continuity used to be refilled blind, so a face close-up that legitimately omits posture had a
+  // whole-body pose (and a held prop, and a wound on a leg nobody can see) pushed back into it. The crop decides
+  // which continuity tags can appear; the interaction tags whose contact point IS in frame still survive, which is
+  // what keeps a neck close-up during a strangling from collapsing into an idle portrait.
   const continuityTags = prompt.characterId
-    ? resolvePersistedCharacterContinuityTags(state, prompt.characterId, llmTags)
+    ? filterTagsForFrame(resolvePersistedCharacterContinuityTags(state, prompt.characterId, llmTags), frame)
     : [];
   // Outfit continuity: inject the character's CURRENT outfit (latest Wearing state, falling back to the saved
   // default outfit) so clothing stays the same across turns instead of drifting whenever the LLM re-describes it.
   // Skipped only when this cut is explicitly fully nude. Wins of state-changed outfits are preserved because the
   // current Wearing memory — not the static default — is the source. uniqueStrings dedups any overlap with llmTags.
+  //
+  // Frame filter: only garments covering a region the crop shows. Injecting boots and a skirt into a face
+  // close-up contradicted the model-facing rule that forbids exactly that, and is the classic way a tight crop
+  // drifts back out to a full body. Dropping an out-of-frame garment is NOT a wardrobe change — the stored
+  // Wearing state is untouched, so the next wider cut gets the full outfit back.
   const outfit =
     prompt.characterId && !assertsFullNudity(llmTags)
-      ? resolveCurrentCharacterOutfit(state, prompt.characterId)
+      ? filterTagsForFrame(resolveCurrentCharacterOutfit(state, prompt.characterId), frame)
       : [];
   // Gender/subject tags lead the caption. Identity used to be appended last, so in a long caption (up to 45
   // authored tags plus continuity and outfit) the one tag that tells NovelAI this figure is a man or a woman
   // sat at the very end, where it is weakest — a reliable way to get a male caption rendered as a second
   // female. The rest of the identity (hair/eyes/face/body) stays at the tail as before.
+  //
+  // The subject/gender half is never frame-filtered: it is what keeps this figure the right person, and it is
+  // true at every crop. Only the descriptive rest is — eye colour has nothing to say about a figure seen from
+  // behind, and hair colour survives because it is not region-bound.
   const { subject: identitySubject, rest: identityRest } = splitSubjectIdentityTags(identity);
+  const framedIdentityRest = filterTagsForFrame(identityRest, frame);
   const composedTags = uniqueStrings([
     ...identitySubject,
     ...llmTags,
     ...continuityTags,
     ...extraLeadingTags,
     ...outfit,
-    ...identityRest
+    ...framedIdentityRest
   ]);
   return {
     ...prompt,
@@ -1483,11 +1552,31 @@ function createDefaultCharacterCenter(index: number, total: number): { x: number
   };
 }
 
-function createContextTags(state: AppState, cue: ImageCue, hasCharacterPrompts = false): string[] {
+function createContextTags(
+  state: AppState,
+  cue: ImageCue,
+  hasCharacterPrompts = false,
+  absorbedCharacterTags: string[] = [],
+  frame?: ImageCueFrame
+): string[] {
   const baseSource = uniqueStrings([...(cue.baseTags ?? []), ...(cue.tags ?? [])]);
-  const contextTags = uniqueStrings(baseSource.flatMap((tag) => promptToTags(tag)))
+  // A per-character tag leaves the base caption only if a character entry actually took it. Otherwise it
+  // would vanish entirely: with two or more entries nothing absorbs it, and dropping it here as well meant
+  // `2girls, school uniform` lost the uniform from the whole prompt.
+  const absorbed = new Set(absorbedCharacterTags);
+  // The crop governs the SHARED caption too, not only the per-character ones. Frame filtering used to run
+  // exclusively inside composeCharacterPrompt, so a model that wrote "looking at viewer" or "brown loafers"
+  // into base_tags bypassed the frame entirely — a from-behind cut still faced the camera and a face
+  // close-up still carried shoes. These tags are model-authored, so they get the authored rule: face-
+  // dependent tags go when the crop hides the face, garments go when their region is out of frame, and
+  // everything else (scene, environment, lighting, composition) is left exactly as written.
+  const contextTags = filterTagsForFrame(
+    uniqueStrings(baseSource.flatMap((tag) => promptToTags(tag))),
+    frame,
+    { authored: true }
+  )
     .filter((tag) => !shouldRouteToNegativePrompt(tag))
-    .filter((tag) => !hasCharacterPrompts || !isCharacterPromptTag(tag));
+    .filter((tag) => !hasCharacterPrompts || !isCharacterPromptTag(tag) || !absorbed.has(tag));
 
   // Scene continuity: only when this cut establishes NO scene/place itself, fall back to the last persisted
   // scene/location/environment so the established setting carries instead of silently resetting. An explicit
@@ -1572,13 +1661,22 @@ function resolvePersistedCharacterStateTags(state: AppState, characterId: string
 
 function isCharacterPromptTag(tag: string): boolean {
   const normalized = stripNovelAiTagWeight(tag).replace(/[._-]+/gu, " ").trim();
+  // Camera/framing is SHARED staging, not per-character detail. Classifying it as character-scoped pulled
+  // the cut's own crop tags out of the base caption and concentrated them on one entry, so the composition
+  // the model chose stopped applying to the picture as a whole.
+  if (isCameraStateReusableTag(normalized)) {
+    return false;
+  }
   return (
     isCharacterIdentityReusableTag(normalized) ||
     isPoseCharacterPromptTag(normalized) ||
     isBodyFocusCharacterPromptTag(normalized) ||
     isExpressionOrConditionReusableTag(normalized) ||
     isClothingStateReusableTag(normalized) ||
-    /\b(?:wearing|outfit|expression|face focus|body focus|eyes?|mouth|smile|crying|blush|sweat)\b/iu.test(normalized)
+    // `eyes`/`mouth` alone matched scene props and camera terms ("bedroom eyes" aside, "mouth of the cave");
+    // require a qualifying context so only genuine per-character features route out of the base caption.
+    /\b(?:wearing|outfit|expression|smile|smiling|crying|blush|blushing|sweat)\b/iu.test(normalized) ||
+    /\b(?:closed|open|half-closed|wide|narrowed|glowing|empty)\s+(?:eyes|mouth)\b/iu.test(normalized)
   );
 }
 
@@ -1855,16 +1953,20 @@ function getNovelAiPositiveTagRank(tag: string): number {
   if (/\b(?:looking at viewer|looking away|looking back|pov|from side|from behind|front view|side view|low angle|high angle|dutch angle|close up|close-up|face focus|upper body|cowboy shot|full body|portrait|wide shot|medium shot|over the shoulder|over-the-shoulder|fisheye|depth of field)\b/iu.test(normalized)) {
     return 1;
   }
-  if (/\b(?:classroom|indoors|outdoors|school desk|desk|chair|chalkboard|blackboard|bed|bedroom|room|hallway|street|alley|library|archive|bookshelf|stage|spotlight|practice room|dance studio|dormitory|apartment|kitchen|cafe|restaurant|hospital|clinic|lab|laboratory|forest|beach|battlefield|rain|snow|night|daylight|window|door|blurred background|background)\b/iu.test(normalized)) {
+  // NovelAI weights earlier tokens more heavily, so the order below is the picture's priority order:
+  // subject count → camera/crop → who the subject IS → what they are DOING → where it happens.
+  // Setting used to outrank appearance and action, which pushed the character description far enough down
+  // the prompt that a busy location could overwhelm the subject.
+  if (/\b(?:hair|eyes?|twintails|twin tails|ponytail|braid|glasses|freckles|scar|beauty mark|horns?|tail|ears?|uniform|school uniform|skirt|pencil skirt|pleated skirt|necktie|ribbon|shirt|blouse|jacket|cardigan|dress|suit|coat|raincoat|sweater|pants|shorts|panties|bra|shoes|sneakers|boots|socks|thighhighs|naked|topless|bottomless|clothes lifted|panties aside|shirt open|tight fit)\b/iu.test(normalized)) {
     return 2;
   }
-  if (/\b(?:standing|sitting|lying|kneeling|crouching|walking|running|leaning|bending|reaching|arm up|arms up|hand up|hands up|spread legs|legs apart|thighs apart|from above|from below)\b/iu.test(normalized)) {
+  if (/\b(?:holding|grabbing|touching|hand on|hands on|hugging|kissing|fighting|dancing|microphone|notebook|book|pen|phone|weapon|sword|gun|hands|breasts?|chest|hips?|thighs?|legs?|feet|mouth|tongue|penis|pussy|vagina|penetration)\b/iu.test(normalized)) {
     return 3;
   }
-  if (/\b(?:holding|grabbing|touching|hand on|hands on|hugging|kissing|fighting|dancing|microphone|notebook|book|pen|phone|weapon|sword|gun|hands|breasts?|chest|hips?|thighs?|legs?|feet|mouth|tongue|penis|pussy|vagina|penetration)\b/iu.test(normalized)) {
+  if (/\b(?:standing|sitting|lying|kneeling|crouching|walking|running|leaning|bending|reaching|arm up|arms up|hand up|hands up|spread legs|legs apart|thighs apart|from above|from below)\b/iu.test(normalized)) {
     return 4;
   }
-  if (/\b(?:hair|eyes?|twintails|twin tails|ponytail|braid|glasses|freckles|scar|beauty mark|horns?|tail|ears?|uniform|school uniform|skirt|pencil skirt|pleated skirt|necktie|ribbon|shirt|blouse|jacket|cardigan|dress|suit|coat|raincoat|sweater|pants|shorts|panties|bra|shoes|sneakers|boots|socks|thighhighs|naked|topless|bottomless|clothes lifted|panties aside|shirt open|tight fit)\b/iu.test(normalized)) {
+  if (/\b(?:classroom|indoors|outdoors|school desk|desk|chair|chalkboard|blackboard|bed|bedroom|room|hallway|street|alley|library|archive|bookshelf|stage|spotlight|practice room|dance studio|dormitory|apartment|kitchen|cafe|restaurant|hospital|clinic|lab|laboratory|forest|beach|battlefield|rain|snow|night|daylight|window|door|blurred background|background)\b/iu.test(normalized)) {
     return 5;
   }
   if (/\b(?:smile|confident|worried|tense|nervous|surprised|frustrated|angry|sad|defiant|evil smile|leering|crying|tears?|tearing|blush|sweat|open mouth|half-closed eyes|closed eyes|light|lighting|spotlight|glow|motion blur|skin detail)\b/iu.test(normalized)) {
@@ -2051,14 +2153,23 @@ function findTurnIndex(state: AppState, turnId: string): number {
 
 function validateImagePolicy(state: AppState, cue: ImageCue, count: number): ImagePolicyResult {
   const warnings: string[] = [];
-  const completedJobs = state.imageJobs.filter((job) => job.status === "completed").length;
+  // Scoped to the CURRENT session, not the simulation's whole history. Counting every image ever completed
+  // meant that once a long-running simulation crossed the limit (default 30) the pipeline stopped producing
+  // images permanently and silently, while still paying for the annotation LLM call every turn. The setting
+  // is an automation guard rail — "do not run away inside one stretch of play" — not a lifetime quota.
+  const sessionJobIds = new Set(
+    state.messages.filter((message) => message.sessionId === state.simulation.activeSessionId).map((message) => message.id)
+  );
+  const completedJobs = state.imageJobs.filter(
+    (job) => job.status === "completed" && (sessionJobIds.size === 0 || sessionJobIds.has(job.turnId))
+  ).length;
   const requestedTotal = completedJobs + count;
 
   if (state.novelAi.automationTermination === "count" && requestedTotal > state.novelAi.countLimit) {
     return {
       allowed: false,
       warnings,
-      blockedReason: `이미지 생성 count limit 초과: ${requestedTotal}/${state.novelAi.countLimit}`
+      blockedReason: `이미지 생성 count limit 초과 (현재 세션 ${requestedTotal}/${state.novelAi.countLimit}). 개인 설정에서 한도를 올리거나 세션을 초기화하세요.`
     };
   }
 
@@ -2079,6 +2190,12 @@ function cueFromJob(job: ImageGenerationJob): ImageCue {
     characterPrompts: Array.isArray(cue?.characterPrompts) ? cue.characterPrompts.filter(isImageCueCharacterPrompt) : undefined,
     scene: typeof cue?.scene === "string" ? cue.scene : "generated scene",
     suppressionReason: typeof cue?.suppressionReason === "string" ? cue.suppressionReason : undefined,
-    visualContext: typeof cue?.visualContext === "string" ? cue.visualContext : undefined
+    visualContext: typeof cue?.visualContext === "string" ? cue.visualContext : undefined,
+    // Re-normalized rather than trusted: a job persisted before frames existed carries none, and a stored
+    // payload can hold whatever shape was written at the time.
+    frame: normalizeImageCueFrame(cue?.frame, [
+      ...(Array.isArray(cue?.baseTags) ? cue.baseTags : []),
+      ...(Array.isArray(cue?.tags) ? cue.tags : [])
+    ])
   };
 }

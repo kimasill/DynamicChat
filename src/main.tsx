@@ -4,6 +4,8 @@ import type { ReactNode } from "react";
 
 import App from "./App";
 import "./styles.css";
+// Imported after styles.css so the consolidated reply-body rules win on source order.
+import "./narrative-output.css";
 
 /**
  * Top-level error boundary that prevents any render-phase throw from

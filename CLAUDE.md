@@ -87,7 +87,8 @@ DynamicChat Web (React/Vite)
 - **서비스**: `src/services/` — 각 파일이 단일 관심사를 담당.
 - **서버 라우트**: `server/dynamicchat-server.mjs` — 라우트를 추가할 때 `matchRoute()` 배열에 등록.
 - **ID 생성**: `createId()` (`src/lib/id.ts`) 사용. `crypto.randomUUID()` 직접 호출 금지.
-- **환경 변수**: `DYNAMICCHAT_API_PORT`, `DYNAMICCHAT_DATA_DIR`, `DYNAMICCHAT_CORS_ORIGIN`, `DYNAMICCHAT_RATE_LIMIT_WINDOW_MS`, `DYNAMICCHAT_RATE_LIMIT_MAX`
+- **환경 변수**: `DYNAMICCHAT_API_PORT`, `DYNAMICCHAT_DATA_DIR`, `DYNAMICCHAT_CORS_ORIGIN`, `DYNAMICCHAT_RATE_LIMIT_WINDOW_MS`, `DYNAMICCHAT_RATE_LIMIT_MAX`, `DYNAMICCHAT_MAX_BODY_BYTES`
+  (요청 본문 상한, 기본 64MiB — 이미지 data URL 이 이 경로로 들어오므로 넉넉하게 잡혀 있다. 초과하면 413)
 - **LLM 백엔드**: 프로바이더 프리셋은 `src/services/llmProviders.ts` 한 곳에 있다. UI 메타데이터
   (라벨/base URL/모델 목록)와 런타임 능력(전송 형식, JSON 모드, temperature 상한, 추가 헤더/바디,
   프록시 필요 여부)을 같이 들고 있으므로 백엔드 추가는 배열 항목 하나면 된다.
@@ -289,6 +290,45 @@ paragraph cadence, adult_19 이다.
 그래서 1턴에는 맞던 시뮬레이션이 3턴에서 안 맞기 시작했고, 증상은 서사가 중간에 무너지는 것이었다.
 이제 응답 예산을 깎기 전에 전사를 먼저 줄인다. 최신 assistant 종료부는 이번 턴의 인수인계 지점이라
 축소 대상에서 제외한다.
+
+## 디자인 토큰과 테마
+
+색은 전부 `src/styles.css` 최상단 `:root` 의 토큰에서 나오고, 야간 테마는
+`src/narrative-output.css` 끝의 `:root[data-reader-theme="night"]` 가 **같은 이름을 다시 정의**해서
+만든다. narrative-output.css 는 styles.css 뒤에 import 되므로 소스 순서로 이긴다.
+
+**규칙 하나가 전부다: 채워진 표면은 쌍이다** — 바탕과 그 위의 잉크. 둘이 같이 뒤집히거나 둘 다 안
+뒤집히거나다. 한쪽만 토큰이고 다른 쪽이 리터럴이면 야간에 쌍이 어긋나 밝은 바탕에 밝은 글씨, 또는
+어두운 바탕에 어두운 글씨가 된다. 어두운 버튼에 흰 글씨가 리터럴로 박혀 있는 건 **정상이다** — 그
+버튼은 양쪽 테마에서 어둡다.
+
+**라이트 테마는 움직이지 않는다.** 리터럴을 토큰으로 바꿀 때 그 토큰의 라이트 값이 리터럴과
+같아야 한다. 같은 값의 토큰이 없으면 근처 토큰으로 반올림하지 말고 **라이트 값을 그대로 가진 토큰을
+새로 만들어라**. 단발성 한 곳이면 토큰을 만드는 대신 야간 스코프 오버라이드 한 줄이 낫다 —
+`.crack-system-note`, `.crack-setup-notice button`, `.library-hero-copy p` 가 그 예다.
+
+토큰 이름은 값이 아니라 **역할**이다. `--dc-panel` 은 카드, `--dc-paper` 는 페이지 바닥,
+`--surface-2` 는 가라앉은 면, `--dc-line` 은 선. `--paper` 를 카드에 쓰면 라이트에서는 맞아 보여도
+야간에 그 토큰이 가장 어두운 면이라 카드가 페이지 아래로 가라앉는다. 실제로 그렇게 틀렸었다.
+
+야간 값이 필요 없는 토큰도 있다. 액센트 6개만 야간 값을 갖는데, 나머지(민트·골드·코럴 등)는
+야간 바닥에서 이미 4.5:1 을 넘기기 때문이다. 안 움직인 토큰을 굳이 다시 적으면 하지도 않은 결정을
+한 것처럼 읽힌다.
+
+### 왜 이 규칙이 생겼는가
+
+styles.css 는 스킨을 여러 번 덧칠하면서 이전 스킨을 지우지 않았다. 같은 셀렉터에 같은 속성을
+6번까지 다시 선언한 블록이 있었고, **228개 블록 / 1,276줄이 어떤 화면에서도 절대 렌더되지 않는
+죽은 코드**였다. 지울 때는 눈으로 고르지 말고 증명해라: 같은 셀렉터 텍스트의 뒤쪽 블록이 그 블록의
+**모든 속성을 이름 그대로** 다시 선언하면, 그 블록은 어떤 요소에서도 마지막 선언이 될 수 없으므로
+삭제해도 계산값이 바뀌지 않는다. 속성 이름을 그대로 비교하는 게 핵심이다 — `background` 가
+뒤에서 `background-color` 로만 덮였다면 죽은 게 아니다.
+
+검증도 화면 하나를 보고 판단하지 마라. 클릭 세 번 들어가야 나오는 화면이 훨씬 많다. 스타일시트를
+파싱해서 (셀렉터, 속성) 별 최종 값을 라이트 토큰으로 해석한 뒤 변경 전후를 비교하면 모든 화면을
+한 번에 덮는다. 브라우저 대비 측정은 그 위에 얹는 확인이지 근거가 아니다 —
+`getComputedStyle` 은 150ms 색 트랜지션 도중과 화면 밖 요소에서 옛 값을 돌려준다(둘 다 실제로
+겪었다).
 
 ## 이미지 생성 정책
 

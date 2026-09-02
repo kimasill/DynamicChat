@@ -127,10 +127,58 @@ export function shouldPlanImageJob(state: AppState, cue: ImageCue, manual = fals
   return shouldGenerateImage(state, cue, manual);
 }
 
-export function shouldAutoRunImageJob(job: ImageGenerationJob): boolean {
+export function shouldAutoRunImageJob(job: ImageGenerationJob, liveState?: AppState): boolean {
   const requiresConfirmation = Boolean(job.providerPayload.requiresConfirmation);
   const allowed = (job.providerPayload.policy as ImagePolicyResult | undefined)?.allowed !== false;
-  return job.status === "queued" && !requiresConfirmation && allowed;
+  // A cut whose provider is not connected cannot succeed, so it is not attempted. The seed ships NovelAI
+  // disabled while the image trigger is realtime_auto, which meant every turn queued a request, ran it, and
+  // failed — a per-turn failure the user could do nothing about from inside the turn. The job is still
+  // PLANNED (its prompt is the thing worth inspecting, and the quality suite reads it), it just does not run.
+  //
+  // The stamp on the payload is only a PLAN-TIME observation and is never refreshed. Trusting it to gate
+  // execution made the marker lie: it says "turn NovelAI on and this cut will generate", but the stamp
+  // survives turning NovelAI on, so the cut stayed vetoed forever. Callers that hold a state snapshot
+  // therefore re-derive the block from live state and the stamp is used only as the fallback for callers
+  // that do not (the stamp remains the display text either way — see CrackMarkerJob).
+  //
+  // A confirmation is the user asking to try NOW, so it overrides either form: let it through and let the
+  // real provider error speak if it is still blocked. Silence is worse than a specific failure.
+  const setupBlocked = liveState
+    ? Boolean(describeNovelAiSetupBlock(liveState))
+    : Boolean(job.providerPayload.setupBlockedReason);
+  const userAskedToRunNow = Boolean(job.providerPayload.confirmedAt);
+  return job.status === "queued" && !requiresConfirmation && allowed && (!setupBlocked || userAskedToRunNow);
+}
+
+/**
+ * Whether the UI should offer the user a "run this now" control on a queued cut.
+ *
+ * Two different things hold a queued job back and the user can release both, so both need the button.
+ * `requiresConfirmation` is the confirm-mode cut waiting to be approved. `setupBlockedReason` is the cut
+ * that was planned while NovelAI was off: it is deliberately left queued rather than failed (a per-turn
+ * failure the user can do nothing about from inside the turn is noise), but without an affordance it was
+ * a dead end — the marker promised "turn NovelAI on and this cut will generate" while the only route back
+ * was cancel-then-regenerate. Running it sets confirmedAt, which overrides the block, so if the setup is
+ * still wrong the user gets the real provider error instead of silence.
+ */
+export function canUserRunQueuedImageJob(job: ImageGenerationJob): boolean {
+  if (job.status !== "queued") {
+    return false;
+  }
+  return Boolean(job.providerPayload.requiresConfirmation) || Boolean(job.providerPayload.setupBlockedReason);
+}
+
+/**
+ * Why NovelAI cannot run right now, or undefined when it can.
+ *
+ * Only conditions the user can see and fix from the settings screen. The API token deliberately is not
+ * checked: in proxy mode the secret lives on the server and the client copy is legitimately empty.
+ */
+export function describeNovelAiSetupBlock(state: AppState): string | undefined {
+  if (!state.novelAi.enabled) {
+    return "NovelAI 연동이 꺼져 있습니다. 개인 설정에서 켜면 이 컷부터 생성됩니다.";
+  }
+  return undefined;
 }
 
 export function planImageJob(
@@ -207,7 +255,11 @@ export function planImageJob(
       // Persisted with the job so a regenerated or re-inspected cut reuses the SAME crop instead of
       // re-guessing it, and so the inspector can show what the composition actually was.
       frame: resolveImageCueFrame(scopedCue)
-    }
+    },
+    // Recorded at plan time so the cut can say why it is waiting instead of failing once per turn. Kept at
+    // the TOP level of providerPayload because that is where both readers look — the CrackMarkerJob marker,
+    // which displays it, and shouldAutoRunImageJob, which holds back only the unattended dispatch.
+    setupBlockedReason: describeNovelAiSetupBlock(state)
   };
 
   return {
@@ -1206,11 +1258,15 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
     uniqueStrings([...layers.imageProfiles, ...layers.context, ...layers.userRules]),
     cueFrame
   );
+  // The cut is likewise the authority for WHERE it happens. Style/profile layers routinely carry a baked-in
+  // location, which otherwise ships alongside the cut's own and contradicts it.
+  const placedCandidates = stripConflictingPlaceTags(generatedCandidates, contextTags);
+  const placedStyleTags = stripConflictingPlaceTags(layers.style, contextTags);
   const positiveCandidates = uniqueStrings([
     ...layers.artist,
     ...layers.quality,
-    ...layers.style,
-    ...generatedCandidates
+    ...placedStyleTags,
+    ...placedCandidates
   ]);
   const reroutedNegativeTags = uniqueStrings(
     positiveCandidates
@@ -1222,7 +1278,7 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
     scopedCue,
     uniqueStrings(
       applyUserRulePositiveConstraints(
-        generatedCandidates
+        placedCandidates
           .filter((tag) => isNovelAiWeightedTag(tag) || !shouldRouteToNegativePrompt(tag)),
         imageUserRules
       )
@@ -1231,7 +1287,7 @@ function createImagePromptPlan(state: AppState, cue: ImageCue): ImagePromptPlan 
   const positiveTags = uniqueStrings([
     ...layers.artist,
     ...layers.quality,
-    ...layers.style,
+    ...placedStyleTags,
     ...generatedTags
   ]);
   const negativeTags = uniqueStrings([
@@ -1316,12 +1372,32 @@ function createCueCharacterPrompts(state: AppState, cue: ImageCue): ImageCueChar
     return [];
   }
 
+  // A caption needs a subject. This legacy path exists for older cues that put per-character tags in `tags`
+  // with no character_prompts, and it used to synthesise an anonymous entry from whatever "looked
+  // per-character" — including on a cut that declares no cast at all. A pure establishing shot
+  // (characters: [], "no humans", "empty classroom, desk, ribbon") therefore acquired a character whose
+  // whole description was "ribbon": the prop was scraped out of the base caption and rendered as a person.
+  // Requiring an actual subject signal keeps scenery as scenery, and because the base caption only gives up
+  // absorbed tags when an entry took them, the prop stays where the model put it.
+  if (cue.characters.length === 0 && !cutHasHumanSubject(cue)) {
+    return [];
+  }
+
   const characterIds = cue.characters.length > 0 ? cue.characters : [undefined];
   return characterIds.map((characterId, index) => ({
     characterId,
     prompt: legacyCharacterTags.join(", "),
     center: createDefaultCharacterCenter(index, characterIds.length)
   }));
+}
+
+/** Whether the cut states that a person is in it, via a subject-count tag and no explicit no-humans marker. */
+function cutHasHumanSubject(cue: ImageCue): boolean {
+  const tags = [...(cue.baseTags ?? []), ...(cue.tags ?? [])].map((tag) => stripNovelAiTagWeight(tag).trim().toLowerCase());
+  if (tags.some((tag) => /^no (?:humans?|people|person)$/u.test(tag))) {
+    return false;
+  }
+  return tags.some((tag) => isSubjectCountTag(tag));
 }
 
 // Anti-runaway backstop only. The LLM is the tag author and the prompt instructions own focus/background
@@ -1589,6 +1665,65 @@ function createContextTags(
 
   const persistedScene = resolvePersistedSceneTags(state);
   return persistedScene.length > 0 ? uniqueStrings([...contextTags, ...persistedScene]) : contextTags;
+}
+
+/**
+ * Place nouns, as opposed to atmosphere.
+ *
+ * Deliberately narrower than isSceneStateTag: "night", "rain", "indoors" and "背景"-ish mood words describe
+ * conditions that can hold in any location and must survive, while these name WHERE the cut happens and
+ * therefore can contradict each other. Only a contradiction is worth resolving.
+ */
+// Anchored to the WHOLE tag, not a substring of it. Unanchored, the place word inside a compound noun
+// dragged the compound in with it: "school uniform", "school swimsuit", "school bag", "stage lights" and
+// "office lady" all read as places and were stripped from the style / image-profile / user-rule layers the
+// moment a cut named its own location — deleting the profile's garment tags, which per the 8-layer contract
+// come from the stored visual profile and must not be inferred away here.
+//
+// But the place word heads a noun phrase; it is not always the last word. Requiring it to be last lost
+// "hotel room", "narrow library aisle" and "classroom window", and an empty cuePlaces set makes
+// stripConflictingPlaceTags a no-op — which is the two-locations bug it exists to prevent. So the tail is
+// an allow-list of place-shaped nouns: it admits those while still rejecting a garment/prop tail.
+// A place word can also be carried as a SUFFIX inside a single word, which the head-of-phrase form misses:
+// "backstage" is a shipped scene-preset tag (seed.ts) whose cut names no other location, so without it
+// cuePlaces comes back empty and the same simulation's profile ships "practice room, dormitory" alongside
+// it — three locations in one prompt. Such words are listed outright rather than by making the head match
+// a substring again, which is what caused the garment bug.
+//
+// The leading-modifier bound is generous because it costs nothing: the tail still has to be a place word,
+// so "long sleeve school uniform" and "bright stage lights" are rejected however many words precede them.
+// Boundary (seed style module, seed.ts): "practice room", "dormitory", "old dance practice room",
+// "hotel room", "narrow library aisle", "backstage", "cozy but poor agency office apartment" match;
+// "school uniform", "school swimsuit", "school bag", "stage lights", "office lady" must not.
+const PLACE_TAG_PATTERN =
+  /^(?:[a-z]+\s+){0,6}(?:classroom|school|library|archive|bookshelf|practice room|dance studio|dormitory|apartment|kitchen|cafe|restaurant|hospital|clinic|backstage|stage|street|alley|hallway|bedroom|bathroom|rooftop|office|studio|motel|hotel|club|bar|convenience store|elevator|car interior|train station|train|subway|park|beach|forest|shrine|temple)(?:\s+(?:room|aisle|window|counter|hall|building|entrance|interior|path|gate))?$/iu;
+
+function isPlaceTag(tag: string): boolean {
+  // Anchoring only holds on a trimmed, weight-free tag, so normalize before testing.
+  return PLACE_TAG_PATTERN.test(toLowerBareTag(tag));
+}
+
+/**
+ * Removes place tags carried by the ALWAYS-ON layers when the cut names its own location.
+ *
+ * Same principle as stripConflictingCompositionTags, applied to WHERE instead of HOW CLOSE: the cut is the
+ * authority on its own setting. Creators routinely bake a location into the image style/profile module —
+ * the shipped demo's profile literally reads "…atmospheric lighting, library, bookshelf, environmental
+ * portrait, close-up…" — so a turn that moves to an empty classroom was rendered with "library, bookshelf,
+ * empty classroom" all at once and NovelAI had to reconcile two places. The cut's own place wins; when the
+ * cut names no place, the profile's stays, because then it is the only setting information there is.
+ */
+function stripConflictingPlaceTags(tags: string[], cueContextTags: string[]): string[] {
+  const cuePlaces = cueContextTags.filter(isPlaceTag).map((tag) => toLowerBareTag(tag));
+  if (cuePlaces.length === 0) {
+    return tags;
+  }
+  const keep = new Set(cuePlaces);
+  return tags.filter((tag) => !isPlaceTag(tag) || keep.has(toLowerBareTag(tag)));
+}
+
+function toLowerBareTag(tag: string): string {
+  return stripNovelAiTagWeight(tag).trim().toLowerCase();
 }
 
 // Last persisted scene-owned scene/location/environment tags, newest first per type. Used only as a fallback when a

@@ -33,6 +33,7 @@ import { IMAGE_STATE_TYPE_INSTRUCTION } from "./imageStateTags";
 import { createStructuredContextSummary, describeRelationshipParameterValue } from "./memoryCompiler";
 import { createSceneCastPromptBlock, inferCurrentSceneCharacterIds } from "./sceneCast";
 import {
+  canonicalizeStateType,
   readStateMemoryKind,
   readStateMemoryOwnerId,
   readStateMemoryStateType,
@@ -328,15 +329,30 @@ export async function generateAssistantText(input: {
   // OpenAI-compatible) take unauthenticated requests, and gating them on a key made them fall silently back
   // to the mock response with no request ever sent.
   const requiresApiKey = getLlmProviderPreset(state.llm.provider).requiresApiKey;
-  if (!state.llm.enabled || state.llm.provider === "mock" || (requiresApiKey && !state.llm.apiKey.trim())) {
+  // "Mock" is a provider the user can deliberately pick to watch the turn machinery run without any network
+  // call, so it keeps producing its placeholder.
+  if (state.llm.provider === "mock") {
     return {
       content: input.fallback,
       sidecar: createFallbackSidecar(input.fallback),
       source: "mock",
       sidecarStatus: "fallback",
-      sidecarErrors: ["Mock or unconfigured LLM used fallback sidecar."],
+      sidecarErrors: ["Mock provider used the fallback sidecar."],
       requestPreview
     };
+  }
+  // An unconfigured backend is NOT a request to invent a story. This used to return the same locally
+  // assembled placeholder as the mock provider, and the caller committed it to the transcript as an ordinary
+  // assistant turn — so the app silently wrote fiction into the user's simulation and the only warning was a
+  // toast that cleared itself. Failing the turn leaves the transcript untouched and the user's own input
+  // intact, and says what to fix.
+  if (!state.llm.enabled) {
+    throw new Error("LLM이 꺼져 있어 진행할 수 없습니다. 개인 설정에서 모델을 켜세요.");
+  }
+  if (requiresApiKey && !state.llm.apiKey.trim()) {
+    throw new Error(
+      `${getLlmProviderPreset(state.llm.provider).label} API 키가 없어 진행할 수 없습니다. 개인 설정에서 키를 입력하거나, 키가 필요 없는 로컬 모델(Ollama)로 바꾸세요.`
+    );
   }
 
   try {
@@ -2508,11 +2524,26 @@ function readLatestRelationshipParameterValue(state: AppState, title: string): s
   if (!targetKey) {
     return undefined;
   }
+  // Match the CANONICAL form too, not just the creator's wording. memoryCompiler canonicalises a state_type
+  // on the way in — 의상 태그 is stored as `Wearing`, 상태 태그 as `StatusTags`, 생각 as `Thought` — so a
+  // raw-title comparison could never find them again and those parameters reported "현재 상태: 아직 없음"
+  // on every single turn. Measured on the shipped full-size simulation that was 3 of 10 parameters, and
+  // precisely the three the relationship tab exists for: outfit, expression/pose, and inner state. The model
+  // was being told to maintain them while never being shown what it had already stored.
+  const canonicalKey = normalizeRelationshipParameterKey(canonicalizeStateType(title) ?? "");
+  const keys = new Set([targetKey, canonicalKey].filter((key) => key.length > 0));
 
   for (let index = state.memoryEvents.length - 1; index >= 0; index -= 1) {
     const event = state.memoryEvents[index];
     const stateType = readStateMemoryStateType(event);
-    if (stateType && normalizeRelationshipParameterKey(stateType) === targetKey) {
+    if (!stateType) {
+      continue;
+    }
+    const eventKeys = [
+      normalizeRelationshipParameterKey(stateType),
+      normalizeRelationshipParameterKey(canonicalizeStateType(stateType) ?? "")
+    ];
+    if (eventKeys.some((key) => key.length > 0 && keys.has(key))) {
       const value = readStateMemoryValue(event);
       if (value) {
         return truncatePromptText(value, 120, "relationship parameter value");

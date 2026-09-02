@@ -403,12 +403,18 @@ export const seedState: AppState = {
     ...defaultRelationshipMapSettings
   },
   relationshipStatusOverrides: [],
+  // A fresh install defaults to the keyless local backend, not to the mock provider. Shipping "mock" meant a
+  // brand-new user's very first turn returned locally assembled placeholder prose that looked exactly like a
+  // real turn — the product appeared to write badly rather than to be unconfigured. With Ollama as the
+  // default, a machine running `ollama serve` works with no key at all (pick a model with 로컬 서버에서
+  // 불러오기), and a machine without it gets a real connection error naming the fix. Mock stays available in
+  // the provider list for anyone who wants to watch the turn machinery run offline.
   llm: {
-    enabled: false,
-    provider: "mock",
-    baseUrl: "https://api.openai.com/v1",
+    enabled: true,
+    provider: "ollama",
+    baseUrl: "http://127.0.0.1:11434/v1",
     apiKey: "",
-    model: "gpt-4.1-mini",
+    model: "",
     temperature: 0.82,
     maxTokens: 900,
     systemPrompt:

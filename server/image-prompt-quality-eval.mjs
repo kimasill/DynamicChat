@@ -19,6 +19,8 @@ try {
   const { findReusableImageAsset, getReusableTagsFromJob, pickStoredAsset, planImageJob } = await vite.ssrLoadModule("/src/services/imageOrchestrator.ts");
   const { generateNovelAiImages } = await vite.ssrLoadModule("/src/services/novelAiClient.ts");
   const { compileSimulationMemoryDelta, memoryDeltaToEvents } = await vite.ssrLoadModule("/src/services/memoryCompiler.ts");
+  const { readStateMemoryStateType, readStateMemoryValue } = await vite.ssrLoadModule("/src/services/stateMemory.ts");
+  const { __buildNarrativePromptForTest } = await vite.ssrLoadModule("/src/services/llmClient.ts");
 
   await evaluateRecentContextTagDetection(seedState, runSimulationTurn);
   evaluateNovelAiWeightingAndUserRules(seedState, planImageJob);
@@ -37,6 +39,8 @@ try {
   await evaluateLlmImageStateTagCarryover(seedState, planImageJob, planImageJobForCompletedTurn, generateNovelAiImages);
   await evaluateImageDetailStateContinuity(seedState, planImageJobForCompletedTurn);
   await evaluateFrameConsistency(seedState, planImageJobForCompletedTurn);
+  await evaluateContextFidelity(seedState, planImageJobForCompletedTurn, compileSimulationMemoryDelta, memoryDeltaToEvents, readStateMemoryStateType, readStateMemoryValue);
+  evaluateRelationshipParameterRoundTrip(seedState, compileSimulationMemoryDelta, memoryDeltaToEvents, __buildNarrativePromptForTest);
   await evaluateLlmNaiTagPreservation(seedState, planImageJob, generateNovelAiImages);
   evaluateNameAndBodyInventoryCleanup(seedState, planImageJob);
   await evaluateActorTargetCharacterDisambiguation(seedState, planImageJob, planImageJobForCompletedTurn);
@@ -2435,6 +2439,198 @@ async function evaluateImageDetailStateContinuity(seedState, planImageJobForComp
  * behind. The checks below assert the crop rules on the ACTUAL composed prompt, so both the LLM contract and
  * the local injection layer are held to them.
  */
+/**
+ * Two cases the product owner named explicitly, both previously broken.
+ *
+ * 1. A cut with NO character. An establishing shot is a legitimate image, and the pipeline used to invent a
+ *    person for it: any base tag that "looked per-character" was scraped out of the base caption and issued
+ *    as an anonymous character_prompt, so "empty classroom, desk, ribbon" rendered a character whose entire
+ *    description was "ribbon" — and the prop vanished from the scene it belonged to.
+ * 2. Outfit continuity across an ADDITIVE change. Putting a cardigan on over a uniform stored the cardigan
+ *    alone, so every later cut rendered the character in a cardigan and nothing else.
+ */
+/**
+ * A relationship parameter must show the model what it already stored.
+ *
+ * The relationship tab exists so outfit, expression and pose stay coherent turn to turn: the creator writes
+ * a rule ("save the confirmed outfit as NovelAI tags"), the annotation pass writes a value, and the next
+ * turn's prompt shows that value back so the model continues it instead of starting blank. memoryCompiler
+ * canonicalises the state_type on the way in — 의상 태그 becomes `Wearing`, 상태 태그 becomes `StatusTags`,
+ * 생각 becomes `Thought` — so a lookup by the creator's raw title silently found nothing and those
+ * parameters reported "현재 상태: 아직 없음" forever. Measured on the shipped simulation: 3 of 10, and
+ * exactly the three this feature exists for.
+ */
+function evaluateRelationshipParameterRoundTrip(seedState, compileSimulationMemoryDelta, memoryDeltaToEvents, buildNarrativePrompt) {
+  const characterId = "char_rel";
+  const parameters = [
+    { id: "p_outfit", title: "의상 태그", rule: "확정된 의상을 영문 태그로 저장", enabled: true, priority: 90 },
+    { id: "p_status", title: "상태 태그", rule: "표정/감정/자세 태그를 저장", enabled: true, priority: 80 },
+    { id: "p_custom", title: "외적 상태", rule: "겉모습 변화를 저장", enabled: true, priority: 70 }
+  ];
+  let state = createPlayableState(seedState, {
+    characters: [
+      { id: characterId, simulationId: seedState.simulation.id, name: "Rin", role: "heroine", summary: "lead", relationship: "", currentMood: "calm" }
+    ],
+    memoryEvents: [],
+    relationshipMap: { ...(seedState.relationshipMap ?? {}), enabled: true, parameters }
+  });
+
+  const values = { "의상 태그": "sailor uniform, wet", "상태 태그": "flushed, kneeling", "외적 상태": "머리 헝클어짐" };
+  for (const parameter of parameters) {
+    const value = values[parameter.title];
+    // Neutral narration on purpose: text that repeats the parameter title would also be mined by the
+    // prose state-extractor, and the test would then be measuring the miner rather than the round-trip.
+    const text = "장면이 이어진다.";
+    const delta = compileSimulationMemoryDelta({
+      state,
+      userText: text,
+      assistantText: text,
+      sidecar: {
+        assistantText: text,
+        memoryEvents: [
+          { content: `${parameter.title}: ${value}`, tags: [], memoryKind: "state", stateType: parameter.title, stateValue: value, actorId: characterId, importance: 0.9 }
+        ],
+        imageCue: { shouldGenerate: false, reason: "n/a", characters: [], tags: [], scene: "", visualContext: "" },
+        imageCues: []
+      },
+      sourceTurnId: `turn_${parameter.id}`
+    });
+    state = { ...state, memoryEvents: [...state.memoryEvents, ...memoryDeltaToEvents(state, delta, new Date(0).toISOString())] };
+  }
+
+  const built = buildNarrativePrompt(state, { userText: "다음 장면", modules: [], evidence: [] }, 2000);
+  const prompt = `${built.runtimeInstruction}\n${built.contextBlock}`;
+  const lineFor = (title) => prompt.split("\n").find((line) => line.trim().startsWith(`- ${title}:`)) ?? "";
+
+  for (const parameter of parameters) {
+    const line = lineFor(parameter.title);
+    assertCheck("relationship.roundtrip", line.length > 0, `Relationship parameter "${parameter.title}" reaches the prompt.`);
+    assertCheck(
+      "relationship.roundtrip",
+      line.length > 0 && !/현재 상태: 아직 없음/u.test(line),
+      `Relationship parameter "${parameter.title}" shows the value that was stored for it.`
+    );
+  }
+  assertCheck(
+    "relationship.roundtrip",
+    /sailor uniform/iu.test(lineFor("의상 태그")),
+    "A canonicalised parameter (의상 태그 -> Wearing) still resolves to its stored value."
+  );
+}
+
+async function evaluateContextFidelity(seedState, planImageJobForCompletedTurn, compileSimulationMemoryDelta, memoryDeltaToEvents, readStateMemoryStateType, readStateMemoryValue) {
+  const characterId = "char_fidelity";
+  const overrides = {
+    characters: [
+      { id: characterId, simulationId: seedState.simulation.id, name: "Rin", role: "heroine", summary: "lead", relationship: "", currentMood: "calm" }
+    ],
+    visualProfiles: [
+      {
+        id: "visual_fidelity",
+        simulationId: seedState.simulation.id,
+        characterId,
+        positivePrompt: "1girl, long black hair, red eyes",
+        negativePrompt: "",
+        defaultOutfitPrompt: "sailor uniform, pleated skirt, black thighhighs, brown loafers",
+        outfitPrompts: {}
+      }
+    ],
+    imageProfile: { ...seedState.imageProfile, triggerMode: "realtime_auto", cooldownTurns: 0, generationCadence: "rich" }
+  };
+
+  // --- 1. Scenery cut keeps its props and stays uninhabited -------------------------------------
+  const sceneryState = createPlayableState(seedState, { ...overrides, memoryEvents: [] });
+  const sceneryUser = createUserMessage(sceneryState, "교실을 비춘다");
+  const sceneryAssistant = createAssistantMessage(sceneryState, "텅 빈 교실. 책상 위에 리본 하나가 놓여 있다. 아무도 없다.");
+  const sceneryCue = {
+    shouldGenerate: true,
+    characters: [],
+    characterPrompts: [],
+    tags: [],
+    baseTags: ["wide shot", "no humans", "empty classroom", "desk", "ribbon", "dusk", "scenery"],
+    scene: "empty classroom",
+    reason: "establishing",
+    frame: { shot: "wide_shot", viewpoint: "front", visibleRegions: [] }
+  };
+  const sceneryPlan = await planImageJobForCompletedTurn(
+    { ...sceneryState, messages: [...sceneryState.messages, sceneryUser, sceneryAssistant] },
+    {
+      userMessage: sceneryUser,
+      assistantMessage: sceneryAssistant,
+      contextPack: createContextPack(sceneryState),
+      promptModuleUsages: [],
+      sidecar: { assistantText: sceneryAssistant.content, memoryEvents: [], imageCue: sceneryCue, imageCues: [sceneryCue] },
+      manualImage: false
+    }
+  );
+  const sceneryJob = sceneryPlan.imageJobs[0];
+  const sceneryCaptions = sceneryJob?.providerPayload?.characterPrompts ?? [];
+  assertCheck("context.scenery", sceneryCaptions.length === 0, "A cut with no cast produces no character caption at all.");
+  assertCheck("context.scenery", /ribbon/iu.test(sceneryJob?.prompt ?? ""), "A prop in a scenery cut stays in the base caption instead of becoming a person.");
+  assertCheck("context.scenery", /no humans/iu.test(sceneryJob?.prompt ?? ""), "An explicit no-humans marker survives into the final prompt.");
+
+  // --- 2. Outfit continuity ---------------------------------------------------------------------
+  const wearing = (value, content) => ({ content, tags: [], memoryKind: "state", stateType: "Wearing", stateValue: value, actorId: characterId, importance: 0.6 });
+  const quietCue = { shouldGenerate: false, reason: "n/a", characters: [], tags: [], scene: "", visualContext: "" };
+  let outfitState = createPlayableState(seedState, { ...overrides, memoryEvents: [] });
+  const applyOutfit = (value, changeText) => {
+    const user = createUserMessage(outfitState, changeText);
+    const assistant = createAssistantMessage(outfitState, changeText);
+    const delta = compileSimulationMemoryDelta({
+      state: outfitState,
+      userText: changeText,
+      assistantText: changeText,
+      sidecar: { assistantText: changeText, memoryEvents: [wearing(value, changeText)], imageCue: quietCue, imageCues: [] },
+      sourceTurnId: assistant.id
+    });
+    outfitState = {
+      ...outfitState,
+      messages: [...outfitState.messages, user, assistant],
+      memoryEvents: [...outfitState.memoryEvents, ...memoryDeltaToEvents(outfitState, delta, new Date(0).toISOString())]
+    };
+    const stored = [...outfitState.memoryEvents].reverse().find((event) => readStateMemoryStateType(event) === "Wearing");
+    return readStateMemoryValue(stored) ?? "";
+  };
+
+  applyOutfit("sailor uniform, pleated skirt, black thighhighs, brown loafers", "교복을 입고 있다.");
+  const afterAdd = applyOutfit("cardigan", "그녀가 가디건을 걸쳤다.");
+  assertCheck("context.outfit", /sailor uniform/iu.test(afterAdd), "Putting a garment on OVER the outfit keeps the outfit.");
+  assertCheck("context.outfit", /cardigan/iu.test(afterAdd), "The added garment is recorded alongside it.");
+
+  const afterChange = applyOutfit("bikini", "그녀는 탈의실에서 비키니로 갈아입었다.");
+  assertCheck("context.outfit", /bikini/iu.test(afterChange), "Changing into a different outfit records the new one.");
+  assertCheck("context.outfit", !/sailor uniform/iu.test(afterChange), "Changing into a different outfit replaces the old one rather than merging.");
+
+  // --- 3. The annotation pass outranks the prose miner for the same state ------------------------
+  // Both write state for the same turn. The miner appended later, so a "latest value" scan returned its
+  // Korean sentence instead of the authored English tags — and a sentence yields no usable outfit tags,
+  // so the next cut rendered the character with no outfit at all.
+  const precedenceState = createPlayableState(seedState, { ...overrides, memoryEvents: [] });
+  const proseWithClothing = "그녀는 교복을 입고 창가에 섰다. 젖은 머리카락이 목덜미에 달라붙었다.";
+  const authoredOutfit = "sailor uniform, pleated skirt, black thighhighs, wet hair";
+  const precedenceDelta = compileSimulationMemoryDelta({
+    state: precedenceState,
+    userText: "창가로 간다",
+    assistantText: proseWithClothing,
+    sidecar: {
+      assistantText: proseWithClothing,
+      memoryEvents: [
+        { content: `착용: ${authoredOutfit}`, tags: [], memoryKind: "state", stateType: "Wearing", stateValue: authoredOutfit, actorId: characterId, importance: 0.9 }
+      ],
+      imageCue: quietCue,
+      imageCues: []
+    },
+    sourceTurnId: "turn_precedence"
+  });
+  const precedenceEvents = memoryDeltaToEvents(precedenceState, precedenceDelta, new Date(0).toISOString());
+  const wearingRecords = precedenceEvents.filter((event) => readStateMemoryStateType(event) === "Wearing");
+  const resolvedOutfit = readStateMemoryValue([...wearingRecords].pop());
+  assertCheck("context.precedence", wearingRecords.length === 1, "One turn writes exactly one outfit record, not one per source.");
+  assertCheck("context.precedence", /wet hair/iu.test(resolvedOutfit ?? ""), "The annotation pass's authored outfit survives the turn.");
+  assertCheck("context.precedence", !/그녀|창가|입고/u.test(resolvedOutfit ?? ""), "A Korean sentence mined from the narration never becomes the stored outfit value.");
+
+}
+
 async function evaluateFrameConsistency(seedState, planImageJobForCompletedTurn) {
   const characters = [
     {

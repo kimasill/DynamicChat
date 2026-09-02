@@ -871,6 +871,15 @@
   color: var(--dc-mint);
 }
 
+/* .danger-button carries #923c31 ink on a #e5c5bf border — the pair reads as a warm warning in light
+   but the ink drops to ~2.1:1 on --dc-panel in night. Lifting the ink to the same salmon used by the
+   setup-notice button keeps the warning hue; the border moves to a translucent version of --dc-copper
+   so the warmth is preserved without the pale pink clashing on the dark panel. */
+:root[data-reader-theme="night"] .danger-button {
+  color: #ff9f80;
+  border-color: rgb(205 99 75 / 45%);
+}
+
 /* --- Turn marker ------------------------------------------------------------------------------ */
 /*
  * One per assistant turn, quiet enough to scroll past and specific enough to navigate by. The transcript

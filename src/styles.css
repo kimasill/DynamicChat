@@ -487,6 +487,7 @@ textarea {
   opacity: 0.45;
 }
 
+
 .strip-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(70px, 1fr));
@@ -642,7 +643,9 @@ textarea {
 .message.user .message-avatar {
   grid-column: 2;
   grid-row: 1;
-  background: #fff4e4;
+  /* Was #fff4e4 — a light amber tint invisible on the night panel. --wash-amber is the same warm
+     hue (#3a2f16 in night), and carries --amber at 5.9:1 on both grounds. */
+  background: var(--wash-amber);
   color: var(--amber);
 }
 
@@ -658,14 +661,16 @@ textarea {
   place-items: center;
   border-radius: var(--radius);
   color: var(--teal-dark);
-  background: #e6f4f2;
+  /* Was #e6f4f2 — a light mint that sat on a dark panel in night at ~1.1:1. --chip-mint is the same
+     hue, has a night value (#1b3b34), and carries --teal-dark at 3.20:1 on both grounds. */
+  background: var(--chip-mint);
 }
 
 .message-body {
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: #fff;
+  background: var(--crack-panel);
   box-shadow: 0 8px 24px rgb(23 32 38 / 5%);
 }
 
@@ -1168,7 +1173,9 @@ textarea {
   place-items: center;
   border-radius: var(--radius);
   color: var(--teal-dark);
-  background: #e6f4f2;
+  /* Was #e6f4f2 — same mint literal as .message-avatar. --chip-mint carries --teal-dark at 3.20:1
+     on both grounds. */
+  background: var(--chip-mint);
 }
 
 .builder-tab strong,
@@ -1183,13 +1190,16 @@ textarea {
 }
 
 .builder-tab.active span {
-  color: #172026;
-  background: #fff;
+  color: var(--dc-ink);
+  background: var(--crack-panel);
 }
 
 .builder-tab.active strong,
 .builder-tab.active small {
-  color: #fff;
+  /* On the active tab surface (painted by the themed --crack-accent) a literal #fff works in light,
+     but night needs --crack-panel's inverse. --crack-ink (#f2f6f8 in night) reads on --crack-accent
+     in both palettes. */
+  color: var(--crack-ink);
 }
 
 .builder-body {
@@ -2147,13 +2157,13 @@ textarea:focus-visible {
 
 .nav-button {
   color: #61605a;
-  border-color: #e5e5e1;
+  border-color: var(--crack-line);
   background: var(--crack-panel);
 }
 
 .icon-text-button {
   color: #1a1918;
-  border-color: #deddd7;
+  border-color: var(--crack-line-strong);
   background: var(--crack-panel);
 }
 
@@ -2168,7 +2178,7 @@ textarea:focus-visible {
 .status-pill {
   min-height: 34px;
   border-radius: 999px;
-  border-color: #e5e5e1;
+  border-color: var(--crack-line);
   background: var(--surface-2);
 }
 
@@ -2196,7 +2206,7 @@ textarea:focus-visible {
 .image-job,
 .memory-row,
 .review-card {
-  border-color: #e5e5e1;
+  border-color: var(--crack-line);
   border-radius: 8px;
   background: var(--crack-panel);
   box-shadow: none;
@@ -2239,7 +2249,7 @@ textarea:focus-visible {
   align-self: start;
   margin: 0;
   padding: 18px 18px 14px;
-  border-bottom: 1px solid #e5e5e1;
+  border-bottom: 1px solid var(--crack-line);
   background: var(--crack-panel);
 }
 
@@ -2252,7 +2262,7 @@ textarea:focus-visible {
   align-self: start;
   height: auto;
   padding: 14px 12px;
-  border-right: 1px solid #e5e5e1;
+  border-right: 1px solid var(--crack-line);
   background: var(--surface-2);
 }
 
@@ -2287,7 +2297,7 @@ textarea:focus-visible {
 .settings-card input,
 .settings-card select,
 .settings-card textarea {
-  border-color: #deddd7;
+  border-color: var(--crack-line-strong);
   border-radius: 8px;
   color: var(--ink-strong);
   background: var(--surface-2);
@@ -2321,35 +2331,35 @@ textarea:focus-visible {
 
 .story-side-panel,
 .story-tool-panel {
-  border-color: #e5e5e1;
+  border-color: var(--crack-line);
   background: var(--surface-2);
   overflow: auto;
 }
 
 .story-side-panel {
-  border-right: 1px solid #e5e5e1;
+  border-right: 1px solid var(--crack-line);
 }
 
 .story-tool-panel {
-  border-left: 1px solid #e5e5e1;
+  border-left: 1px solid var(--crack-line);
 }
 
 .story-run-workspace .panel-header {
   min-height: 72px;
-  border-bottom: 1px solid #e5e5e1;
+  border-bottom: 1px solid var(--crack-line);
   background: var(--surface-2);
 }
 
 .story-cover-block {
   gap: 12px;
   padding: 12px;
-  border-bottom: 1px solid #e5e5e1;
+  border-bottom: 1px solid var(--crack-line);
 }
 
 .story-cover-block .scene-card.featured {
   min-height: 304px;
   overflow: hidden;
-  border-color: #deddd7;
+  border-color: var(--crack-line-strong);
 }
 
 .story-cover-block .scene-card.featured .scene-visual {
@@ -2385,7 +2395,7 @@ textarea:focus-visible {
   z-index: 3;
   min-height: 72px;
   padding: 12px 16px;
-  border-bottom: 1px solid #e5e5e1;
+  border-bottom: 1px solid var(--crack-line);
   /* The strip is sticky over a themed column and its heading paints from --ink, so a literal white
      left the title on white in night. --dc-panel is #fffefa against the white it replaces here. */
   background: color-mix(in srgb, var(--dc-panel) 96%, transparent);
@@ -2407,7 +2417,7 @@ textarea:focus-visible {
 }
 
 .quick-model-control {
-  border-color: #e5e5e1;
+  border-color: var(--crack-line);
   border-radius: 8px;
   background: var(--surface-2);
 }
@@ -2418,7 +2428,7 @@ textarea:focus-visible {
   margin: 0;
   padding: 14px 16px;
   border-width: 0 0 1px;
-  border-color: #e5e5e1;
+  border-color: var(--crack-line);
   border-radius: 0;
   background: var(--crack-panel);
   box-shadow: none;
@@ -2466,7 +2476,7 @@ textarea:focus-visible {
 .message-avatar {
   width: 34px;
   height: 34px;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   color: var(--ink-label);
   background: var(--dc-paper);
 }
@@ -2530,7 +2540,7 @@ textarea:focus-visible {
   margin: 0;
   padding: 10px 14px max(10px, env(safe-area-inset-bottom));
   border: 0;
-  border-top: 1px solid #e5e5e1;
+  border-top: 1px solid var(--crack-line);
   border-radius: 0;
   /* Same pair as the strip above: the textarea inside follows the themed input rule, so the tray it
      sits in has to travel with it. */
@@ -2567,7 +2577,7 @@ textarea:focus-visible {
   min-height: 34px;
   overflow: hidden;
   padding: 0 12px;
-  border: 1px solid #deddd7;
+  border: 1px solid var(--crack-line-strong);
   border-radius: 999px;
   color: var(--ink-control);
   background: var(--surface-2);
@@ -2589,7 +2599,7 @@ textarea:focus-visible {
   height: 34px;
   place-items: center;
   padding: 0;
-  border: 1px solid #deddd7;
+  border: 1px solid var(--crack-line-strong);
   border-radius: 999px;
   color: #42413d;
   background: var(--crack-panel);
@@ -2630,12 +2640,12 @@ textarea:focus-visible {
 .story-tool-panel .tabs {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   padding: 12px;
-  border-bottom: 1px solid #e5e5e1;
+  border-bottom: 1px solid var(--crack-line);
   background: var(--surface-2);
 }
 
 .story-tool-panel .tab-button {
-  border-color: #deddd7;
+  border-color: var(--crack-line-strong);
   background: var(--crack-panel);
 }
 
@@ -2665,7 +2675,7 @@ textarea:focus-visible {
 .story-tool-panel .eval-row,
 .story-tool-panel .trace-card,
 .story-tool-panel .empty-panel {
-  border-color: #e5e5e1;
+  border-color: var(--crack-line);
   background: var(--crack-panel);
 }
 
@@ -2705,7 +2715,7 @@ textarea:focus-visible {
     grid-column: 1 / -1;
     max-height: none;
     border-left: 0;
-    border-top: 1px solid #e5e5e1;
+    border-top: 1px solid var(--crack-line);
   }
 }
 
@@ -2747,7 +2757,7 @@ textarea:focus-visible {
   .story-side-panel,
   .story-tool-panel {
     border: 0;
-    border-bottom: 1px solid #e5e5e1;
+    border-bottom: 1px solid var(--crack-line);
   }
 
   .story-cover-block .scene-card.featured {
@@ -2895,7 +2905,7 @@ textarea:focus-visible {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   height: 48px;
-  border-bottom: 1px solid #e5e5e1;
+  border-bottom: 1px solid var(--crack-line);
   background: var(--crack-panel);
 }.crack-story-breadcrumb {
   justify-self: start;
@@ -2921,7 +2931,7 @@ textarea:focus-visible {
   justify-content: center;
   min-width: 32px;
   height: 32px;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   border-radius: 8px;
   background: var(--crack-panel);
 }
@@ -2953,7 +2963,7 @@ textarea:focus-visible {
   gap: 10px;
   width: min(360px, 90vw);
   padding: 14px;
-  border: 1px solid #deddd7;
+  border: 1px solid var(--crack-line-strong);
   border-radius: 10px;
   background: var(--crack-panel);
   box-shadow: 0 18px 40px rgb(13 13 12 / 14%);
@@ -2969,7 +2979,7 @@ textarea:focus-visible {
   gap: 8px;
   min-height: 36px;
   padding: 0 10px;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   border-radius: 8px;
   background: var(--surface-2);
   font-weight: 600;
@@ -3189,7 +3199,7 @@ textarea:focus-visible {
   gap: 10px;
   align-items: center;
   padding: 12px;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   border-radius: 8px;
   background: var(--surface-2);
 }
@@ -3217,7 +3227,7 @@ textarea:focus-visible {
   place-items: center;
   min-height: 32px;
   padding: 0 10px;
-  border: 1px solid #deddd7;
+  border: 1px solid var(--crack-line-strong);
   border-radius: 8px;
   background: var(--crack-panel);
   font-weight: 600;
@@ -3266,7 +3276,7 @@ textarea:focus-visible {
   gap: 6px;
   width: 210px;
   padding: 8px;
-  border: 1px solid #deddd7;
+  border: 1px solid var(--crack-line-strong);
   border-radius: 8px;
   background: var(--crack-panel);
   box-shadow: 0 16px 36px rgb(13 13 12 / 14%);
@@ -3337,7 +3347,7 @@ textarea:focus-visible {
   gap: 6px;
   min-height: 92px;
   padding: 12px;
-  border: 1px solid #deddd7;
+  border: 1px solid var(--crack-line-strong);
   border-radius: 8px;
   background: rgb(255 255 255 / 96%);
   box-shadow: 0 12px 36px rgb(13 13 12 / 8%);
@@ -3380,7 +3390,7 @@ textarea:focus-visible {
   height: 28px;
   place-items: center;
   padding: 0;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   border-radius: 999px;
   color: var(--ink-label);
   background: var(--crack-panel);
@@ -3392,7 +3402,7 @@ textarea:focus-visible {
   gap: 5px;
   min-height: 28px;
   padding: 0 10px;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   border-radius: 999px;
   color: #42413d;
   background: var(--crack-panel);
@@ -3406,7 +3416,7 @@ textarea:focus-visible {
   gap: 6px;
   min-height: 28px;
   padding: 0 6px 0 10px;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   border-radius: 999px;
   color: var(--ink-control);
   background: var(--crack-panel);
@@ -3462,7 +3472,7 @@ textarea:focus-visible {
   display: grid;
   gap: 8px;
   padding: 10px;
-  border: 1px solid #deddd7;
+  border: 1px solid var(--crack-line-strong);
   border-radius: 8px;
   background: var(--crack-panel);
   box-shadow: 0 14px 34px rgb(13 13 12 / 12%);
@@ -3472,7 +3482,7 @@ textarea:focus-visible {
   min-height: 42px;
   padding: 8px 10px;
   text-align: left;
-  border: 1px solid #e5e5e1;
+  border: 1px solid var(--crack-line);
   border-radius: 8px;
   color: #42413d;
   background: var(--surface-2);
@@ -10435,17 +10445,31 @@ textarea:focus {
     min-width: 0;
   }
 
-  .crack-chat-shell {
-    grid-template-columns: minmax(0, 1fr);
+  /* The workspace becomes a flex column so the chat shell fills whatever the episode bar leaves,
+     instead of relying on a hardcoded calc that assumed 50px exactly. */
+  .crack-run-workspace {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 58px);
+    min-height: 0;
+    overflow: hidden;
   }
 
   .crack-episode-bar {
+    flex: 0 0 auto;
     grid-template-columns: minmax(0, 1fr);
     /* Single column here means breadcrumb and actions stack into two rows. The unconditional rule further
        up sets a fixed height: 50px, which is later in source than the earlier @media block that relaxed it,
        so the action row overflowed into the story column. Height has to be released wherever the bar wraps. */
     height: auto;
     min-height: 50px;
+  }
+
+  .crack-chat-shell {
+    flex: 1 1 0;
+    min-height: 0;
+    height: auto;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .crack-episode-actions {

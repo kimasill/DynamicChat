@@ -315,6 +315,17 @@ paragraph cadence, adult_19 이다.
 야간 바닥에서 이미 4.5:1 을 넘기기 때문이다. 안 움직인 토큰을 굳이 다시 적으면 하지도 않은 결정을
 한 것처럼 읽힌다.
 
+### 세피아 테마
+
+세피아 테마는 **읽기 열(reading column)만 리페인트하고 크롬은 건드리지 않는다.** 의도적이다.
+`narrative-output.css` 의 `.crack-story-stage[data-reader-theme="sepia"]` 블록이
+`--rich-*` 토큰 9개만 재정의한다(잉크·규선·배경·강조·인용). 야간 테마와 달리 `:root` 블록이
+없으므로 탑바·사이드바·인스펙터·대화상자는 전부 라이트 모드를 유지한다.
+
+세피아에서 영향받는 요소: `.rich-heading`, `.rich-strong`, `.rich-quote`, `.rich-list-item::marker`,
+`.rich-table`, `.rich-code`, `.rich-divider`, `.rich-link`, `.crack-setup-notice button`.
+영향받지 않는 요소: 본문 산문 `.crack-markdown`, 대화 강조 `--reader-speech`, 컴포저.
+
 ### 왜 이 규칙이 생겼는가
 
 styles.css 는 스킨을 여러 번 덧칠하면서 이전 스킨을 지우지 않았다. 같은 셀렉터에 같은 속성을

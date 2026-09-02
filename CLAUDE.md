@@ -104,9 +104,37 @@ DynamicChat Web (React/Vite)
 pnpm eval:simulation      # 시뮬레이션 품질 평가
 pnpm eval:image-prompts   # 이미지 프롬프트 품질 평가 (프레임 일관성 포함)
 pnpm eval:simulation-runs # 시뮬레이션 실행 품질 평가
+pnpm eval:theme-contrast  # 야간 테마 대비 회귀 검사 (스타일시트 정적 검사, 키/모델 불필요)
 pnpm eval:oss-models      # 오픈 모델 연동 검증 (키 불필요, 모의 업스트림)
 pnpm eval:quality         # 전체 평가
 ```
+
+### 전체 사슬 검증 (end-to-end)
+
+위 평가들은 각각 한 구간만 본다. 부품이 전부 통과하면서 이음매가 깨져 있을 수 있고, 실제로 결함은
+대부분 거기서 나왔다. `server/end-to-end-run-eval.mjs` 는 로컬 모델로 **진짜 턴**을 돌려 한 컷을
+끝까지 따라간다:
+
+```
+사용자 입력 → 서사 패스 → 주석 패스 → image cue → 작업 계획 → 큐 → NovelAI HTTP
+```
+
+```powershell
+$env:OSS_EVAL_MODEL="qwen3:14b"
+node server/end-to-end-run-eval.mjs
+```
+
+마지막 구간은 **인증 실패로 끝나는 것이 정상이다.** NovelAI 토큰이 없으면 거기까지가 사슬의 끝이고,
+novelai.net 이 돌려주는 401 이야말로 요청이 실제로 조립되어 나갔다는 증거다. `mock` 과 `disabled` 는
+같은 함수에서 빈 결과를 돌려주므로 "이미지가 없다" 만으로는 아무것도 증명하지 못한다.
+
+cadence 별 수량도 여기서 잰다 — `image_progression` 은 정확히 10, `rich` 는 2 이상, `balanced` 는 1.
+생성 cue 는 전부 신규 작업이나 재사용 자산 중 하나로 이어져야 하며, 어느 쪽도 아닌 cue 는 턴이
+약속하고 내놓지 않은 이미지다.
+
+frame 선언율만 합격/불합격이 아니라 **비율**로 본다(기본 하한 80%). 프레임은 모델이 쓰는 것이라
+편차가 있고, qwen3:14b 는 image_progression 에서 80% 근처가 실측값이다. 프레임이 없는 컷은 구도
+태그는 여전히 프롬프트에 들어가지만 부위 게이팅이 생략된다.
 
 ### 오픈 모델 검증
 
@@ -372,6 +400,12 @@ styles.css 는 스킨을 여러 번 덧칠하면서 이전 스킨을 지우지 �
 ## 이미지 생성 정책
 
 - 이미지 프롬프트는 8개 레이어를 순서대로 합친다: 품질 → 화풍 → 작가 → 캐릭터 visual profile → 장면/배경 → 감정/의상 → 사용자 규정 → negative
+- **한 턴에 몇 장이 나오는지는 cadence 가 정한다** — cue 하나당 작업 하나, 작업 하나당 이미지 한 장.
+  `ImageGenerationProfile.countMin` / `countMax` 는 타입과 시드에 값이 있지만(여성의 삶 시드는 4/4)
+  **런타임에서 아무도 읽지 않는다.** `planImageJob` 의 `options.count` 를 넘기는 프로덕션 호출부가
+  없어서 항상 1이다. 여러 장 machinery(`createImagePromptVariants`, `executeImageJob` 의 순차 슬롯
+  루프)는 완성되어 있고 `eval:image-prompts` 가 `{ count: 3 }` 으로 검증하지만, 실제로는 그 경로에
+  1 말고는 들어가지 않는다. 배선하면 컷당 호출 수가 그만큼 곱해지므로 비용 결정이 먼저다.
 - 각 캐릭터는 독립된 `char_caption`을 가진다 (NAI multi-char prompting).
 - 외형/의상 정보는 LLM이 추론하지 않고 저장된 `CharacterVisualProfile` + 현재 `Wearing` 상태에서 직접 주입한다.
 

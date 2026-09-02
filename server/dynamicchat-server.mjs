@@ -34,9 +34,23 @@ const novelAiEncodeVibeUrl = "https://image.novelai.net/ai/encode-vibe";
 const NOVELAI_UPSTREAM_TIMEOUT_MS = 180_000;
 const rateLimitWindowMs = Number(process.env.DYNAMICCHAT_RATE_LIMIT_WINDOW_MS ?? 60_000);
 const rateLimitMaxRequests = Number(process.env.DYNAMICCHAT_RATE_LIMIT_MAX ?? 180);
+// Validated rather than read straight through, because both failure modes are silent and neither is
+// exotic: "64MB" is NaN and every `> NaN` comparison is false, which disables the cap entirely, while an
+// exported-but-empty variable is not nullish, so `Number("")` is 0 and every body is refused. A cap that
+// can be switched off or jammed shut by a typo is worse than no cap; an unusable value falls back.
+const configuredMaxBodyBytes = Number(process.env.DYNAMICCHAT_MAX_BODY_BYTES);
+const maxJsonBodyBytes =
+  Number.isFinite(configuredMaxBodyBytes) && configuredMaxBodyBytes > 0 ? configuredMaxBodyBytes : 64 * 1024 * 1024;
 const rateLimitBuckets = new Map();
 let stateStoreWriteQueue = Promise.resolve();
 let secretStoreWriteQueue = Promise.resolve();
+
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super("Request body too large.");
+    this.name = "PayloadTooLargeError";
+  }
+}
 
 const corsHeaders = {
   "access-control-allow-origin": process.env.DYNAMICCHAT_CORS_ORIGIN ?? "*",
@@ -77,9 +91,19 @@ const server = createServer(async (request, response) => {
       response.destroy();
       return;
     }
-    sendJson(response, 500, {
-      error: error instanceof Error ? error.message : "Unknown DynamicChat API error"
-    });
+    // The generic 500 below says nothing on purpose, which would leave a caller whose image simply
+    // outgrew the cap with no way to tell a size refusal from a server bug. This one case is safe to
+    // name because the limit is the caller's own configuration, not a fact about the host. It reaches
+    // the caller only when the request declared a content-length; a chunked body that overruns while
+    // streaming has already lost its socket by the time we get here, so this write goes nowhere.
+    if (error instanceof PayloadTooLargeError) {
+      sendJson(response, 413, { error: "Request body too large.", maxBytes: maxJsonBodyBytes });
+      return;
+    }
+    // The message is already on the operator's console above. Echoing it to the caller leaks
+    // absolute filesystem paths (any escaping fs rejection carries one), so the wire gets a
+    // constant — the same shape getObjectAsset has always used for its failures.
+    sendJson(response, 500, { error: "Internal server error." });
   }
 });
 
@@ -129,9 +153,11 @@ function matchRoute(method, pathname) {
 }
 
 function allowRequestByRateLimit(request, response) {
-  const scope = readRequestScope(request);
-  const remote = request.socket.remoteAddress ?? "local";
-  const key = `${scope.ownerId}:${remote}`;
+  // Transport-derived only. The key used to fold in x-dynamicchat-owner-id, which the caller supplies
+  // and which is in access-control-allow-headers: rotating it handed every request a fresh bucket
+  // (measured: 400 requests with rotating ids drew 0 x 429 against a max of 180) and left a permanent
+  // Map entry behind each one. The remote address is the one thing the caller cannot choose.
+  const key = request.socket.remoteAddress ?? "local";
   const now = Date.now();
   const bucket = rateLimitBuckets.get(key) ?? { count: 0, resetAt: now + rateLimitWindowMs };
 
@@ -142,6 +168,17 @@ function allowRequestByRateLimit(request, response) {
 
   bucket.count += 1;
   rateLimitBuckets.set(key, bucket);
+
+  // Nothing else ever deletes from this Map. Keying on the remote address already bounds it in
+  // practice, but a long-lived process still accumulates one entry per address that ever connected,
+  // so sweep expired windows once the Map grows past a size no honest local client reaches.
+  if (rateLimitBuckets.size > 1000) {
+    for (const [existingKey, existingBucket] of rateLimitBuckets) {
+      if (now > existingBucket.resetAt) {
+        rateLimitBuckets.delete(existingKey);
+      }
+    }
+  }
 
   if (bucket.count > rateLimitMaxRequests) {
     response.writeHead(429, {
@@ -157,7 +194,11 @@ function allowRequestByRateLimit(request, response) {
 }
 
 async function health(_request, response) {
-  sendJson(response, 200, { ok: true, service: "dynamicchat-api", dataDir, rateLimit: { windowMs: rateLimitWindowMs, max: rateLimitMaxRequests } });
+  // /health is a header-free simple GET reachable from any page the user is visiting, so it must not
+  // describe the host. The absolute data directory carries the OS username and checkout location, and
+  // the limiter configuration tells an attacker exactly what budget it has. Both are printed to the
+  // operator's console at startup instead; nothing in src/, server/ or docs/ read them off the wire.
+  sendJson(response, 200, { ok: true, service: "dynamicchat-api" });
 }
 
 async function getNovelAiSubscription(request, response) {
@@ -326,7 +367,13 @@ async function proxyLlmChat(request, response) {
   let body;
   try {
     body = await readJsonBody(request);
-  } catch {
+  } catch (error) {
+    // A size refusal is not a parse failure. Swallowing it here reports 400 "Invalid JSON body." for a
+    // body that was well-formed and merely large — and this route carries the biggest payloads there
+    // are (assembled prompts, vibe-transfer base64), so it is where the diagnostic matters most.
+    if (error instanceof PayloadTooLargeError) {
+      throw error;
+    }
     sendJson(response, 400, { error: "Invalid JSON body." });
     return;
   }
@@ -504,6 +551,22 @@ const CLI_AGENT_ENV_OVERRIDES = {
   antigravity: "DYNAMICCHAT_CLI_ANTIGRAVITY"
 };
 
+// Shown when the binary is missing or unauthenticated. "It exited with code 1" is not a thing a user can
+// act on; the install command and the sign-in step are.
+const CLI_AGENT_INSTALL_HINTS = {
+  claude: "Install it with `npm i -g @anthropic-ai/claude-code`.",
+  codex: "Install it with `npm i -g @openai/codex`.",
+  gemini: "Install it with `npm i -g @google/gemini-cli`.",
+  antigravity: "Install Google Antigravity and make sure `agy` is on PATH."
+};
+
+const CLI_AGENT_AUTH_HINTS = {
+  claude: "Run `claude` once in a terminal and finish the sign-in.",
+  codex: "Run `codex` once in a terminal and finish the sign-in.",
+  gemini: "Run `gemini` once in a terminal to sign in, or set GEMINI_API_KEY in the environment.",
+  antigravity: "Run `agy` once in a terminal and finish the sign-in."
+};
+
 // Kept below the client-side CLI ceiling (MAX_CLI_AGENT_REQUEST_TIMEOUT_MS = 300s in llmClient)
 // so the bridge times out first and returns a clean 502 rather than the client aborting opaquely.
 // This is the hard ceiling for the NON-streaming path (whole response buffered before we see anything).
@@ -515,10 +578,23 @@ const cliAgentIdleTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_IDLE_TIMEOUT_MS
 const cliAgentStreamMaxTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_STREAM_MAX_MS ?? 900_000);
 
 async function proxyLlmCliAgent(_request, response) {
+  // The one relay that is NOT stateless-with-caller-credentials: it spawns this machine's own
+  // subscription-authenticated CLI (see runCliAgentProcess, which deliberately does not pass --bare so the
+  // signed-in OAuth session is used). A JSON POST with no custom headers is a simple request, so without
+  // this any page the user is visiting could spend their Claude/Codex/Gemini subscription and read the
+  // answer. The app's own calls carry a localhost origin and the eval harness sends none, so both pass.
+  if (rejectNonLocalSecretRequest(_request, response)) {
+    return;
+  }
+
   let payload;
   try {
     payload = await readJsonBody(_request);
-  } catch {
+  } catch (error) {
+    // Same reason as proxyLlmChat: a size refusal must not be reported as malformed JSON.
+    if (error instanceof PayloadTooLargeError) {
+      throw error;
+    }
     sendJson(response, 400, { error: "Invalid JSON body." });
     return;
   }
@@ -576,12 +652,36 @@ async function proxyLlmCliAgent(_request, response) {
     agent === "claude" ? (userPrompt.trim() || fullPrompt) : fullPrompt;
   const spawnWithoutShell = agent === "antigravity";
 
+  const describeMissingBinary = () =>
+    `${agent} CLI not found (command: ${command}). ${CLI_AGENT_INSTALL_HINTS[agent] ?? "Install it and ensure it is on PATH."} Or set ${CLI_AGENT_ENV_OVERRIDES[agent]} to its full path.`;
+
   const describeSpawnError = (error) =>
     error?.code === "ENOENT"
-      ? `${agent} CLI not found (command: ${command}). Install it and ensure it is on PATH, or set ${CLI_AGENT_ENV_OVERRIDES[agent]}.`
+      ? describeMissingBinary()
       : error instanceof Error
         ? error.message
         : `${agent} CLI agent failed.`;
+
+  /**
+   * Turns a non-zero exit into something the user can act on.
+   *
+   * The ENOENT branch above almost never fires in practice: the bridge spawns with `shell: true` on Windows,
+   * so a missing binary is not a spawn failure at all — cmd.exe starts fine, prints "'gemini' is not
+   * recognized as an internal or external command", and exits 1. The user was then told "gemini CLI exited
+   * with code 1" with no hint that the tool simply is not installed. The shell's own wording is matched here
+   * so the actionable message is produced on every platform.
+   */
+  const describeExitFailure = (code, stderr) => {
+    const text = String(stderr ?? "");
+    if (/is not recognized as an internal or external command|command not found|No such file or directory/iu.test(text)) {
+      return describeMissingBinary();
+    }
+    // Gemini and codex report an unconfigured account this way; without the hint it reads as a crash.
+    if (/Please set an Auth method|not authenticated|Please login|GEMINI_API_KEY/iu.test(text)) {
+      return `${agent} CLI is installed but not signed in. ${CLI_AGENT_AUTH_HINTS[agent] ?? "Run it once in a terminal and complete the sign-in."} Upstream said: ${text.slice(0, 300)}`;
+    }
+    return `${agent} CLI exited with code ${code}.${text ? ` ${text.slice(0, 500)}` : ""}`;
+  };
 
   if (wantStream) {
     // Stream stdout to the client as it is produced so the UI can render text incrementally.
@@ -662,7 +762,7 @@ async function proxyLlmCliAgent(_request, response) {
       // Process produced no stdout: surface an error (client checks response.ok before reading the stream).
       if (result.code !== 0) {
         sendJson(response, 502, {
-          error: `${agent} CLI exited with code ${result.code}.${result.stderr ? ` ${result.stderr.slice(0, 500)}` : ""}`
+          error: describeExitFailure(result.code, result.stderr)
         });
         return;
       }
@@ -686,9 +786,7 @@ async function proxyLlmCliAgent(_request, response) {
       cwd: agent === "claude" ? claudeNeutralCwd : undefined
     });
     if (result.code !== 0) {
-      sendJson(response, 502, {
-        error: `${agent} CLI exited with code ${result.code}.${result.stderr ? ` ${result.stderr.slice(0, 500)}` : ""}`
-      });
+      sendJson(response, 502, { error: describeExitFailure(result.code, result.stderr) });
       return;
     }
 
@@ -987,6 +1085,9 @@ async function getObjectAsset(_request, response, [objectKey]) {
 }
 
 async function listSimulations(request, response) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const store = await readStateStore();
   const scope = readRequestScope(request);
   const simulations = Object.values(store.simulations ?? {}).filter((state) => state?.simulation?.ownerId === scope.ownerId);
@@ -995,6 +1096,13 @@ async function listSimulations(request, response) {
 }
 
 async function createSimulation(request, response) {
+  // POST /simulations is a PUT in disguise: it reaches the same upsertSimulationState sink as
+  // saveSimulationState with no id-vs-URL check and no existence check, so an id that already exists is
+  // overwritten wholesale — transcript included — and the extracted secrets are written to the vault
+  // store. Guarding the state routes and leaving this one open left the write side of the same store open.
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const state = await readJsonBody(request);
   if (!assertRequestScope(response, request, state)) {
     return;
@@ -1004,6 +1112,9 @@ async function createSimulation(request, response) {
 }
 
 async function getSimulation(_request, response, [simulationId]) {
+  if (rejectNonLocalSecretRequest(_request, response)) {
+    return;
+  }
   const store = await readStateStore();
   const state = store.simulations[simulationId];
   if (!state) {
@@ -1018,6 +1129,9 @@ async function getSimulation(_request, response, [simulationId]) {
 }
 
 async function saveSimulationState(request, response, [simulationId]) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const state = await readJsonBody(request);
   if (state?.simulation?.id !== simulationId) {
     sendJson(response, 400, { error: "Simulation ID mismatch" });
@@ -1044,6 +1158,18 @@ async function saveSimulationState(request, response, [simulationId]) {
  * forge it, while the app's own traffic carries either a localhost origin or (for non-browser callers such
  * as the eval scripts) none at all. DYNAMICCHAT_CORS_ORIGIN, when set, is honoured as an extra allowed
  * origin so a configured deployment keeps working.
+ *
+ * The rule for who gets it: every handler that touches the persisted state store or the secret store,
+ * read or write, PLUS any handler that can spend something of the user's. Nothing narrower survives
+ * contact — the transcript is readable through /simulations, through a single simulation, through its
+ * assets and through its audit log, and writable through both POST /simulations and PUT .../state;
+ * picking a subset just moves the door.
+ *
+ * Left off deliberately are /health, GET /objects/*, which needs an object key only a guarded route hands
+ * out and is loaded by the app as an <img> subresource that sends no Origin at all, and the relays that
+ * really are stateless and really do run on credentials the caller supplies in the request: /novelai/*
+ * and POST /llm/chat. POST /llm/cli-agent is NOT in that set and IS guarded — it runs the host's own
+ * signed-in CLI, so the cost of leaving it open is the user's subscription, not the caller's key.
  */
 function isLocalBrowserOrigin(origin) {
   if (!origin) {
@@ -1070,7 +1196,7 @@ function rejectNonLocalSecretRequest(request, response) {
   }
   sendJson(response, 403, {
     error: "forbidden_origin",
-    message: "개인 API 보관함은 이 컴퓨터의 DynamicChat 앱에서만 접근할 수 있습니다."
+    message: "이 데이터는 이 컴퓨터의 DynamicChat 앱에서만 접근할 수 있습니다."
   });
   return true;
 }
@@ -1109,6 +1235,9 @@ async function savePersonalApiVault(request, response) {
 }
 
 async function createPromptModule(request, response, [simulationId]) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const module = await readJsonBody(request);
   const store = await readStateStore();
   const state = store.simulations[simulationId];
@@ -1128,6 +1257,9 @@ async function createPromptModule(request, response, [simulationId]) {
 }
 
 async function updatePromptModule(request, response, [moduleId]) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const patch = await readJsonBody(request);
   const store = await readStateStore();
   const { state, module } = findModule(store, moduleId);
@@ -1156,6 +1288,9 @@ async function resetSession(_request, response) {
 }
 
 async function createImageJob(request, response, [simulationId]) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const body = await readJsonBody(request);
   const now = new Date().toISOString();
   const job = {
@@ -1189,6 +1324,11 @@ async function createImageJob(request, response, [simulationId]) {
 }
 
 async function listAssets(request, response, [simulationId]) {
+  // Answers with image asset metadata and, for requested ids, hydrated data URLs — the same simulation
+  // content getSimulation guards, through a different door.
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const store = await readStateStore();
   const state = store.simulations[simulationId];
   if (!state) {
@@ -1225,6 +1365,12 @@ async function listAssets(request, response, [simulationId]) {
 }
 
 async function persistImageAssets(request, response, [simulationId]) {
+  // This is the route the object-key traversal is reached through, and it writes files. The scope check
+  // below is not a gate on its own — readRequestScope falls back to the stored ownerId, so a header-less
+  // caller always satisfies it — so the origin guard is what keeps an arbitrary page off it.
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const body = await readJsonBody(request);
   const assets = Array.isArray(body?.assets) ? body.assets : [];
   const store = await readStateStore();
@@ -1250,6 +1396,9 @@ function readRequestedAssetIds(request) {
 }
 
 async function cancelImageJob(request, response, [jobId]) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const store = await readStateStore();
   const { state, job } = findImageJob(store, jobId);
   if (!state || !job) {
@@ -1268,6 +1417,9 @@ async function cancelImageJob(request, response, [jobId]) {
 }
 
 async function getImageJob(request, response, [jobId]) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const store = await readStateStore();
   const { state, job } = findImageJob(store, jobId);
   if (!job) {
@@ -1282,6 +1434,11 @@ async function getImageJob(request, response, [jobId]) {
 }
 
 async function listAudit(request, response, [simulationId]) {
+  // The audit log is not innocuous: appendSecretAuditEvents records api_secret_stored entries carrying
+  // the secretRef ("dev:local_user:llm") plus provider and model, so this route names what the vault holds.
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const store = await readStateStore();
   const state = store.simulations[simulationId];
   if (!state) {
@@ -1296,6 +1453,9 @@ async function listAudit(request, response, [simulationId]) {
 }
 
 async function createBackup(request, response, [simulationId]) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const store = await readStateStore();
   const state = store.simulations[simulationId];
   if (!state) {
@@ -1316,6 +1476,12 @@ async function createBackup(request, response, [simulationId]) {
 }
 
 async function createRedaction(request, response, [simulationId]) {
+  // The most destructive route on the server: applyRedaction drops memory events, rewrites prompt module
+  // bodies to "[redacted]" and rm()s the backing object files, then the result is persisted. There is no
+  // undo, so it needs the guard more than the read routes do.
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
   const body = await readJsonBody(request);
   const store = await readStateStore();
   const state = store.simulations[simulationId];
@@ -1401,7 +1567,15 @@ async function extractPersistentState(inputState, existingSecrets = {}) {
 }
 
 async function persistAssetObjects(simulationId, assets, objectRoot = defaultObjectDir) {
-  const simulationObjectDir = path.join(objectRoot, simulationId);
+  // Both halves of the object key arrive from the request. Without this, POSTing an asset id of
+  // "../../../pwned" wrote the caller's bytes three levels above <data>/objects/ and mkdir created the
+  // directories on the way. Refuse the write and hand the asset back unpersisted rather than throwing:
+  // an id this shape is not something the app itself ever produces, and the caller still gets its
+  // metadata echoed exactly as it does for an unparseable data URL.
+  if (!isSafeObjectPathSegment(simulationId)) {
+    return assets;
+  }
+  const simulationObjectDir = resolveObjectPath(simulationId, objectRoot);
   await mkdir(simulationObjectDir, { recursive: true });
 
   return Promise.all(
@@ -1415,9 +1589,13 @@ async function persistAssetObjects(simulationId, assets, objectRoot = defaultObj
         return asset;
       }
 
+      if (!isSafeObjectPathSegment(asset.id)) {
+        return asset;
+      }
+
       const extension = extensionForMimeType(parsed.mimeType);
       const objectKey = `${simulationId}/${asset.id}.${extension}`;
-      const filePath = path.join(objectRoot, objectKey);
+      const filePath = resolveObjectPath(objectKey, objectRoot);
       await mkdir(path.dirname(filePath), { recursive: true });
       await writeFile(filePath, parsed.bytes);
 
@@ -1746,8 +1924,7 @@ async function writeBackupFile(store, reason) {
     id,
     reason,
     createdAt,
-    fileName,
-    dataDir
+    fileName
   };
 }
 
@@ -1935,6 +2112,20 @@ function resolveObjectPath(objectKey, objectRoot = defaultObjectDir) {
     throw new Error("Invalid object key.");
   }
   return filePath;
+}
+
+/**
+ * Whitelists a single path segment before it is used to build an object path.
+ *
+ * resolveObjectPath is the containment backstop and catches anything that escapes the root, but it is
+ * the wrong and only line of defence for a segment we are about to *create*: it happily accepts a
+ * simulation id or asset id that merely burrows sideways into another simulation's directory, or that
+ * carries a drive letter, a UNC prefix, or a NUL. Both are attacker-supplied — persistImageAssets takes
+ * the id straight out of the request body and the simulation id out of the URL — so they get an
+ * allow-list here as well as the containment check there. Neither replaces the other.
+ */
+function isSafeObjectPathSegment(value) {
+  return typeof value === "string" && value !== "." && value !== ".." && /^[A-Za-z0-9._-]+$/u.test(value);
 }
 
 function parseDataUrl(dataUrl) {
@@ -2177,8 +2368,31 @@ function readBearerToken(request) {
 }
 
 async function readJsonBody(request) {
+  // Node's http server caps neither the body nor the number of chunks, so without this a single POST
+  // buffers until the process dies (measured: a 64MB body was accepted in 318ms). The default is
+  // deliberately generous — a full-resolution NovelAI PNG arrives here as a base64 data URL inside the
+  // asset payload, which is the large legitimate case — and DYNAMICCHAT_MAX_BODY_BYTES raises it for
+  // anyone whose images outgrow it. Declared content-length is checked first so an honest oversized
+  // client is refused before we allocate anything, and that is the only path on which the caller gets
+  // a readable 413 — see the streaming check below.
+  const declared = Number(request.headers["content-length"] ?? 0);
+  if (Number.isFinite(declared) && declared > maxJsonBodyBytes) {
+    throw new PayloadTooLargeError();
+  }
+
   const chunks = [];
+  let total = 0;
   for await (const chunk of request) {
+    total += chunk.length;
+    if (total > maxJsonBodyBytes) {
+      // A chunked request declares no length, so the only way to stop the flood is to drop the socket —
+      // and that takes the response with it: the 413 the dispatcher then formats is written to a dead
+      // connection and silently discarded. The caller sees a connection reset, not a status. Throwing
+      // without destroying would not change that; leaving the `for await` runs the iterator's return(),
+      // which destroys the stream anyway. The throw still exists so the operator log names the cause.
+      request.destroy();
+      throw new PayloadTooLargeError();
+    }
     chunks.push(chunk);
   }
 

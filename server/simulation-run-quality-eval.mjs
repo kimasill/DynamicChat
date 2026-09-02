@@ -14,7 +14,7 @@ const vite = await createServer({
 const checks = [];
 
 try {
-  const { seedState } = await vite.ssrLoadModule("/src/data/seed.ts");
+  const { seedState, hydrateState } = await vite.ssrLoadModule("/src/data/seed.ts");
   const { activateSimulationProgressRun, createFreshSimulationRun } = await vite.ssrLoadModule("/src/services/simulationRuns.ts");
   const { NeuralMapClient } = await vite.ssrLoadModule("/src/services/neuralMapClient.ts");
   const { createLocalContextPack } = await vite.ssrLoadModule("/src/services/neuralMapClient.ts");
@@ -29,6 +29,7 @@ try {
   await evaluateContinuityAnchors(seedState, createLocalContextPack, generateAssistantText);
   await evaluateSceneCastGuard(seedState, createLocalContextPack, generateAssistantText, createStructuredContextSummary);
   evaluateImageCastContinuity(seedState, inferCurrentSceneCharacterIds);
+  await evaluateUnconfiguredTurnHonesty(seedState, hydrateState, runSimulationTurn);
 } finally {
   await vite.close();
 }
@@ -413,9 +414,16 @@ async function evaluateNeuralMapGraphDeltaRoles(seedState, NeuralMapClient) {
     const request = requests.find((item) => item.url.includes("/graph/deltas"))?.body;
     const synapses = request?.upsert_synapses ?? [];
     const neurons = request?.upsert_neurons ?? [];
-    const sceneNodeId = `simulation:${simulationId}:scene:graph-role-room`;
-    const minaNodeId = `simulation:${simulationId}:person:char_mina`;
-    const soraNodeId = `simulation:${simulationId}:person:char_sora`;
+    // Graph node ids are RUN-SCOPED: createRunScopedSimNamespace (neuralMapClient.ts) builds
+    // `simulation:<sim>:run:<runSlug>:…` so two progress runs of the same simulation cannot collide in
+    // NeuralMap. These assertions were written before that scoping existed and kept the old
+    // `simulation:<sim>:…` shape, so all five id-matching checks had been failing against a graph that was
+    // in fact correct — the edge-type and edge-count checks beside them, which do not look at ids, passed
+    // throughout. Built from the same two ids the state above is given, so the expectation moves with it.
+    const runScopedNamespace = `simulation:${simulationId}:run:${runId}`;
+    const sceneNodeId = `${runScopedNamespace}:scene:graph-role-room`;
+    const minaNodeId = `${runScopedNamespace}:person:char_mina`;
+    const soraNodeId = `${runScopedNamespace}:person:char_sora`;
     const edgeTypes = new Set(synapses.map((edge) => edge.type));
 
     assertCheck("neuralmap.graph", Boolean(request), "Graph delta request is sent to NeuralMap.");
@@ -429,6 +437,51 @@ async function evaluateNeuralMapGraphDeltaRoles(seedState, NeuralMapClient) {
   } finally {
     globalThis.fetch = previousFetch;
   }
+}
+
+/**
+ * An unconfigured backend must fail the turn, never invent one.
+ *
+ * The seed used to ship `llm: { enabled: false, provider: "mock" }`, and requestAssistantTurn returned the
+ * same locally-assembled placeholder for "mock" and for "not set up yet". The caller committed that to the
+ * transcript as an ordinary assistant message, so a brand-new user's first turn was fabricated prose stored
+ * in their simulation, warned about only by a toast that cleared itself. "Mock" stays a deliberate offline
+ * demo; "not configured" now stops the turn and says what to fix.
+ */
+async function evaluateUnconfiguredTurnHonesty(seedState, hydrateState, runSimulationTurn) {
+  assertCheck(
+    "turn.honesty",
+    seedState.llm.provider !== "mock" && seedState.llm.enabled === true,
+    "A fresh install defaults to a real backend, not to the offline mock provider."
+  );
+
+  const attempt = async (llm) => {
+    const state = hydrateState({
+      ...seedState,
+      llm: { ...seedState.llm, ...llm },
+      memoryEvents: [],
+      imageJobs: [],
+      imageAssets: [],
+      neuralMap: { ...seedState.neuralMap, enabled: false }
+    });
+    try {
+      const turn = await runSimulationTurn(state, "창가로 걸어간다", false);
+      return { wrote: true, text: turn?.assistantMessage?.content ?? "" };
+    } catch (error) {
+      return { wrote: false, message: String(error?.message ?? "") };
+    }
+  };
+
+  const disabled = await attempt({ enabled: false, provider: "ollama" });
+  assertCheck("turn.honesty", !disabled.wrote, "A disabled LLM fails the turn instead of writing a fabricated one.");
+  assertCheck("turn.honesty", /설정/u.test(disabled.message ?? ""), "The failure says where to fix it.");
+
+  const noKey = await attempt({ enabled: true, provider: "codex", apiKey: "", model: "gpt-4.1-mini" });
+  assertCheck("turn.honesty", !noKey.wrote, "A hosted provider with no API key fails the turn instead of writing a fabricated one.");
+  assertCheck("turn.honesty", /Ollama/u.test(noKey.message ?? ""), "The missing-key failure names the keyless local alternative.");
+
+  const mock = await attempt({ enabled: false, provider: "mock", model: "mock-simulation-agent" });
+  assertCheck("turn.honesty", mock.wrote, "The mock provider remains a working offline demo when deliberately selected.");
 }
 
 async function evaluateNeuralMapCastFiltering(seedState, NeuralMapClient, runSimulationTurn) {

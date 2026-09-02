@@ -163,7 +163,13 @@ export function compileSimulationMemoryDelta(input: {
 
   records.push(...recordsFromSidecar(input.state, input.sidecar.memoryEvents, input.assistantText));
   records.push(...recordsFromImageCueDrafts(input.state, input.sidecar.imageCues.length > 0 ? input.sidecar.imageCues : [input.sidecar.imageCue], records, input.assistantText));
-  records.push(...extractStateRecords(input.state, input.userText, input.assistantText));
+  // The prose miner is a FALLBACK for turns the annotation pass did not describe, never a second opinion on
+  // one it did. Both used to write for the same turn, and the miner's record was appended later, so a
+  // "latest value" scan returned it: a turn whose annotation authored
+  // `sailor uniform, pleated skirt, black thighhighs` was overwritten by the Korean sentence
+  // "그녀는 교복을 입고 창가에 섰다" mined out of the narration. Stored as the outfit, that sentence yields
+  // no usable tags at all, so the next cut lost the outfit entirely.
+  records.push(...withoutStateTypesAlreadyAuthored(extractStateRecords(input.state, input.userText, input.assistantText), records));
   records.push(...extractObservationAndBeliefRecords(input.state, input.userText, input.assistantText));
 
   if (records.length === 0) {
@@ -566,7 +572,9 @@ function preserveWearingStateDetails(
   }
 
   const baseTags = findStableOutfitBaseTags(state, ownerId);
-  const shouldPreserveBase = shouldPreserveOutfitBase(value, incomingTags, baseTags);
+  // An addition keeps everything already worn; only a genuine outfit change replaces it.
+  const shouldPreserveBase =
+    isOutfitAdditionChange(changeText) ? baseTags.length > 0 : shouldPreserveOutfitBase(value, incomingTags, baseTags);
   const tags = shouldPreserveBase ? uniquePromptTags([...baseTags, ...incomingTags]) : incomingTags;
   return limitStateTagValue(tags).join(", ");
 }
@@ -729,8 +737,54 @@ const OUTFIT_IDENTITY_WORD_PATTERN =
 const OUTFIT_REMOVAL_PATTERN =
   /\b(?:removed?|removing|removes|takes?\s+off|took\s+off|taking\s+off|strips?|stripped|stripping|undress(?:ed|es|ing)?|slips?\s+off|slipped\s+off|pulls?\s+off|pulled\s+off|peels?\s+off|peeled\s+off|unequip(?:ped|s)?|unfasten(?:ed|s)?|unlocks?|unlocked|came\s+off|cast\s+off|sheds?|doff(?:ed|s)?|discards?|discarded|naked|nude|topless|bottomless|fully\s+exposed)\b|벗(?:다|었|어|고|기|긴|겨|는|은|을|겼)|벗겨|탈의|알몸|나체/iu;
 
+/** Key a state record by who it is about and which state it sets, so two sources can be compared. */
+function readStateRecordKey(record: MemoryDeltaRecord): string | undefined {
+  if (record.kind !== "state" || !record.stateType) {
+    return undefined;
+  }
+  const owner = record.ownerId ?? record.actorId ?? "";
+  return `${owner}::${canonicalizeStateType(record.stateType) ?? record.stateType}`;
+}
+
+/** Drops mined records for a (character, state type) the annotation pass already wrote this turn. */
+function withoutStateTypesAlreadyAuthored(mined: MemoryDeltaRecord[], authored: MemoryDeltaRecord[]): MemoryDeltaRecord[] {
+  const taken = new Set(authored.map(readStateRecordKey).filter((key): key is string => Boolean(key)));
+  if (taken.size === 0) {
+    return mined;
+  }
+  return mined.filter((record) => {
+    const key = readStateRecordKey(record);
+    return key === undefined || !taken.has(key);
+  });
+}
+
 function isOutfitRemovalChange(changeText: string | undefined): boolean {
   return Boolean(changeText && OUTFIT_REMOVAL_PATTERN.test(changeText));
+}
+
+/**
+ * Language for putting something ON OVER what is already worn, as opposed to changing outfits.
+ *
+ * The tags alone cannot separate the two: "cardigan" is one garment either way. Only the narration says
+ * whether she pulled it on over the uniform or changed into it. Without this the additive case lost the
+ * whole outfit — a turn narrating "그녀가 가디건을 걸쳤다" stored `cardigan` and nothing else, so the next
+ * cut rendered her in a cardigan alone, with the uniform, skirt, thighhighs and shoes all gone.
+ *
+ * Deliberately excludes bare 입다, which covers both readings, and yields to the explicit change verbs
+ * (갈아입다 / changed into) so a real outfit swap still replaces.
+ */
+// Korean verbs inflect, so the stem alone does not match: 걸치다 surfaces as 걸쳤다 / 걸쳐 / 걸치고, and
+// 덧입다 as 덧입었다. Each stem therefore lists the vowel forms it actually takes in narration.
+const OUTFIT_ADDITION_PATTERN =
+  /\b(?:puts?\s+on|putting\s+on|pulls?\s+on|slips?\s+on|throws?\s+on|shrugs?\s+on|drapes?|draped|wraps?|wrapped|dons|donned)\b|걸[치쳐쳤]|덧입|껴입|둘[러렀]|두르|위에\s*입|어깨에\s*걸/iu;
+const OUTFIT_REPLACEMENT_PATTERN =
+  /\b(?:changes?\s+into|changed\s+into|swaps?\s+into|switch(?:es|ed)?\s+into)\b|갈아\s*[입입었]|갈아입|바꿔\s*입/iu;
+
+function isOutfitAdditionChange(changeText: string | undefined): boolean {
+  if (!changeText || OUTFIT_REPLACEMENT_PATTERN.test(changeText)) {
+    return false;
+  }
+  return OUTFIT_ADDITION_PATTERN.test(changeText);
 }
 
 function extractStateRecords(state: AppState, userText: string, assistantText: string): MemoryDeltaRecord[] {

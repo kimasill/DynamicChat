@@ -60,7 +60,7 @@ import type {
   SetStateAction,
   WheelEvent as ReactWheelEvent
 } from "react";
-import { Component, cloneElement, createContext, isValidElement, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Children, Component, cloneElement, createContext, isValidElement, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { builtInSimulationStates, createStateFromDraft, hydrateState, seedState, type SimulationDraft } from "./data/seed";
 import { createId } from "./lib/id";
@@ -70,7 +70,7 @@ import {
   promptModuleBodyCharLimit
 } from "./lib/promptLimits";
 import { listLocalLlmModels, normalizeApiToken, validateLlmApi, validateNovelAiApi } from "./services/apiValidation";
-import { executeImageJob, planImageJob, shouldAutoRunImageJob } from "./services/imageOrchestrator";
+import { canUserRunQueuedImageJob, executeImageJob, planImageJob, shouldAutoRunImageJob } from "./services/imageOrchestrator";
 import { generateAssistantText, isLlmAbortedError, setActiveTurnAbortSignal } from "./services/llmClient";
 import { LLM_PROVIDER_GROUP_LABELS, LLM_PROVIDER_PRESETS, type LlmProviderPreset } from "./services/llmProviders";
 import { describeImageCueFrame } from "./services/imageFrame";
@@ -259,6 +259,21 @@ function LlmProviderOptionGroups() {
 
 type BuilderTab = "overview" | "prompts" | "characters" | "status" | "api" | "review";
 type RightPanel = "image" | "relationship" | "neuralmap" | "memory" | "ops" | "persona" | "settings";
+type RightPanelGroup = "image" | "memory" | "settings";
+
+/**
+ * Seven peer tabs wrapped onto THREE rows in a 280px rail — roughly 142px of the rail spent before any
+ * content, and no reason for a reader to believe 관계 / Neural / 메모리 / 페르소나 were four different places.
+ * They are one question ("what does the app remember about this story"), so they are one tab with sections.
+ * The seven panel ids stay: other code still routes to "neuralmap" directly, and that now selects the group
+ * containing it.
+ */
+function resolveRightPanelGroup(panel: RightPanel): RightPanelGroup {
+  if (panel === "image") {
+    return "image";
+  }
+  return panel === "ops" || panel === "settings" ? "settings" : "memory";
+}
 type ModuleDropPosition = "before" | "after";
 type ImageScenePresetDropPosition = "before" | "after" | "inside";
 type DynamicTextBlockKind = "scene" | "impact" | "whisper" | "sfx" | "status" | "choice" | "memory" | "letter";
@@ -761,7 +776,7 @@ function NarrationImage({ src, alt }: { src?: string; alt?: string }) {
       return <CrackMarkerImage asset={slot.asset} onFeedback={media?.onFeedback} />;
     }
     if (slot?.kind === "job") {
-      return <CrackMarkerJob status={slot.job.status} />;
+      return <CrackMarkerJob job={slot.job} />;
     }
     // Marker with no matching media (e.g. image generation disabled): drop it instead of showing the literal token.
     return null;
@@ -808,11 +823,30 @@ const CrackMarkerImage = memo(function CrackMarkerImage({
   );
 });
 
-function CrackMarkerJob({ status }: { status: ImageGenerationJob["status"] }) {
+/**
+ * Where an image was going to be, showing why it is not there.
+ *
+ * This used to render the four words "이미지 생성 실패" and nothing else, while the pipeline had already
+ * written a specific, actionable reason onto the job — NovelAI disabled, no token, an upstream 401, a
+ * timeout. On a fresh install every single turn fails this way (the seed ships novelAi disabled with
+ * realtime_auto), so the one place the user was looking said only that something broke.
+ */
+function CrackMarkerJob({ job }: { job: ImageGenerationJob }) {
+  const failed = job.status === "failed" || job.status === "canceled";
+  const setupBlocked = typeof job.providerPayload?.setupBlockedReason === "string" ? job.providerPayload.setupBlockedReason : "";
+  const detail = setupBlocked || (failed ? job.error?.trim() || job.reason?.trim() || "" : "");
+  const label = setupBlocked
+    ? "이미지 설정 필요"
+    : failed
+      ? job.status === "canceled"
+        ? "이미지 생성 취소됨"
+        : "이미지 생성 실패"
+      : "이미지 생성 중…";
   return (
-    <span className="crack-marker-job" role="status">
+    <span className={`crack-marker-job${failed || setupBlocked ? " failed" : ""}`} role="status">
       <ImageIcon size={13} />
-      {status === "failed" ? "이미지 생성 실패" : "이미지 생성 중…"}
+      {label}
+      {detail ? <em>{detail}</em> : null}
     </span>
   );
 }
@@ -875,6 +909,45 @@ function decorateDialogue(children: ReactNode): ReactNode {
   return transform(children);
 }
 
+/**
+ * True for a list that is really a status panel — every row a bolded label, then a colon, then a value.
+ *
+ * Creators routinely require a status block at the end of every turn (the shipped full-size simulation asks
+ * for 통장/의상/건강 panels). Markdown gives them one shape for it — a bullet list of `**label**: value` — so
+ * the panel arrived at the reader looking exactly like narration, which is a large part of why the output
+ * reads as undifferentiated. Detection is STRUCTURAL, never by label text: a Korean, English or invented
+ * label set all produce the same shape, and hard-coding one creator's headings would work for exactly that
+ * creator. A list only qualifies when it is short and EVERY row matches, so an ordinary prose list that
+ * happens to bold its first phrase is left alone.
+ */
+/** Minimal shape of the hast node react-markdown hands each component. */
+interface MarkdownNode {
+  type?: string;
+  tagName?: string;
+  value?: string;
+  children?: MarkdownNode[];
+}
+
+function looksLikeStatBlock(node: MarkdownNode | undefined): boolean {
+  // Judged on the markdown AST rather than the rendered children: this component map replaces `li` and
+  // `strong` with custom components, so a `child.type === "li"` test never matches once they are React
+  // elements. The AST is also what the creator actually wrote, which is the thing being classified.
+  const items = (node?.children ?? []).filter((child) => child.tagName === "li");
+  if (items.length < 2 || items.length > 12) {
+    return false;
+  }
+  return items.every((item) => {
+    const parts = (item.children ?? []).filter(
+      (part) => part.tagName !== undefined || (part.value ?? "").trim().length > 0
+    );
+    if (parts[0]?.tagName !== "strong") {
+      return false;
+    }
+    // The label must be followed by a separator; "**bold** and then prose" is narration, not a stat row.
+    return /^\s*[:：]/u.test(parts[1]?.value ?? "");
+  });
+}
+
 const dynamicMarkdownComponents: Components = {
   img: ({ node: _node, src, alt }) => (
     <NarrationImage src={typeof src === "string" ? src : undefined} alt={typeof alt === "string" ? alt : ""} />
@@ -894,7 +967,11 @@ const dynamicMarkdownComponents: Components = {
       {decorateDialogue(children)}
     </blockquote>
   ),
-  ul: ({ node: _node, ...props }) => <ul className="rich-list" {...props} />,
+  ul: ({ node, children, ...props }) => (
+    <ul className={`rich-list${looksLikeStatBlock(node as MarkdownNode | undefined) ? " rich-stat-block" : ""}`} {...props}>
+      {children}
+    </ul>
+  ),
   ol: ({ node: _node, ...props }) => <ol className="rich-list ordered" {...props} />,
   li: ({ node: _node, children, ...props }) => (
     <li className="rich-list-item" {...props}>
@@ -1595,6 +1672,10 @@ function saveOpsRailWidth(width: number): void {
 
 interface StoryScrollSnapshot {
   simulationId: string;
+  /* A progress-run switch keeps simulation.id and swaps only the message array, so the scroll effect saw
+     "same simulation, different message count" and kept the previous run's offset — dropping the reader at
+     an arbitrary scrollTop inside unfamiliar prose. The run is part of the identity of what is on screen. */
+  progressRunId: string;
   messageCount: number;
   isSending: boolean;
   imageJobStatusSignature: string;
@@ -2249,7 +2330,7 @@ async function runRunnableImageJobs(
   snapshot: AppState,
   runJob: (job: ImageGenerationJob, snapshot: AppState) => Promise<void>
 ): Promise<void> {
-  const runnableJobs = jobs.filter(shouldAutoRunImageJob);
+  const runnableJobs = jobs.filter((job) => shouldAutoRunImageJob(job, snapshot));
   if (runnableJobs.length === 0) {
     return;
   }
@@ -4740,7 +4821,10 @@ function App() {
   const autoProgressOwnerRef = useRef<RunOwner | undefined>(undefined);
   const autoProgressActiveRef = useRef(false);
   const autoProgressResumeAttemptedRef = useRef(false);
-  const [rightPanel, setRightPanel] = useState<RightPanel>("neuralmap");
+  // Opens on the panel that answers the question a reader actually has — "where did my picture go". It
+  // used to open on Neural, which on a fresh install is a panel for a service that ships disabled and is
+  // not running, so the first thing in the rail was an empty graph and a "로컬 미러" badge.
+  const [rightPanel, setRightPanel] = useState<RightPanel>("image");
   // A queue, not a single slot. One 2.4-second slot was the app's entire feedback channel, so a failure
   // notice was routinely overwritten by the next success before it could be read — which is why image and
   // provider errors felt invisible.
@@ -5514,7 +5598,7 @@ function App() {
         }
       : job;
 
-    if (!shouldAutoRunImageJob(executableJob)) {
+    if (!shouldAutoRunImageJob(executableJob, snapshot)) {
       return;
     }
 
@@ -6040,7 +6124,7 @@ function App() {
           }
         }
 
-        const runnableImageJobs = imageJobs.filter(shouldAutoRunImageJob);
+        const runnableImageJobs = imageJobs.filter((job) => shouldAutoRunImageJob(job, runtimeSnapshot));
         if (runnableImageJobs.length > 0) {
           const snapshotWithImageJobs = {
             ...runtimeSnapshot,
@@ -6548,9 +6632,22 @@ function App() {
     }
 
     setIsResetting(true);
+    // The run this reset belongs to. createResetSessionState awaits three NeuralMap round-trips and returns a
+    // whole AppState derived from this closure's `state`, so committing it unguarded replaced whatever run was
+    // open by then with this one's messages / traces / assets. Comparing simulation.id alone would not catch
+    // it: a progress-run switch keeps simulation.id and swaps only the arrays.
+    const resetOwner = readRunOwner(state);
     try {
       const nextState = await createResetSessionState(state);
-      setState(nextState);
+      if (!ownsActiveRun(latestStateRef.current, resetOwner)) {
+        // The user left this run while the handoff was in flight — drop the snapshot and the panel/notice
+        // side effects with it, so nothing about the abandoned reset shows up in the run they moved to.
+        return;
+      }
+      // Ownership alone is not enough: an image job finishing or a settings edit landing in THIS run during
+      // those round-trips also passes the guard, and a wholesale replacement would throw it away. Layer only
+      // the new-session deltas, exactly as the auto-handoff commits do.
+      setState((current) => (ownsActiveRun(current, resetOwner) ? layerSessionResetOntoLiveState(current, nextState) : current));
       setRightPanel("neuralmap");
       showRuntimeNotice("에이전트 세션을 초기화했습니다. 시뮬레이션 기억과 설정은 유지됩니다.");
     } catch (error) {
@@ -6755,34 +6852,23 @@ function App() {
       <header className={`topbar ${view === "simulation" ? "crack-global-topbar" : ""}`}>
         {view === "simulation" ? (
           <>
+            {/* Only destinations that actually go somewhere. This bar used to carry 월드 and 보관함 (both
+                setView("home"), i.e. the logo's destination under two other names), 큐 (setView("simulation")
+                from inside the simulation view — a no-op), a search field with no value/onChange/submit, and
+                이미지 and 알림 icon buttons with no onClick at all. Six of eight controls did nothing or
+                duplicated another, which is what made the chrome read as decoration rather than an app. */}
             <div className="crack-global-left">
               <button className="crack-logo-button" type="button" onClick={() => setView("home")}>
                 DynamicChat
               </button>
               <button type="button" onClick={() => setView("home")}>
-                월드
+                라이브러리
               </button>
               <button type="button" onClick={() => openBuilder(state)}>
                 제작
               </button>
-              <button type="button" onClick={() => setView("home")}>
-                보관함
-              </button>
-              <button type="button" onClick={() => setView("simulation")}>
-                큐
-              </button>
-            </div>
-            <div className="crack-search-box">
-              <input aria-label="검색" placeholder="검색어를 입력해 주세요" />
-              <Search size={19} />
             </div>
             <div className="crack-global-actions">
-              <button className="crack-icon-action accent" type="button" aria-label="이미지">
-                <Sparkles size={18} />
-              </button>
-              <button className="crack-icon-action" type="button" aria-label="알림">
-                <Bell size={19} />
-              </button>
               <button className="crack-icon-action" type="button" aria-label="개인 설정" onClick={() => setPersonalSettingsOpen(true)}>
                 <UserRound size={20} />
               </button>
@@ -7288,6 +7374,7 @@ function CrackSimulationRunPage({
   );
   const storyScrollStateRef = useRef<StoryScrollSnapshot>({
     simulationId: state.simulation.id,
+    progressRunId: state.activeProgressRunId ?? "",
     messageCount: state.messages.length,
     isSending,
     imageJobStatusSignature,
@@ -7295,7 +7382,20 @@ function CrackSimulationRunPage({
     scrollHeight: 0,
     pinnedToBottom: true
   });
-  const turnIndex = Math.max(0, state.messages.filter((message) => message.role !== "system").length - 1);
+  // Numbered per ASSISTANT turn, which is what a reader means by "turn". The transcript used to carry one
+  // marker at the very top, labelled with the LAST turn's number and timestamp, so scrolling gave no sense of
+  // position and there was no way to point at a past beat.
+  const assistantTurnNumbers = useMemo(() => {
+    const numbers = new Map<string, number>();
+    let turn = 0;
+    for (const message of state.messages) {
+      if (message.role === "assistant") {
+        turn += 1;
+        numbers.set(message.id, turn);
+      }
+    }
+    return numbers;
+  }, [state.messages]);
   const markerDate = new Date(state.messages.at(-1)?.createdAt ?? state.simulation.updatedAt);
   const latestImageJob = state.imageJobs.at(-1);
   const rightMenuStatus = state.novelAi.enabled ? "NovelAI 연결" : "저장 이미지";
@@ -7365,6 +7465,41 @@ function CrackSimulationRunPage({
     [opsRailWidth]
   );
 
+  // The handle was pointer-only: a named, focusable control that a keyboard could reach and then do nothing
+  // with (WCAG 2.1.1). Arrow keys now step the width, Shift takes bigger steps and Home/End go to the bounds.
+  // Left widens because the rail is on the right edge — so the leftmost position (Home) is the widest one.
+  // Every path runs through clampOpsRailWidth and persists, exactly like the drag.
+  const handleOpsRailResizeKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLButtonElement>) => {
+      const step = event.shiftKey ? 48 : 16;
+      const requestedWidth =
+        event.key === "ArrowLeft"
+          ? opsRailWidth + step
+          : event.key === "ArrowRight"
+            ? opsRailWidth - step
+            : event.key === "Home"
+              ? MAX_OPS_RAIL_WIDTH
+              : event.key === "End"
+                ? MIN_OPS_RAIL_WIDTH
+                : null;
+
+      if (requestedWidth === null) {
+        return;
+      }
+
+      event.preventDefault();
+      const nextWidth = clampOpsRailWidth(requestedWidth);
+      setOpsRailWidth(nextWidth);
+      saveOpsRailWidth(nextWidth);
+    },
+    [opsRailWidth]
+  );
+
+  // Announced separately from MAX_OPS_RAIL_WIDTH because clampOpsRailWidth enforces getOpsRailWidthBounds,
+  // whose ceiling shrinks with the viewport — a fixed 720 would tell a screen reader the handle can reach a
+  // width it silently refuses, so Home would read as a broken control rather than as at its limit.
+  const [opsRailMaxWidth, setOpsRailMaxWidth] = useState(() => getOpsRailWidthBounds().max);
+
   const handleStoryScroll = useCallback(() => {
     const scrollElement = storyScrollRef.current;
     if (!scrollElement) {
@@ -7385,7 +7520,8 @@ function CrackSimulationRunPage({
 
     const previous = storyScrollStateRef.current;
     const firstLayout = previous.scrollHeight === 0;
-    const simulationChanged = previous.simulationId !== state.simulation.id;
+    const simulationChanged =
+      previous.simulationId !== state.simulation.id || previous.progressRunId !== (state.activeProgressRunId ?? "");
     const messageCountChanged = previous.messageCount !== state.messages.length;
     const sendingStarted = isSending && !previous.isSending;
     const imageStateChanged =
@@ -7400,6 +7536,7 @@ function CrackSimulationRunPage({
 
     storyScrollStateRef.current = {
       simulationId: state.simulation.id,
+      progressRunId: state.activeProgressRunId ?? "",
       messageCount: state.messages.length,
       isSending,
       imageJobStatusSignature,
@@ -7407,7 +7544,17 @@ function CrackSimulationRunPage({
       scrollHeight: scrollElement.scrollHeight,
       pinnedToBottom: shouldFollowBottom || (imageStateChanged && previous.pinnedToBottom) || isStoryScrollPinnedToBottom(scrollElement)
     };
-  }, [imageJobStatusSignature, isSending, state.imageAssets.length, state.messages.length, state.simulation.id]);
+    // activeProgressRunId belongs here: a progress-run switch keeps simulation.id, so when the two runs happen
+    // to share message count, image-asset count and job signature nothing else in this list changes and the
+    // `simulationChanged` branch above never gets to run — exactly the case it exists for.
+  }, [
+    imageJobStatusSignature,
+    isSending,
+    state.activeProgressRunId,
+    state.imageAssets.length,
+    state.messages.length,
+    state.simulation.id
+  ]);
 
   useEffect(() => {
     if (isSending) {
@@ -7418,6 +7565,7 @@ function CrackSimulationRunPage({
   useEffect(() => {
     const handleWindowResize = () => {
       setOpsRailWidth((current) => clampOpsRailWidth(current));
+      setOpsRailMaxWidth(getOpsRailWidthBounds().max);
     };
 
     window.addEventListener("resize", handleWindowResize);
@@ -7432,14 +7580,9 @@ function CrackSimulationRunPage({
   return (
     <section className="crack-run-workspace">
       <nav className="crack-episode-bar" aria-label="시뮬레이션 상단 메뉴">
-        <div className="crack-episode-tabs">
-          <button className="active" type="button">
-            에피소드
-          </button>
-          <button type="button">
-            파티챗
-          </button>
-        </div>
+        {/* The 에피소드 / 파티챗 pair that used to sit here had no onClick on either button and a hardcoded
+            className="active" on the first — a tab control that could not be operated. It held a fixed 260px
+            column, which is why the run title truncated; that column now belongs to the title. */}
         <button className="crack-story-breadcrumb" type="button" onClick={onEditSimulation}>
           {state.simulation.title}
           <ChevronRight size={15} />
@@ -7557,19 +7700,11 @@ function CrackSimulationRunPage({
           style={readerStageStyle(readerSettings)}
         >
           <div className="crack-story-scroll" ref={storyScrollRef} onScroll={handleStoryScroll}>
-            <header className="crack-story-title">
-              <h1>{state.simulation.title}</h1>
-              <p>장면, 기억, 이미지가 한 턴씩 맞물리는 라이브 런타임</p>
-            </header>
-
-            <div className="crack-episode-marker">
-              [{turnIndex}] | {markerDate.toLocaleDateString("ko-KR")} | {markerDate.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })} | {state.simulation.title}
-            </div>
-
             {state.messages.map((message) => (
               <CrackTimelineMessage
                 key={message.id}
                 message={message}
+                turnNumber={assistantTurnNumbers.get(message.id)}
                 assets={findMessageAssets(message, assetsById)}
                 jobs={pendingJobsByTurnId.get(message.id) ?? EMPTY_IMAGE_JOBS}
                 relatedJobs={allJobsByTurnId.get(message.id) ?? EMPTY_IMAGE_JOBS}
@@ -7588,6 +7723,9 @@ function CrackSimulationRunPage({
           </div>
 
           <form className="crack-composer" onSubmit={onSubmit}>
+            {/* Inside the composer card rather than above it: the card is position:absolute with z-index 20,
+                so a sibling in normal flow renders behind it. */}
+            <CrackSetupNotice state={state} onOpenPersonalSettings={onOpenPersonalSettings} />
             <textarea
               ref={composerTextareaRef}
               aria-label="메시지 보내기"
@@ -7706,43 +7844,60 @@ function CrackSimulationRunPage({
         </section>
 
         <aside className={`crack-ops-rail ${opsRailResizing ? "is-resizing" : ""}`} aria-label="운영 패널">
+          {/* role="separator" rather than button: there is nothing here to press, and the window-splitter
+              role is what lets a screen reader read the current width back out of aria-valuenow while the
+              arrow keys move it. The class selectors in styles.css are element-agnostic, so keeping the
+              <button> element keeps the existing look untouched. */}
           <button
             className="ops-rail-resize-handle"
             type="button"
+            role="separator"
+            aria-orientation="vertical"
+            aria-valuenow={opsRailWidth}
+            aria-valuemin={MIN_OPS_RAIL_WIDTH}
+            aria-valuemax={opsRailMaxWidth}
             onPointerDown={handleOpsRailResizePointerDown}
-            aria-label="오른쪽 운영 패널 크기 조절"
+            onKeyDown={handleOpsRailResizeKeyDown}
+            aria-label="오른쪽 운영 패널 크기 조절 (좌우 방향키)"
           />
           <div className="tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="오른쪽 패널">
-            <TabButton active={rightPanel === "image"} icon={<ImageIcon size={17} />} label="이미지" onClick={() => onRightPanelChange("image")} />
-            <TabButton active={rightPanel === "relationship"} icon={<Network size={17} />} label="관계" onClick={() => onRightPanelChange("relationship")} />
-            <TabButton active={rightPanel === "neuralmap"} icon={<Database size={17} />} label="Neural" onClick={() => onRightPanelChange("neuralmap")} />
-            <TabButton active={rightPanel === "memory"} icon={<Brain size={17} />} label="메모리" onClick={() => onRightPanelChange("memory")} />
-            <TabButton active={rightPanel === "ops"} icon={<Activity size={17} />} label="운영" onClick={() => onRightPanelChange("ops")} />
-            <TabButton active={rightPanel === "persona"} icon={<UserRound size={17} />} label="페르소나" onClick={() => onRightPanelChange("persona")} />
-            <TabButton active={rightPanel === "settings"} icon={<Settings2 size={17} />} label="설정" onClick={() => onRightPanelChange("settings")} />
+            <TabButton active={resolveRightPanelGroup(rightPanel) === "image"} icon={<ImageIcon size={17} />} label="장면" onClick={() => onRightPanelChange("image")} panelKey="ops-image" />
+            <TabButton active={resolveRightPanelGroup(rightPanel) === "memory"} icon={<Brain size={17} />} label="기억" onClick={() => onRightPanelChange("memory")} panelKey="ops-memory" />
+            <TabButton active={resolveRightPanelGroup(rightPanel) === "settings"} icon={<Settings2 size={17} />} label="설정" onClick={() => onRightPanelChange("settings")} panelKey="ops-settings" />
           </div>
-          <RuntimePanelContent
-            panel={rightPanel}
-            state={state}
-            isSending={isSending}
-            latestAssets={latestAssets}
-            latestContextPackId={latestContextPack?.id}
-            pendingUserText={activePendingUserText}
-            onCancelImageJob={onCancelImageJob}
-            onDeleteImageAsset={onDeleteImageAsset}
-            onImageFeedback={onImageFeedback}
-            onImageProfileChange={onImageProfileChange}
-            onLlmChange={onLlmChange}
-            onImageTagLlmChange={onImageTagLlmChange}
-            onNovelAiChange={onNovelAiChange}
-            onNotify={onNotify}
-            onOpenPersonalSettings={onOpenPersonalSettings}
-            onRedactMemory={onRedactMemory}
-            onRegenerateImageJob={onRegenerateImageJob}
-            onResetDemo={onResetDemo}
-            onRunImageJob={onRunImageJob}
-            onStateChange={onStateChange as Dispatch<SetStateAction<AppState>>}
-          />
+          {/* The tablist above had no panel to name: RuntimePanelContent returns a fragment of two to four
+              sibling panels, so there was no element to carry role="tabpanel". This wrapper is that element.
+              The rail is block flow with no gap, so an unstyled block wrapper leaves the layout untouched.
+              No tabIndex — the panel is full of focusable controls and the rail itself is the scroller, so a
+              tab stop here would only add a stop that goes nowhere. */}
+          <div
+            role="tabpanel"
+            id={`tabpanel-ops-${resolveRightPanelGroup(rightPanel)}`}
+            aria-labelledby={`tab-ops-${resolveRightPanelGroup(rightPanel)}`}
+          >
+            <RuntimePanelContent
+              panel={rightPanel}
+              state={state}
+              isSending={isSending}
+              latestAssets={latestAssets}
+              latestContextPackId={latestContextPack?.id}
+              pendingUserText={activePendingUserText}
+              onCancelImageJob={onCancelImageJob}
+              onDeleteImageAsset={onDeleteImageAsset}
+              onImageFeedback={onImageFeedback}
+              onImageProfileChange={onImageProfileChange}
+              onLlmChange={onLlmChange}
+              onImageTagLlmChange={onImageTagLlmChange}
+              onNovelAiChange={onNovelAiChange}
+              onNotify={onNotify}
+              onOpenPersonalSettings={onOpenPersonalSettings}
+              onRedactMemory={onRedactMemory}
+              onRegenerateImageJob={onRegenerateImageJob}
+              onResetDemo={onResetDemo}
+              onRunImageJob={onRunImageJob}
+              onStateChange={onStateChange as Dispatch<SetStateAction<AppState>>}
+            />
+          </div>
         </aside>
       </div>
       <MobileOpsDock activePanel={rightPanel} open={mobilePanelOpen} onClose={() => setMobilePanelOpen(false)} onSelectPanel={openMobilePanel}>
@@ -7832,28 +7987,23 @@ function RuntimePanelContent({
     );
   }
 
-  if (panel === "memory") {
-    return <MemoryPanel state={state} selectedContextPackId={latestContextPackId} onRedactMemory={onRedactMemory} />;
+  // 기억: what the app remembers about this story, as sections of one panel rather than four peer tabs.
+  if (resolveRightPanelGroup(panel) === "memory") {
+    return (
+      <>
+        <MemoryPanel state={state} selectedContextPackId={latestContextPackId} onRedactMemory={onRedactMemory} />
+        <RelationshipMapPanel state={state} onStateChange={onStateChange} />
+        <PersonaPanel state={state} onNotify={onNotify} onStateChange={onStateChange} />
+        <NeuralMapPanel state={state} isSending={isSending} pendingUserText={pendingUserText} onNotify={onNotify} onStateChange={onStateChange} />
+      </>
+    );
   }
 
-  if (panel === "relationship") {
-    return <RelationshipMapPanel state={state} onStateChange={onStateChange} />;
-  }
-
-  if (panel === "neuralmap") {
-    return <NeuralMapPanel state={state} isSending={isSending} pendingUserText={pendingUserText} onNotify={onNotify} onStateChange={onStateChange} />;
-  }
-
-  if (panel === "ops") {
-    return <OperationalPanel state={state} onFeedback={onImageFeedback} />;
-  }
-
-  if (panel === "persona") {
-    return <PersonaPanel state={state} onNotify={onNotify} onStateChange={onStateChange} />;
-  }
-
+  // 설정: runtime diagnostics sit with the settings that change them.
   return (
-    <SettingsPanel
+    <>
+      <OperationalPanel state={state} onFeedback={onImageFeedback} />
+      <SettingsPanel
       state={state}
       onImageProfileChange={onImageProfileChange}
       onLlmChange={onLlmChange}
@@ -7861,9 +8011,10 @@ function RuntimePanelContent({
       onNovelAiChange={onNovelAiChange}
       onNotify={onNotify}
       onOpenPersonalSettings={onOpenPersonalSettings}
-      onStateChange={onStateChange}
-      onResetDemo={onResetDemo}
-    />
+        onStateChange={onStateChange}
+        onResetDemo={onResetDemo}
+      />
+    </>
   );
 }
 
@@ -7880,27 +8031,31 @@ function MobileOpsDock({
   onClose: () => void;
   onSelectPanel: (panel: RightPanel) => void;
 }) {
+  // The same three groups as the desktop rail. Seven tabs in a fixed 3-column dock wrapped to three rows and
+  // covered the composer on a phone.
   const tabs: Array<{ panel: RightPanel; icon: React.ReactNode; label: string }> = [
-    { panel: "image", icon: <ImageIcon size={17} />, label: "이미지" },
-    { panel: "relationship", icon: <Network size={17} />, label: "관계" },
-    { panel: "neuralmap", icon: <Database size={17} />, label: "Neural" },
-    { panel: "memory", icon: <Brain size={17} />, label: "메모리" },
-    { panel: "ops", icon: <Activity size={17} />, label: "운영" },
-    { panel: "persona", icon: <UserRound size={17} />, label: "페르소나" },
+    { panel: "image", icon: <ImageIcon size={17} />, label: "장면" },
+    { panel: "memory", icon: <Brain size={17} />, label: "기억" },
     { panel: "settings", icon: <Settings2 size={17} />, label: "설정" }
   ];
+
+  const opsDrawerRef = useModalDialog(open, onClose);
 
   return (
     <div className={`mobile-ops ${open ? "open" : ""}`}>
       <div className="mobile-ops-tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="모바일 운영 패널">
+        {/* The drawer — the only thing these tabs control — is unmounted while closed, so aria-controls is
+            emitted for the selected tab and only while there is a panel for it to resolve to. */}
         {tabs.map((tab) => (
           <button
-            className={activePanel === tab.panel ? "active" : ""}
+            className={resolveRightPanelGroup(activePanel) === tab.panel ? "active" : ""}
             key={tab.panel}
             type="button"
             role="tab"
-            aria-selected={activePanel === tab.panel}
-            tabIndex={activePanel === tab.panel ? 0 : -1}
+            id={`tab-mobile-ops-${tab.panel}`}
+            aria-controls={open && resolveRightPanelGroup(activePanel) === tab.panel ? `tabpanel-mobile-ops-${tab.panel}` : undefined}
+            aria-selected={resolveRightPanelGroup(activePanel) === tab.panel}
+            tabIndex={resolveRightPanelGroup(activePanel) === tab.panel ? 0 : -1}
             onClick={() => onSelectPanel(tab.panel)}
           >
             {tab.icon}
@@ -7910,17 +8065,155 @@ function MobileOpsDock({
       </div>
       {open ? (
         <div className="mobile-ops-scrim" role="presentation" onClick={onClose}>
-          <section className="mobile-ops-drawer" role="dialog" aria-modal="true" aria-label="운영 패널" onClick={(event) => event.stopPropagation()}>
+          <section
+            className="mobile-ops-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="운영 패널"
+            ref={opsDrawerRef}
+            onClick={(event) => event.stopPropagation()}
+          >
             <header>
-              <strong>{tabs.find((tab) => tab.panel === activePanel)?.label ?? "운영"} 패널</strong>
+              {/* Matched to the tab strip above: the drawer holds seven panels but only three tabs, so a raw
+                  activePanel lookup misses whenever the app parks on neuralmap / relationship / persona / ops
+                  (session reset and every run switch do) and the header read a generic "운영 패널" that
+                  disagreed with the highlighted tab and with the content below it. */}
+              <strong>{tabs.find((tab) => tab.panel === resolveRightPanelGroup(activePanel))?.label ?? "운영"} 패널</strong>
               <button className="icon-button" type="button" onClick={onClose} aria-label="패널 닫기">
                 <Minus size={17} />
               </button>
             </header>
-            <div className="mobile-ops-content">{children}</div>
+            <div
+              className="mobile-ops-content"
+              role="tabpanel"
+              id={`tabpanel-mobile-ops-${resolveRightPanelGroup(activePanel)}`}
+              aria-labelledby={`tab-mobile-ops-${resolveRightPanelGroup(activePanel)}`}
+            >
+              {children}
+            </div>
           </section>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * Says, permanently and in place, when the app cannot do what the screen implies it is doing.
+ *
+ * A fresh install ships `llm: { enabled: false, provider: "mock" }` and `novelAi: { enabled: false }` while
+ * `imageProfile.triggerMode` is "realtime_auto" (src/data/seed.ts). So the first turn returns locally
+ * assembled placeholder prose and every turn queues an image that cannot be generated — and the only
+ * warning was a toast that cleared itself after a couple of seconds. A new user concluded, reasonably, that
+ * this is simply what the product writes and that images are broken.
+ *
+ * Deliberately not dismissable: it disappears by fixing the condition, not by acknowledging it.
+ */
+/**
+ * The behaviour `role="dialog" aria-modal="true"` promises: Escape closes, focus starts inside, and Tab
+ * cycles within instead of walking the page behind.
+ *
+ * Both dialogs declared the attributes and implemented none of it, so a keyboard or screen-reader user
+ * could tab straight out of an "modal" dialog into the transcript underneath while the scrim still covered
+ * it, and had no way to close without finding the mouse.
+ */
+function useModalDialog(open: boolean, onClose: () => void) {
+  const containerRef = useRef<HTMLElement>(null);
+  // Both call sites pass a fresh inline arrow, so `onClose` has a new identity on every parent render. With
+  // it in the dependency array the effect tore down and re-ran on any App-level state change while the dialog
+  // was open (a runtime notice expiring 2.8s later is enough) — each pass yanked focus back to the dialog's
+  // first control and re-captured `previouslyFocused` as that same control, destroying the restore-to-opener
+  // promise of the cleanup below. Reading the handler through a ref lets the effect depend only on `open`, so
+  // it runs exactly once per open.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const container = containerRef.current;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+
+    const focusableSelector =
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
+    const focusable = () =>
+      Array.from(container?.querySelectorAll<HTMLElement>(focusableSelector) ?? []).filter(
+        (element) => element.offsetParent !== null || element === document.activeElement
+      );
+
+    // Focus the first control rather than the container, so the first Tab moves forward inside the dialog.
+    const initial = focusable()[0] ?? container;
+    initial?.focus?.();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") {
+        return;
+      }
+      const items = focusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (event.shiftKey && (active === first || !container?.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown, true);
+      // Hand focus back to whatever opened the dialog, so the keyboard user is not dropped at the page top.
+      previouslyFocused?.focus?.();
+    };
+  }, [open]);
+
+  return containerRef;
+}
+
+function CrackSetupNotice({ state, onOpenPersonalSettings }: { state: AppState; onOpenPersonalSettings: () => void }) {
+  const llmUnconfigured = !state.llm.enabled || state.llm.provider === "mock";
+  const imagesWanted =
+    state.imageProfile.enabled &&
+    state.simulation.realtimeImageEnabled &&
+    state.imageProfile.triggerMode !== "stored_only" &&
+    state.imageProfile.triggerMode !== "manual";
+  const imagesUnconfigured = imagesWanted && !state.novelAi.enabled;
+
+  if (!llmUnconfigured && !imagesUnconfigured) {
+    return null;
+  }
+
+  return (
+    <div className="crack-setup-notice" role="status">
+      <div>
+        {llmUnconfigured ? (
+          <p>
+            <strong>아직 실제 모델에 연결되지 않았습니다.</strong> 지금 보이는 응답은 앱이 로컬에서 만든 예시이며, 시뮬레이션이
+            실제로 진행되지는 않습니다.
+          </p>
+        ) : null}
+        {imagesUnconfigured ? (
+          <p>
+            <strong>이미지 생성이 켜져 있지만 NovelAI가 연결되지 않았습니다.</strong> 매 턴 이미지가 예약되었다가 그대로 실패합니다.
+          </p>
+        ) : null}
+      </div>
+      <button type="button" onClick={onOpenPersonalSettings}>
+        설정 열기
+      </button>
     </div>
   );
 }
@@ -8052,6 +8345,7 @@ const DynamicTextEffectBlock = memo(function DynamicTextEffectBlock({ content, k
 
 function CrackTimelineMessage({
   message,
+  turnNumber,
   assets,
   jobs,
   relatedJobs,
@@ -8066,6 +8360,7 @@ function CrackTimelineMessage({
   regenerationDisabled
 }: {
   message: AppState["messages"][number];
+  turnNumber?: number;
   assets: ImageAsset[];
   jobs: ImageGenerationJob[];
   relatedJobs: ImageGenerationJob[];
@@ -8151,7 +8446,16 @@ function CrackTimelineMessage({
   );
 
   return (
-    <article className="crack-narration-block">
+    /* A stable id per turn: the anchor a reader (or a future find-in-transcript) needs to return to a beat. */
+    <article className="crack-narration-block" id={`turn-${message.id}`}>
+      {turnNumber !== undefined ? (
+        <div className="crack-turn-marker">
+          <span>{turnNumber}턴</span>
+          <time dateTime={message.createdAt}>
+            {new Date(message.createdAt).toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+          </time>
+        </div>
+      ) : null}
       <NarrationMediaContext.Provider value={narrationMedia}>
         {narration.items.map((item) =>
           item.kind === "markdown" ? (
@@ -8269,7 +8573,6 @@ const CrackInlineImageJob = memo(function CrackInlineImageJob({
   onRegenerate: (job: ImageGenerationJob) => void;
   onRun: (job: ImageGenerationJob) => void;
 }) {
-  const requiresConfirmation = Boolean(job.providerPayload.requiresConfirmation);
   const canCancel = ["queued", "planning", "generating"].includes(job.status);
   const canRegenerate = ["queued", "failed", "canceled", "completed"].includes(job.status);
   const statusLabel =
@@ -8292,7 +8595,7 @@ const CrackInlineImageJob = memo(function CrackInlineImageJob({
         <p>{job.reason}</p>
       </div>
       <div className="crack-inline-image-job-actions">
-        {requiresConfirmation && job.status === "queued" ? (
+        {canUserRunQueuedImageJob(job) ? (
           <button type="button" onClick={() => onRun(job)}>
             생성
           </button>
@@ -8596,21 +8899,17 @@ function HomePage({
           </span>
           <strong>DynamicChat</strong>
         </div>
-        <button className="discover-nav-item active" type="button">
-          <Home size={17} />
-          내 시뮬레이션
-        </button>
-        <button className="discover-nav-item" type="button">
+        {/* Four buttons used to sit here — 내 시뮬레이션 / 제작 도구 / 장면 로그 / Prompt Tree — none with an
+            onClick and the first with a hardcoded "active". The first screen taught the user that clicking
+            things in this app does nothing. The two with a real destination are wired; the two that only
+            named the page you were already on, or a concept with no screen behind it, are gone. */}
+        <button className="discover-nav-item" type="button" onClick={() => onEdit(activeState.simulation.id)}>
           <WandSparkles size={17} />
           제작 도구
         </button>
-        <button className="discover-nav-item" type="button">
+        <button className="discover-nav-item" type="button" onClick={() => onOpen(activeState.simulation.id)}>
           <MessageSquareText size={17} />
           장면 로그
-        </button>
-        <button className="discover-nav-item" type="button">
-          <Layers size={17} />
-          Prompt Tree
         </button>
         <div className="discover-nav-card">
           <strong>시뮬레이션 {simulations.length}개</strong>
@@ -8813,7 +9112,11 @@ function ModelQuickSwitch({
   return (
     <div className="quick-model-control">
       <span>모델</span>
+      {/* The 모델 caption is a bare <span>, so it names neither control here. The sibling input already
+          carried its own aria-label; this one is deliberately worded differently so the two are not
+          announced identically. */}
       <select
+        aria-label="실행 중 LLM 모델 프리셋"
         value={knownModel}
         onChange={(event) => {
           if (event.target.value === "custom") {
@@ -10023,15 +10326,20 @@ function CreateSimulationPage({
       </div>
 
       <div className="builder-tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="시뮬레이션 제작 단계">
-        <BuilderTabButton active={activeTab === "overview"} icon={<Boxes size={18} />} label="기본" metric="개요" onClick={() => setActiveTab("overview")} />
-        <BuilderTabButton active={activeTab === "prompts"} icon={<Layers size={18} />} label="프롬프트 트리" metric={`${draft.modules.length}개`} onClick={() => setActiveTab("prompts")} />
-        <BuilderTabButton active={activeTab === "characters"} icon={<ImageIcon size={18} />} label="캐릭터/이미지" metric={draft.imageProfile.triggerMode} onClick={() => setActiveTab("characters")} />
-        <BuilderTabButton active={activeTab === "status"} icon={<Network size={18} />} label="관계/상태" metric={draft.relationshipMap.enabled ? "저장" : "꺼짐"} onClick={() => setActiveTab("status")} />
-        <BuilderTabButton active={activeTab === "api"} icon={<Settings2 size={18} />} label="이미지/연동" metric={draft.novelAi.enabled ? draft.novelAi.modelPreset : "mock"} onClick={() => setActiveTab("api")} />
-        <BuilderTabButton active={activeTab === "review"} icon={<Check size={18} />} label="검토" metric="생성" onClick={() => setActiveTab("review")} />
+        <BuilderTabButton active={activeTab === "overview"} icon={<Boxes size={18} />} label="기본" metric="개요" onClick={() => setActiveTab("overview")} panelKey="overview" />
+        <BuilderTabButton active={activeTab === "prompts"} icon={<Layers size={18} />} label="프롬프트 트리" metric={`${draft.modules.length}개`} onClick={() => setActiveTab("prompts")} panelKey="prompts" />
+        <BuilderTabButton active={activeTab === "characters"} icon={<ImageIcon size={18} />} label="캐릭터/이미지" metric={draft.imageProfile.triggerMode} onClick={() => setActiveTab("characters")} panelKey="characters" />
+        <BuilderTabButton active={activeTab === "status"} icon={<Network size={18} />} label="관계/상태" metric={draft.relationshipMap.enabled ? "저장" : "꺼짐"} onClick={() => setActiveTab("status")} panelKey="status" />
+        <BuilderTabButton active={activeTab === "api"} icon={<Settings2 size={18} />} label="이미지/연동" metric={draft.novelAi.enabled ? draft.novelAi.modelPreset : "mock"} onClick={() => setActiveTab("api")} panelKey="api" />
+        <BuilderTabButton active={activeTab === "review"} icon={<Check size={18} />} label="검토" metric="생성" onClick={() => setActiveTab("review")} panelKey="review" />
       </div>
 
-      <div className="builder-body">
+      <div
+        className="builder-body"
+        role="tabpanel"
+        id={`tabpanel-builder-${activeTab}`}
+        aria-labelledby={`tab-builder-${activeTab}`}
+      >
         {activeTab === "overview" ? (
           <div className="builder-grid">
             <section className="builder-panel span-2">
@@ -10865,19 +11173,24 @@ function BuilderTabButton({
   icon,
   label,
   metric,
-  onClick
+  onClick,
+  panelKey
 }: {
   active: boolean;
   icon: React.ReactNode;
   label: string;
   metric: string;
   onClick: () => void;
+  panelKey: string;
 }) {
   return (
     <button
       className={`builder-tab ${active ? "active" : ""}`}
       type="button"
       role="tab"
+      // Only `.builder-body` for the selected step exists, so only the selected tab can name a panel.
+      id={`tab-builder-${panelKey}`}
+      aria-controls={active ? `tabpanel-builder-${panelKey}` : undefined}
       aria-selected={active}
       tabIndex={active ? 0 : -1}
       onClick={onClick}
@@ -11452,7 +11765,7 @@ function ImagePanel({
               <strong>{getImageJobStatusLabel(inspectedJob.status)}</strong>
             </div>
             <div className="job-actions">
-              {inspectedJob.providerPayload.requiresConfirmation && inspectedJob.status === "queued" ? (
+              {canUserRunQueuedImageJob(inspectedJob) ? (
                 <button className="icon-button" type="button" onClick={() => onRunJob(inspectedJob)} aria-label="이미지 작업 실행">
                   <Play size={15} />
                 </button>
@@ -11564,7 +11877,7 @@ function ImagePanel({
             </button>
             <div className="job-actions">
               <strong>{getImageJobStatusLabel(job.status)}</strong>
-              {job.providerPayload.requiresConfirmation && job.status === "queued" ? (
+              {canUserRunQueuedImageJob(job) ? (
                 <button className="icon-button" type="button" onClick={() => onRunJob(job)} aria-label="이미지 작업 실행">
                   <Play size={15} />
                 </button>
@@ -14202,9 +14515,18 @@ function PersonalSettingsDialog({
     }
   };
 
+  const dialogRef = useModalDialog(true, onClose);
+
   return (
     <div className="personal-settings-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="personal-settings-dialog" role="dialog" aria-modal="true" aria-label="개인 API 설정" onMouseDown={(event) => event.stopPropagation()}>
+      <section
+        className="personal-settings-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="개인 API 설정"
+        ref={dialogRef}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <header className="personal-settings-header">
           <div>
             <span className="section-kicker">개인 설정</span>
@@ -15888,12 +16210,31 @@ function Capability({ label, value }: { label: string; value: string }) {
 // aria-selected, and every tab in the natural tab order, so reaching the seventh ops panel took seven Tab
 // presses. Roving tabIndex plus the arrow-key handler on the list makes one Tab reach the group and the
 // arrows move within it, which is what a tablist promises.
-function TabButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactNode; label: string; onClick: () => void }) {
+// `panelKey` is what ties a tab to the region it drives: `id` lets the panel name itself with
+// aria-labelledby, and aria-controls points the other way. Only the SELECTED tab gets aria-controls,
+// because these rails render one panel at a time — the unselected panels are not in the DOM, so
+// pointing at their ids would hand a screen reader references that resolve to nothing. Optional
+// because one caller (SimulationRunPage) has no single element to mark as the panel.
+function TabButton({
+  active,
+  icon,
+  label,
+  onClick,
+  panelKey
+}: {
+  active: boolean;
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  panelKey?: string;
+}) {
   return (
     <button
       className={`tab-button ${active ? "active" : ""}`}
       type="button"
       role="tab"
+      id={panelKey ? `tab-${panelKey}` : undefined}
+      aria-controls={active && panelKey ? `tabpanel-${panelKey}` : undefined}
       aria-selected={active}
       tabIndex={active ? 0 : -1}
       onClick={onClick}

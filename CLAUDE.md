@@ -87,7 +87,8 @@ DynamicChat Web (React/Vite)
 - **서비스**: `src/services/` — 각 파일이 단일 관심사를 담당.
 - **서버 라우트**: `server/dynamicchat-server.mjs` — 라우트를 추가할 때 `matchRoute()` 배열에 등록.
 - **ID 생성**: `createId()` (`src/lib/id.ts`) 사용. `crypto.randomUUID()` 직접 호출 금지.
-- **환경 변수**: `DYNAMICCHAT_API_PORT`, `DYNAMICCHAT_DATA_DIR`, `DYNAMICCHAT_CORS_ORIGIN`, `DYNAMICCHAT_RATE_LIMIT_WINDOW_MS`, `DYNAMICCHAT_RATE_LIMIT_MAX`
+- **환경 변수**: `DYNAMICCHAT_API_PORT`, `DYNAMICCHAT_DATA_DIR`, `DYNAMICCHAT_CORS_ORIGIN`, `DYNAMICCHAT_RATE_LIMIT_WINDOW_MS`, `DYNAMICCHAT_RATE_LIMIT_MAX`, `DYNAMICCHAT_MAX_BODY_BYTES`
+  (요청 본문 상한, 기본 64MiB — 이미지 data URL 이 이 경로로 들어오므로 넉넉하게 잡혀 있다. 초과하면 413)
 - **LLM 백엔드**: 프로바이더 프리셋은 `src/services/llmProviders.ts` 한 곳에 있다. UI 메타데이터
   (라벨/base URL/모델 목록)와 런타임 능력(전송 형식, JSON 모드, temperature 상한, 추가 헤더/바디,
   프록시 필요 여부)을 같이 들고 있으므로 백엔드 추가는 배열 항목 하나면 된다.
@@ -103,9 +104,37 @@ DynamicChat Web (React/Vite)
 pnpm eval:simulation      # 시뮬레이션 품질 평가
 pnpm eval:image-prompts   # 이미지 프롬프트 품질 평가 (프레임 일관성 포함)
 pnpm eval:simulation-runs # 시뮬레이션 실행 품질 평가
+pnpm eval:theme-contrast  # 야간 테마 대비 회귀 검사 (스타일시트 정적 검사, 키/모델 불필요)
 pnpm eval:oss-models      # 오픈 모델 연동 검증 (키 불필요, 모의 업스트림)
 pnpm eval:quality         # 전체 평가
 ```
+
+### 전체 사슬 검증 (end-to-end)
+
+위 평가들은 각각 한 구간만 본다. 부품이 전부 통과하면서 이음매가 깨져 있을 수 있고, 실제로 결함은
+대부분 거기서 나왔다. `server/end-to-end-run-eval.mjs` 는 로컬 모델로 **진짜 턴**을 돌려 한 컷을
+끝까지 따라간다:
+
+```
+사용자 입력 → 서사 패스 → 주석 패스 → image cue → 작업 계획 → 큐 → NovelAI HTTP
+```
+
+```powershell
+$env:OSS_EVAL_MODEL="qwen3:14b"
+node server/end-to-end-run-eval.mjs
+```
+
+마지막 구간은 **인증 실패로 끝나는 것이 정상이다.** NovelAI 토큰이 없으면 거기까지가 사슬의 끝이고,
+novelai.net 이 돌려주는 401 이야말로 요청이 실제로 조립되어 나갔다는 증거다. `mock` 과 `disabled` 는
+같은 함수에서 빈 결과를 돌려주므로 "이미지가 없다" 만으로는 아무것도 증명하지 못한다.
+
+cadence 별 수량도 여기서 잰다 — `image_progression` 은 정확히 10, `rich` 는 2 이상, `balanced` 는 1.
+생성 cue 는 전부 신규 작업이나 재사용 자산 중 하나로 이어져야 하며, 어느 쪽도 아닌 cue 는 턴이
+약속하고 내놓지 않은 이미지다.
+
+frame 선언율만 합격/불합격이 아니라 **비율**로 본다(기본 하한 80%). 프레임은 모델이 쓰는 것이라
+편차가 있고, qwen3:14b 는 image_progression 에서 80% 근처가 실측값이다. 프레임이 없는 컷은 구도
+태그는 여전히 프롬프트에 들어가지만 부위 게이팅이 생략된다.
 
 ### 오픈 모델 검증
 
@@ -290,9 +319,93 @@ paragraph cadence, adult_19 이다.
 이제 응답 예산을 깎기 전에 전사를 먼저 줄인다. 최신 assistant 종료부는 이번 턴의 인수인계 지점이라
 축소 대상에서 제외한다.
 
+## 디자인 토큰과 테마
+
+색은 전부 `src/styles.css` 최상단 `:root` 의 토큰에서 나오고, 야간 테마는
+`src/narrative-output.css` 끝의 `:root[data-reader-theme="night"]` 가 **같은 이름을 다시 정의**해서
+만든다. narrative-output.css 는 styles.css 뒤에 import 되므로 소스 순서로 이긴다.
+
+**규칙 하나가 전부다: 채워진 표면은 쌍이다** — 바탕과 그 위의 잉크. 둘이 같이 뒤집히거나 둘 다 안
+뒤집히거나다. 한쪽만 토큰이고 다른 쪽이 리터럴이면 야간에 쌍이 어긋나 밝은 바탕에 밝은 글씨, 또는
+어두운 바탕에 어두운 글씨가 된다. 어두운 버튼에 흰 글씨가 리터럴로 박혀 있는 건 **정상이다** — 그
+버튼은 양쪽 테마에서 어둡다.
+
+**라이트 테마는 움직이지 않는다.** 리터럴을 토큰으로 바꿀 때 그 토큰의 라이트 값이 리터럴과
+같아야 한다. 같은 값의 토큰이 없으면 근처 토큰으로 반올림하지 말고 **라이트 값을 그대로 가진 토큰을
+새로 만들어라**. 단발성 한 곳이면 토큰을 만드는 대신 야간 스코프 오버라이드 한 줄이 낫다 —
+`.crack-system-note`, `.crack-setup-notice button`, `.library-hero-copy p` 가 그 예다.
+
+토큰 이름은 값이 아니라 **역할**이다. `--dc-panel` 은 카드, `--dc-paper` 는 페이지 바닥,
+`--surface-2` 는 가라앉은 면, `--dc-line` 은 선. `--paper` 를 카드에 쓰면 라이트에서는 맞아 보여도
+야간에 그 토큰이 가장 어두운 면이라 카드가 페이지 아래로 가라앉는다. 실제로 그렇게 틀렸었다.
+
+야간 값이 필요 없는 토큰도 있다. 액센트 6개만 야간 값을 갖는데, 나머지(민트·골드·코럴 등)는
+야간 바닥에서 이미 4.5:1 을 넘기기 때문이다. 안 움직인 토큰을 굳이 다시 적으면 하지도 않은 결정을
+한 것처럼 읽힌다.
+
+### 야간 테마는 실행 화면에만 걸린다
+
+`data-reader-theme` 를 `document.documentElement` 에 다는 effect 는 **실행 워크스페이스 안에** 있고
+언마운트할 때 속성을 지운다(App.tsx). 즉 야간은 "앱 테마" 가 아니라 **읽기 테마**이고, 라이브러리와
+제작 화면은 항상 라이트다. 의도된 동작이다 — 실행에서 나오면 크롬이 다시 밝아진다.
+
+그래서 야간을 검증할 때는 **실행을 열고 나서** 재야 한다. 라이브러리에서 속성을 손으로 붙여놓고 재면
+실제로 존재하지 않는 상태를 재는 것이고, 거기서 나온 "실패" 는 고칠 대상이 아니다.
+
+### 브라우저로 잴 때 걸리는 함정 네 가지
+
+전부 실제로 겪었고, 전부 **없는 버그를 있다고 보고하거나 있는 버그를 놓치게** 만든다.
+
+1. **트랜지션이 안 끝난다.** 브라우저 패널이 숨겨져 있으면 rAF 가 멈추고 150ms 색 트랜지션이
+   영원히 진행 중으로 남는다. `getComputedStyle` 은 **시작 값**(=라이트 값)을 돌려준다. 재기 전에
+   `* { transition: none !important }` 를 넣어 얼려라. `document.hidden` 으로 확인할 수 있다.
+2. **그라디언트는 위치가 있다.** `.library-page` 는 왼쪽 236px 만 어둡게 칠하는 90deg 그라디언트를
+   쓴다. 색 정지점만 모아서 "제일 어두운 것" 을 배경으로 잡으면 x=288 에 있는 제목이 1.0:1 로
+   나온다. 요소 중심이 그라디언트 축의 어디인지 계산해서 그 지점의 색을 써야 한다.
+3. **요소 자신의 background-image 를 빼먹지 마라.** `.send-button` 은 불투명한 어두운 그라디언트
+   아래에 `var(--dc-ink)` 를 깔아둔다. 부모부터 훑고 요소의 background-**color** 만 합치면 야간에
+   흰 글씨가 밝은 바닥에 있는 것처럼 보인다. 실제로는 그라디언트가 다 덮는다.
+4. **`el.focus()` 로는 `:focus-visible` 이 안 걸린다.** 포커스 링을 재려면 진짜 Tab 키를 보내야 한다.
+
+3번이 알려주는 진짜 규칙도 있다: **잉크 토큰을 바닥에 쓰지 마라.** `--dc-ink`/`--ink` 는 야간에
+밝아지므로 흰 글씨를 얹은 표면에 쓰면 뒤집힌다. 양쪽 테마에서 어두운 표면은 `--night` 이고,
+라이트 값이 `--dc-ink` 와 같으므로 바꿔도 라이트는 안 움직인다.
+
+### 세피아 테마
+
+세피아 테마는 **읽기 열(reading column)만 리페인트하고 크롬은 건드리지 않는다.** 의도적이다.
+`narrative-output.css` 의 `.crack-story-stage[data-reader-theme="sepia"]` 블록이
+`--rich-*` 토큰 9개만 재정의한다(잉크·규선·배경·강조·인용). 야간 테마와 달리 `:root` 블록이
+없으므로 탑바·사이드바·인스펙터·대화상자는 전부 라이트 모드를 유지한다.
+
+세피아에서 영향받는 요소: `.rich-heading`, `.rich-strong`, `.rich-quote`, `.rich-list-item::marker`,
+`.rich-table`, `.rich-code`, `.rich-divider`, `.rich-link`, `.crack-setup-notice button`.
+영향받지 않는 요소: 본문 산문 `.crack-markdown`, 대화 강조 `--reader-speech`, 컴포저.
+
+### 왜 이 규칙이 생겼는가
+
+styles.css 는 스킨을 여러 번 덧칠하면서 이전 스킨을 지우지 않았다. 같은 셀렉터에 같은 속성을
+6번까지 다시 선언한 블록이 있었고, **228개 블록 / 1,276줄이 어떤 화면에서도 절대 렌더되지 않는
+죽은 코드**였다. 지울 때는 눈으로 고르지 말고 증명해라: 같은 셀렉터 텍스트의 뒤쪽 블록이 그 블록의
+**모든 속성을 이름 그대로** 다시 선언하면, 그 블록은 어떤 요소에서도 마지막 선언이 될 수 없으므로
+삭제해도 계산값이 바뀌지 않는다. 속성 이름을 그대로 비교하는 게 핵심이다 — `background` 가
+뒤에서 `background-color` 로만 덮였다면 죽은 게 아니다.
+
+검증도 화면 하나를 보고 판단하지 마라. 클릭 세 번 들어가야 나오는 화면이 훨씬 많다. 스타일시트를
+파싱해서 (셀렉터, 속성) 별 최종 값을 라이트 토큰으로 해석한 뒤 변경 전후를 비교하면 모든 화면을
+한 번에 덮는다. 브라우저 대비 측정은 그 위에 얹는 확인이지 근거가 아니다 —
+`getComputedStyle` 은 150ms 색 트랜지션 도중과 화면 밖 요소에서 옛 값을 돌려준다(둘 다 실제로
+겪었다).
+
 ## 이미지 생성 정책
 
 - 이미지 프롬프트는 8개 레이어를 순서대로 합친다: 품질 → 화풍 → 작가 → 캐릭터 visual profile → 장면/배경 → 감정/의상 → 사용자 규정 → negative
+- **한 턴에 몇 장이 나오는지는 cadence 가 정한다** — cue 하나당 작업 하나, 작업 하나당 이미지 한 장.
+  `ImageGenerationProfile.countMin` / `countMax` 는 타입과 시드에 값이 있지만(여성의 삶 시드는 4/4)
+  **런타임에서 아무도 읽지 않는다.** `planImageJob` 의 `options.count` 를 넘기는 프로덕션 호출부가
+  없어서 항상 1이다. 여러 장 machinery(`createImagePromptVariants`, `executeImageJob` 의 순차 슬롯
+  루프)는 완성되어 있고 `eval:image-prompts` 가 `{ count: 3 }` 으로 검증하지만, 실제로는 그 경로에
+  1 말고는 들어가지 않는다. 배선하면 컷당 호출 수가 그만큼 곱해지므로 비용 결정이 먼저다.
 - 각 캐릭터는 독립된 `char_caption`을 가진다 (NAI multi-char prompting).
 - 외형/의상 정보는 LLM이 추론하지 않고 저장된 `CharacterVisualProfile` + 현재 `Wearing` 상태에서 직접 주입한다.
 

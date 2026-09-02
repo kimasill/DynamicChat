@@ -24,6 +24,10 @@
   --rich-fill: rgb(17 22 26 / 4%);
   --rich-accent: #1f6f66;
   --rich-quote-bar: rgb(31 111 102 / 45%);
+
+  /* The reply body's own paper: the surface a control inside the story stage sits on. Only a
+     var() fallback existed, so the setup notice's button stayed near-white on every theme. */
+  --rich-paper: #fffefa;
 }
 
 .crack-story-stage[data-reader-theme="sepia"] {
@@ -35,6 +39,7 @@
   --rich-fill: rgb(120 88 40 / 7%);
   --rich-accent: #8a5a23;
   --rich-quote-bar: rgb(138 90 35 / 45%);
+  --rich-paper: #fdf6e8;
 }
 
 .crack-story-stage[data-reader-theme="night"] {
@@ -46,6 +51,7 @@
   --rich-fill: rgb(210 228 240 / 6%);
   --rich-accent: #7fd3c4;
   --rich-quote-bar: rgb(127 211 196 / 45%);
+  --rich-paper: #1f252b;
 }
 
 /* --- Prose rhythm -------------------------------------------------------------------------- */
@@ -73,7 +79,7 @@
   color: var(--rich-ink-strong);
   line-height: 1.25;
   letter-spacing: -0.01em;
-  font-weight: 760;
+  font-weight: 800;
 }
 
 .crack-story-stage .rich-heading:first-child {
@@ -130,6 +136,62 @@
 
 .crack-story-stage .rich-list-item::marker {
   color: var(--rich-ink-soft);
+}
+
+/* --- Status panel -------------------------------------------------------------------------- */
+/*
+ * A list whose every row is "**label**: value" is a status panel, not narration — creators ask for one at
+ * the end of every turn. Rendered inline it was typographically identical to the prose above it, so the
+ * reader had to parse which was which. It becomes a quiet card with an aligned label column: still the
+ * creator's own content and wording, just no longer masquerading as story.
+ *
+ * All tokens are reader-theme aware, so day / sepia / night each get the right fill and rule.
+ */
+.crack-story-stage .rich-list.rich-stat-block {
+  display: grid;
+  gap: 0.15em 0.9em;
+  margin: 0.9em 0;
+  padding: 0.75em 0.95em;
+  border: 1px solid var(--rich-rule);
+  border-radius: 10px;
+  background: var(--rich-fill);
+  list-style: none;
+  font-size: 0.94em;
+}
+
+.crack-story-stage .rich-list.rich-stat-block .rich-list-item {
+  display: grid;
+  /* The label column sizes to the longest label but never eats the value's room. */
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  gap: 0.15em 0.7em;
+  margin: 0;
+  padding: 0.18em 0;
+  border-bottom: 1px solid var(--rich-rule);
+}
+
+.crack-story-stage .rich-list.rich-stat-block .rich-list-item:last-child {
+  border-bottom: 0;
+}
+
+.crack-story-stage .rich-list.rich-stat-block .rich-list-item::marker {
+  content: "";
+}
+
+.crack-story-stage .rich-list.rich-stat-block .rich-strong {
+  color: var(--rich-ink-soft);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Narrow readers cannot afford a label column; stack instead of truncating the value. */
+@media (max-width: 640px) {
+  .crack-story-stage .rich-list.rich-stat-block .rich-list-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .crack-story-stage .rich-list.rich-stat-block .rich-strong {
+    white-space: normal;
+  }
 }
 
 /* --- Divider ------------------------------------------------------------------------------- */
@@ -214,7 +276,7 @@
   border-bottom: 2px solid var(--rich-rule-strong);
   background: none;
   font-size: 0.92em;
-  font-weight: 650;
+  font-weight: 700;
   letter-spacing: 0.02em;
 }
 
@@ -338,6 +400,20 @@
   border-color: rgb(163 52 31 / 45%);
   color: #7d2415;
   background: rgb(163 52 31 / 8%);
+}
+
+/* The destructive pair above is two literals chosen against a white panel, and neither is tokenised, so
+   night left them at 2.3:1 on #1c2127 — and the hover state was darker still. Warning colour has to stay
+   warning colour, so these are night-scoped lifts of the same copper-red hue rather than a repaint through
+   an accent token. The light and sepia themes keep the declarations above untouched. */
+:root[data-reader-theme="night"] :is(.danger-action, .danger-zone strong) {
+  color: #ff9c88;
+}
+
+:root[data-reader-theme="night"] .danger-action:hover {
+  border-color: rgb(255 156 136 / 45%);
+  color: #ffc4b6;
+  background: rgb(255 156 136 / 10%);
 }
 
 .danger-zone {
@@ -513,11 +589,89 @@
   --night: #0d1014;
 
   --dc-paper: #171b20;
-  --dc-surface: #1c2127;
   --dc-ink: #dfe6ea;
+  --dc-ink-2: #c3ced5;
   --dc-muted: #97a4ad;
   --dc-muted-2: #7d8a93;
   --dc-line: rgb(210 228 240 / 14%);
+
+  /* The rails paint from these, and they were missing here — which is why night mode repainted the
+     transcript and left roughly half the screen bright white. Every surface token the chrome consumes now
+     has a night value, so the ~150 literals that were routed through them follow automatically. */
+  --dc-panel: #1c2127;
+  --dc-panel-2: #232931;
+  --surface-3: #232931;
+  --ink-soft: #c3ced5;
+  --muted-2: #7d8a93;
+  --line-strong: rgb(210 228 240 / 26%);
+  --dc-line-strong: rgb(210 228 240 / 26%);
+  --crack-panel: #1c2127;
+  --crack-soft: #232931;
+  --crack-ink: #f2f6f8;
+  --crack-text: #dfe6ea;
+  --crack-muted: #97a4ad;
+  --crack-line: rgb(210 228 240 / 14%);
+  --crack-line-strong: rgb(210 228 240 / 26%);
+
+  /* Accents. Every accent in the palette was chosen to sit on white, so on the night ground each one
+     measures between 2.8:1 and 4.1:1 — readable enough to look deliberate and too weak to actually read.
+     These six are lightened along their own hue in OKLCH until they clear 4.5:1 against --dc-paper
+     (#171b20), which is what a dark theme does to an accent anyway; the hue is preserved so it is the
+     same green rather than the washed-out grey that blending toward white in sRGB produces.
+
+     Only six entries because the rest of the family does not need one. --teal/--dc-mint (7.8:1),
+     --amber/--dc-gold (7.6:1), --coral and --crack-accent (5.0:1), --crack-gold (8.8:1) and
+     --crack-green (5.1:1) already clear the bar unchanged, and --accent, --blue and --violet are
+     aliases of --dc-copper, --dc-blue and --dc-plum, so they follow their base. Restating a token that
+     did not move would read as a decision that was never made. */
+  --dc-copper: #cd634b;
+  --dc-blue: #5889a8;
+  --dc-plum: #907b9c;
+  --teal-dark: #4a8f7d;
+  --green: #4e8e7c;
+  --crack-blue: #5687b0;
+
+  /* Night halves of the tokens minted at the end of the :root block in styles.css. Each one existed
+     there as a literal painted on a surface that flips here, so the pair came apart; giving the token a
+     value on this side is what closes it.
+
+     Ratios below are measured against #1c2127 — --dc-panel / --crack-panel / --surface-2, which is the
+     lighter of the two night grounds and therefore the worse case for light ink. On --dc-paper
+     (#171b20) every one of them measures higher. Inks that carry body text clear 4.5:1; the glyph on a
+     chip is non-text UI and is held to 3:1.
+
+     The two ramps stay warm and cool respectively, as they are in light — lifting them to a common grey
+     would have merged two ramps the light theme deliberately keeps apart. */
+  --ink-strong: #ece9e4; /* 13.4:1 */
+  --ink-status: #e2ded7; /* 12.1:1 */
+  --ink-control: #cdc8bf; /* 9.7:1 */
+  --ink-label: #a8a29a; /* 6.4:1 */
+  --copy-ink: #c8d2d8; /* 10.5:1 */
+  --copy-muted: #a2b0b8; /* 7.3:1 */
+
+  /* Fills: hue held, lightness taken down, the way the surface tokens above do it. A chip reads as a
+     chip because it is a tint of its ground, not because it is high contrast — so the number that has
+     to hold is the glyph on the chip, not the chip on the panel. --chip-mint carries --teal-dark
+     (#4a8f7d here) at 3.20:1; --chip-warm carries --ink-soft (#c3ced5) at 8.66:1. Against the panel
+     the chips themselves sit at 1.33:1 and 1.17:1, against 1.12:1 and 1.15:1 in light — the same
+     barely-there lift, which is what they are supposed to be. */
+  --chip-mint: #1b3b34;
+  --chip-warm: #302c26;
+
+  /* One value for both washes. They are 1.16 dE apart in light and there is no reason to carry that
+     distinction into a hover state here; --ink-soft reads 8.2:1 on it and --ink-control 7.9:1. */
+  --wash-amber: #3a2f16;
+  --wash-amber-2: #3a2f16;
+
+  /* #b66a1a is 3.9:1 on the night panel — the same near-miss the accents above had. Lightened along
+     its own hue to 6.7:1, which also carries the 3px category rules it draws. */
+  --amber-ink: #e0973f;
+
+  /* The graph-paper lattice is a pair of dark 4% lines. Every surface it rides on flipped to near-black
+     here, so the ruling vanished into it; the same lines drawn light keep the grid readable on the dark
+     canvases without becoming a second visual layer. */
+  --dc-grid: linear-gradient(90deg, rgb(210 228 240 / 6%) 1px, transparent 1px),
+    linear-gradient(180deg, rgb(210 228 240 / 6%) 1px, transparent 1px);
 }
 
 :root[data-reader-theme="night"] body {
@@ -541,6 +695,27 @@
   color: var(--dc-muted-2);
 }
 
+/* The system note carries its own amber pair — a 12% tint with dark-brown ink — and neither half is
+   tokenised, so night left dark brown on a dark tint at 1.86:1. Only the ink needs to move: the tint is
+   translucent and already composites correctly over the night stage. Routing this through --dc-gold was
+   rejected because #d9a340 measures ~2.0:1 on the pale amber tint in LIGHT, trading one failure for
+   another; a night-scoped literal leaves the light theme exactly as it was. */
+:root[data-reader-theme="night"] .crack-system-note {
+  color: #e7c07a;
+}
+
+/* The map canvas gradient runs var(--surface) -> #edf7f4 -> var(--dc-paper): both ends follow the theme,
+   the 48% stop does not, so night drove a near-white band through the middle of the map and put the
+   empty-state label at 2.33:1 on it. The literal cannot simply become var(--surface-2): that token is
+   #f6f8f8 in light, a cooler and less minty wash than #edf7f4, which would have repainted the light theme.
+   So the whole stack is restated night-only. background-IMAGE, not the shorthand — the shorthand resets
+   background-size, and styles.css sets 24px 24px there for the lattice tiles. */
+:root[data-reader-theme="night"] .neural-map-canvas {
+  background-image:
+    var(--dc-grid),
+    linear-gradient(135deg, var(--surface) 0, var(--surface-2) 48%, var(--dc-paper) 100%);
+}
+
 /* --- Provider hint --------------------------------------------------------------------------- */
 
 /* One line explaining what each backend is good for, next to the select. The open-model tier is the whole
@@ -552,4 +727,179 @@
   font-size: 11.5px;
   line-height: 1.5;
   word-break: keep-all;
+}
+
+/* --- Setup notice --------------------------------------------------------------------------- */
+/*
+ * Sits directly above the composer and states what the app cannot currently do. It is the one piece of
+ * chrome allowed to interrupt the reading column, because the alternative — the previous behaviour — was a
+ * toast that vanished before the user could read it while placeholder prose accumulated behind it.
+ */
+.crack-setup-notice {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 10px;
+  padding: 11px 14px;
+  border: 1px solid rgb(198 91 67 / 32%);
+  border-radius: 10px;
+  background: rgb(198 91 67 / 7%);
+  color: var(--rich-ink, #202724);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.crack-setup-notice p {
+  margin: 0;
+}
+
+.crack-setup-notice p + p {
+  margin-top: 5px;
+}
+
+.crack-setup-notice strong {
+  font-weight: 700;
+}
+
+.crack-setup-notice button {
+  flex: 0 0 auto;
+  padding: 7px 13px;
+  border: 1px solid rgb(198 91 67 / 42%);
+  border-radius: 8px;
+  background: var(--rich-paper, #fffefa);
+  color: #a2422c;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Giving --rich-paper a real night value fixed the button's surface and stranded its ink: the copper
+   label stayed at the light-mode literal and fell from 6.2:1 to 2.5:1 on the new #1f252b fill. Lifting
+   only the ink keeps the copper/warning hue the notice's border speaks in — --rich-accent would have
+   read 8.9:1 but repainted the button teal. */
+.crack-story-stage[data-reader-theme="night"] .crack-setup-notice button {
+  border-color: rgb(255 159 128 / 45%);
+  color: #ff9f80;
+}
+
+.crack-setup-notice button:hover {
+  background: rgb(198 91 67 / 12%);
+}
+
+/* --- Failed image marker -------------------------------------------------------------------- */
+/*
+ * The marker sits inline where the picture would have been. On failure it now carries the reason the
+ * pipeline already recorded, so the answer to "why is there no image" is in the place the user is looking
+ * rather than in a toast that has already gone.
+ */
+.crack-marker-job {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: baseline;
+}
+
+.crack-marker-job.failed {
+  color: #a2422c;
+}
+
+.crack-marker-job em {
+  flex: 1 1 100%;
+  color: var(--rich-ink-soft);
+  font-size: 0.92em;
+  font-style: normal;
+  line-height: 1.5;
+}
+
+/* --- Night: filled and selected controls ------------------------------------------------------ */
+/*
+ * A filled control is a PAIR — its surface and the text on that surface — and the pair has to flip
+ * together. Routing the chrome's white backgrounds through tokens made night mode reach the rails, but any
+ * control whose background followed the theme while its text colour stayed a light-mode literal (or the
+ * reverse) ended up light-on-light or dark-on-dark. Measured worst case was a selected reader-theme chip at
+ * 1.06:1 — invisible. These rules restate both halves so the pair cannot drift apart.
+ */
+:root[data-reader-theme="night"] :is(.icon-text-button, .nav-button, .crack-round-tool, .crack-recommend-button, .crack-auto-progress-control) {
+  border-color: var(--line);
+  color: var(--ink);
+  background: var(--surface-2);
+}
+
+:root[data-reader-theme="night"] :is(button, [role="tab"]).active,
+:root[data-reader-theme="night"] [role="tab"][aria-selected="true"] {
+  border-color: transparent;
+  color: #10151a;
+  background: var(--ink);
+}
+
+/* The inner label elements carry their own colour from styles.css, so :is() lost the specificity race and
+   a selected chip kept light text on its now-light surface. Spelled out so it wins. */
+:root[data-reader-theme="night"] button.active strong,
+:root[data-reader-theme="night"] button.active span,
+:root[data-reader-theme="night"] button.active small,
+:root[data-reader-theme="night"] button.active em,
+:root[data-reader-theme="night"] [role="tab"][aria-selected="true"] strong,
+:root[data-reader-theme="night"] [role="tab"][aria-selected="true"] span,
+:root[data-reader-theme="night"] [role="tab"][aria-selected="true"] small {
+  color: inherit;
+}
+
+/* --- Night: the last three light-only inks ------------------------------------------------------ */
+/*
+ * Three single-use literals that the token pass deliberately did not route, because no token carries their
+ * exact light value and rounding them onto a near neighbour would have changed the light theme. They are
+ * one-offs, so minting three tokens for them would grow the palette to fix three declarations — the
+ * opposite of what the pass was for. A night-scoped override is the cheaper trade: light keeps its literal
+ * byte-for-byte, night borrows a token that already has the right meaning and a night value.
+ *
+ * Measured on the surfaces these actually sit on, before and after:
+ *   .library-hero-copy p   #41504d on --dc-paper #171b20   2.04:1  ->  --dc-muted  6.78:1
+ *   .status-pill.good      #226f5e on the pill's own 12% mint tint over --dc-panel (rgb(36,52,54))
+ *                                                          2.16:1  ->  --dc-mint   5.85:1
+ *   .capability-row strong #2d7a66 on --dc-panel #1c2127   3.15:1  ->  --dc-mint   7.31:1
+ */
+:root[data-reader-theme="night"] .library-hero-copy p {
+  color: var(--dc-muted);
+}
+
+:root[data-reader-theme="night"] .status-pill.good {
+  color: var(--dc-mint);
+}
+
+:root[data-reader-theme="night"] .capability-row strong {
+  color: var(--dc-mint);
+}
+
+/* --- Turn marker ------------------------------------------------------------------------------ */
+/*
+ * One per assistant turn, quiet enough to scroll past and specific enough to navigate by. The transcript
+ * previously carried a single marker at the very top, labelled with the LAST turn's number — so a reader
+ * scrolling through fifty turns had no idea where they were and no way to point at a scene they wanted to
+ * come back to. The article now also carries id="turn-<messageId>" as the anchor.
+ */
+.crack-turn-marker {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 0.5em;
+  color: var(--rich-ink-soft);
+  font-size: 0.78em;
+  letter-spacing: 0.02em;
+}
+
+.crack-turn-marker span {
+  font-weight: 600;
+}
+
+.crack-turn-marker::after {
+  flex: 1;
+  height: 1px;
+  background: var(--rich-rule);
+  content: "";
+}
+
+.crack-turn-marker time {
+  order: 1;
+  font-variant-numeric: tabular-nums;
 }

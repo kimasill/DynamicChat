@@ -38,8 +38,6 @@
   --teal: var(--dc-mint);
   --teal-dark: #267462;
   --amber: var(--dc-gold);
-  --coral: #ff4432;
-  --violet: var(--dc-plum);
   --blue: var(--dc-blue);
   --radius: 8px;
   --crack-ink: #121211;
@@ -58,7 +56,6 @@
   --story-font: "MaruBuri", "NanumMyeongjo", "KoPubBatang", serif;
   --ink-soft: var(--dc-ink-2);
   --muted-2: var(--dc-muted-2);
-  --surface-3: var(--dc-panel-2);
   --line-strong: var(--dc-line-strong);
   --accent: var(--dc-copper);
   --green: #327866;
@@ -77,7 +74,16 @@
   --dc-copper: #c65b43;
   --dc-gold: #d9a340;
   --dc-blue: #4d7f9f;
-  --dc-plum: #705a7c;
+  /* The focus indicator is a PAIR — the ring and the halo that separates it from whatever is behind —
+     so both halves need a night value or the ring lands on a surface it cannot be seen against. It was a
+     literal until now, which meant every focusable control OUTSIDE the story stage kept the light-mode
+     dark amber in night mode and measured 2.17:1. */
+  /* Ink weight of the copper accent, for the 11px labels that were using the accent itself. --crack-accent
+     (#ff4432) measures 3.40:1 as small text on --dc-panel and --accent (#c65b43) 4.18:1 — both fail AA for
+     text this size. An accent is a FILL; a label needs its own value. Hue preserved from --dc-copper. */
+  --accent-ink: #be543d;
+  --focus-ring: #7a4a00;
+  --focus-halo: rgb(255 255 255 / 85%);
   --dc-grid: linear-gradient(90deg, rgb(17 22 26 / 4%) 1px, transparent 1px),
     linear-gradient(180deg, rgb(17 22 26 / 4%) 1px, transparent 1px);
 
@@ -2907,7 +2913,9 @@ textarea:focus-visible {
   height: 48px;
   border-bottom: 1px solid var(--crack-line);
   background: var(--crack-panel);
-}.crack-story-breadcrumb {
+}
+
+.crack-story-breadcrumb {
   justify-self: start;
   display: inline-flex;
   align-items: center;
@@ -3493,9 +3501,13 @@ textarea:focus-visible {
 @media (max-width: 1040px) {
   .crack-global-topbar {
     grid-template-columns: 1fr auto;
-  }  .crack-episode-bar {
+  }
+
+  .crack-episode-bar {
     grid-template-columns: 1fr auto;
-  }  .crack-chat-shell {
+  }
+
+  .crack-chat-shell {
     grid-template-columns: 1fr;
   }
 
@@ -3665,7 +3677,9 @@ textarea:focus-visible {
 .crack-global-left .crack-logo-button {
   color: var(--crack-accent);
   letter-spacing: 0;
-}.crack-run-workspace {
+}
+
+.crack-run-workspace {
   color: var(--crack-text);
   background: var(--crack-panel);
 }
@@ -4036,9 +4050,9 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 summary:focus-visible {
-  outline: 2px solid #7a4a00;
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-  box-shadow: 0 0 0 4px rgb(255 255 255 / 85%);
+  box-shadow: 0 0 0 4px var(--focus-halo);
 }
 
 .topbar {
@@ -4574,16 +4588,30 @@ textarea {
   color: var(--accent);
   font-size: 21px;
   font-weight: 600;
-}.crack-icon-action {
+}
+
+.crack-icon-action {
   width: 38px;
 }
 
+/* The only control in the app that was never given a surface. With no `background` or `border` of its own
+   a <button> keeps the UA's, which is a grey fill and a 2px outset bevel — and under `color-scheme: dark`
+   that fill becomes rgb(107 107 107), putting the themed ink on it at 4.22:1. Painting it explicitly
+   fixes the bevel in light and the contrast in night with one rule; it reads as the quiet breadcrumb it
+   was always meant to be, and the radius gives the focus ring something sensible to trace. */
 .crack-story-breadcrumb {
   overflow: hidden;
   min-width: 0;
+  border: 0;
+  border-radius: 8px;
   color: var(--ink);
+  background: transparent;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.crack-story-breadcrumb:hover {
+  background: var(--surface-2);
 }
 
 .crack-square-select,
@@ -6080,6 +6108,14 @@ body.resizing-ops-rail {
   border: 2px solid #ffffff;
   border-radius: 50%;
   color: #ffffff;
+  /* --node-a/b/c come from the palette extracted off the character's generated image, so their lightness
+     is data rather than a design decision: the shipped fallback alone ends on #e8edea and the white
+     initials vanish into it (measured 1.00:1 for seven of eight characters). A scrim under the glyphs is
+     the only fix that holds for a palette nobody chose — darkening the gradient would fight the portrait
+     it is meant to echo. */
+  text-shadow:
+    0 1px 2px rgb(17 22 26 / 62%),
+    0 0 6px rgb(17 22 26 / 45%);
   background:
     radial-gradient(circle at 68% 24%, var(--node-c), transparent 28%),
     linear-gradient(135deg, var(--node-a), var(--node-b));
@@ -6368,7 +6404,7 @@ body.resizing-ops-rail {
 }
 
 .relationship-edge-row span {
-  color: var(--crack-accent);
+  color: var(--accent-ink);
   font-size: 11px;
   font-weight: 600;
 }
@@ -6720,7 +6756,7 @@ body.resizing-ops-rail {
 }
 
 .neural-map-inspector-head span {
-  color: var(--crack-accent);
+  color: var(--accent-ink);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -7587,7 +7623,9 @@ body.resizing-ops-rail {
 
   .crack-global-topbar {
     grid-template-columns: 1fr auto;
-  }  .crack-chat-shell {
+  }
+
+  .crack-chat-shell {
     grid-template-columns: minmax(0, 1fr) minmax(280px, var(--ops-rail-width, 320px));
   }
 
@@ -7629,7 +7667,9 @@ body.resizing-ops-rail {
     grid-template-columns: minmax(0, 1fr) auto;
     height: auto;
     min-height: 50px;
-  }  .crack-story-breadcrumb {
+  }
+
+  .crack-story-breadcrumb {
     padding-left: 12px;
   }
 
@@ -8949,7 +8989,10 @@ button:active {
 
 .builder-tab.active > span {
   color: #ffffff;
-  background: var(--dc-ink);
+  /* --night, not --dc-ink: an ink token flips to a LIGHT value in night and this chip carries white text,
+     so it would have gone white-on-white. --night is the surface that stays dark in both themes and is
+     the same #11161a here in light. */
+  background: var(--night);
 }
 
 .builder-tab.active strong {
@@ -9081,7 +9124,9 @@ textarea:focus {
   vertical-align: middle;
   background: linear-gradient(90deg, var(--dc-copper), var(--dc-gold), var(--dc-mint));
   content: "";
-}.crack-icon-action {
+}
+
+.crack-icon-action {
   border: 1px solid rgb(255 255 255 / 10%);
   border-radius: 8px;
 }
@@ -9101,7 +9146,9 @@ textarea:focus {
   height: 50px;
   border-bottom: 1px solid rgb(17 22 26 / 8%);
   background: var(--dc-panel);
-}.crack-square-select,
+}
+
+.crack-square-select,
 .crack-more-menu summary {
   border-color: var(--dc-line);
   background: var(--dc-panel);
@@ -9244,7 +9291,9 @@ textarea:focus {
   margin-bottom: 42px;
   padding-left: 22px;
   border-left: 1px solid rgb(17 22 26 / 12%);
-}.crack-markdown {
+}
+
+.crack-markdown {
   color: #202724;
   font-size: 18px;
   line-height: 1.9;
@@ -9763,7 +9812,9 @@ textarea:focus {
 
   .crack-episode-bar {
     grid-template-columns: minmax(0, 1fr) auto;
-  }  .crack-choice-message {
+  }
+
+  .crack-choice-message {
     grid-template-columns: 32px minmax(0, 1fr);
   }
 
@@ -10241,7 +10292,10 @@ textarea:focus {
 
 .reader-stepper-controls button:not(:disabled):hover {
   color: #ffffff;
-  background: var(--ink);
+  /* Same inversion as .builder-tab.active > span — and this one IS reachable in night, since the reader
+     controls live inside the run workspace. A hover state is invisible to a text-contrast sweep, which is
+     why it survived the audit. */
+  background: var(--night);
 }
 
 .reader-stepper-controls output {

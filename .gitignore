@@ -9,3 +9,5 @@ dist/
 
 # Scratch output from local eval/measurement runs
 scratch-*
+tmp/
+eval_fails.txt

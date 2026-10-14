@@ -528,9 +528,30 @@ const CLI_AGENT_DEFAULT_COMMANDS = {
   // refuses with exit 55. Gemini reads the piped stdin as the prompt and runs non-interactively (no -p flag needed).
   gemini: ["gemini", "--skip-trust", "--model", "{model}"],
   // antigravity → the `agy` CLI (Google's terminal coding agent that replaced the individual gemini CLI).
-  // `agy` reads the piped stdin as the prompt when no -p flag is provided and runs non-interactively.
-  // Passing prompt via stdin prevents Windows cmd.exe command line length limits (~8191 chars) on full simulation prompts.
-  antigravity: ["agy", "--model", "{model}", "--disable-slash-commands"]
+  //
+  // WITHOUT --print, `agy` opens an INTERACTIVE session: it ignores the piped stdin, prints no completion and
+  // never exits, so every turn sat on a live-but-idle subprocess until the absolute ceiling below (9 minutes)
+  // and the user saw a turn that simply never finished. --print takes the prompt as its own VALUE
+  // (`--print='...'`) and does not read stdin, which a full simulation prompt cannot fit, so the prompt is fed
+  // over stdin through the NDJSON input format instead. That path also emits incremental text_delta events,
+  // which is what lets this agent stream like claude rather than going dark until the end.
+  antigravity: [
+    "agy",
+    "--print=",
+    // agy's own print-mode ceiling defaults to 5m, which is BELOW what a DynamicChat turn takes on a heavy
+    // prompt (a 21-paragraph narrative measured 184s, and the annotation pass is the largest call of the
+    // turn). Past it agy exits 1 with its reason on stdout, which the NDJSON parser discards — the caller saw
+    // a bare "exited with code 1". Raised to sit just above the bridge's own absolute backstop so the bridge,
+    // not agy, is what bounds a wedged run and reports it.
+    "--print-timeout=16m",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "{model}",
+    "--disable-slash-commands"
+  ]
 };
 
 // Streaming variants. `claude --output-format stream-json --verbose --include-partial-messages` emits
@@ -541,8 +562,18 @@ const CLI_AGENT_DEFAULT_COMMANDS = {
 // fall back to their default command and have their raw stdout forwarded as-is.
 const CLI_AGENT_STREAM_COMMANDS = {
   // Same narrative-hardening flags as the default command; see comment above for rationale.
-  claude: ["claude", "--print", "--model", "{model}", "--tools=", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections", "--system-prompt-file", "{systemPromptFile}", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+  claude: ["claude", "--print", "--model", "{model}", "--tools=", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections", "--system-prompt-file", "{systemPromptFile}", "--output-format", "stream-json", "--verbose", "--include-partial-messages"],
+  // agy needs no separate streaming argv: the NDJSON transport its prompt must travel over already carries
+  // incremental text_delta events, so one command serves both callers.
+  antigravity: CLI_AGENT_DEFAULT_COMMANDS.antigravity
 };
+
+// `agy` is a coding agent: its session exposes run_command, view_file, browser_* and the rest, and on a
+// narrative prompt it will sometimes answer with a TOOL CALL instead of prose. In print mode nobody is there
+// to approve it, so the call fails and agy ends the turn having emitted no text at all — the turn comes back
+// empty. claude gets `--tools=` for this; agy has no equivalent flag, so the instruction is the only lever.
+const ANTIGRAVITY_NO_TOOL_PREAMBLE =
+  "Answer directly with text only. Do not call any tool, do not read or write files, do not run commands, and do not browse. This is a writing request, not a coding task.";
 
 const CLI_AGENT_ENV_OVERRIDES = {
   claude: "DYNAMICCHAT_CLI_CLAUDE",
@@ -575,6 +606,10 @@ const cliAgentTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_TIMEOUT_MS ?? 540_0
 // abort, so a long-but-healthy generation completes; we only give up after a real stall. A generous
 // absolute backstop still bounds a truly wedged process.
 const cliAgentIdleTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_IDLE_TIMEOUT_MS ?? 120_000);
+// How long the streaming path waits before committing to a 200 with no output yet. Must exceed the time a
+// CLI takes to fail at startup (missing binary, expired or ineligible login) so that failure is still
+// reportable as a 502; see the header-grace comment at its use site.
+const CLI_AGENT_HEADER_GRACE_MS = Number(process.env.DYNAMICCHAT_CLI_HEADER_GRACE_MS ?? 20_000);
 const cliAgentStreamMaxTimeoutMs = Number(process.env.DYNAMICCHAT_CLI_STREAM_MAX_MS ?? 900_000);
 
 async function proxyLlmCliAgent(_request, response) {
@@ -648,8 +683,17 @@ async function proxyLlmCliAgent(_request, response) {
 
   // claude receives its system prompt via --system-prompt-file (above); its stdin carries only the
   // user turn so the two don't collide. Other agents (codex/gemini/antigravity) get the combined prompt via stdin.
+  // antigravity reads stdin as NDJSON (one message per line), not as raw text — raw text is rejected with
+  // `stream input message is missing the "event" field`.
   const stdinText =
-    agent === "claude" ? (userPrompt.trim() || fullPrompt) : fullPrompt;
+    agent === "claude"
+      ? (userPrompt.trim() || fullPrompt)
+      : agent === "antigravity"
+        ? `${JSON.stringify({
+            event: "user",
+            message: { role: "user", content: [{ type: "text", text: `${ANTIGRAVITY_NO_TOOL_PREAMBLE}\n\n${fullPrompt}` }] }
+          })}\n`
+        : fullPrompt;
   const spawnWithoutShell = agent === "antigravity";
 
   const describeMissingBinary = () =>
@@ -671,8 +715,11 @@ async function proxyLlmCliAgent(_request, response) {
    * with code 1" with no hint that the tool simply is not installed. The shell's own wording is matched here
    * so the actionable message is produced on every platform.
    */
-  const describeExitFailure = (code, stderr) => {
-    const text = String(stderr ?? "");
+  const describeExitFailure = (code, stderr, stdout = "") => {
+    // agy prints its own usage/startup errors to STDOUT, not stderr, and on the NDJSON path those lines are
+    // discarded by the parser as unparseable. Falling back to stdout is what turns a bare "exited with code 1"
+    // into the actual reason.
+    const text = String(stderr ?? "").trim() || String(stdout ?? "").trim();
     if (/is not recognized as an internal or external command|command not found|No such file or directory/iu.test(text)) {
       return describeMissingBinary();
     }
@@ -680,7 +727,17 @@ async function proxyLlmCliAgent(_request, response) {
     if (/Please set an Auth method|not authenticated|Please login|GEMINI_API_KEY/iu.test(text)) {
       return `${agent} CLI is installed but not signed in. ${CLI_AGENT_AUTH_HINTS[agent] ?? "Run it once in a terminal and complete the sign-in."} Upstream said: ${text.slice(0, 300)}`;
     }
-    return `${agent} CLI exited with code ${code}.${text ? ` ${text.slice(0, 500)}` : ""}`;
+    // A model id the CLI has retired. Distinct from an outage: nothing recovers until the model is changed,
+    // and the CLI already prints the list it does accept, so that list is worth forwarding verbatim.
+    if (/is not recognized as a known model|invalid model selection|unknown model/iu.test(text)) {
+      return `${agent} CLI rejected the selected model "${model || "(default)"}". Pick a different model for this call in the settings. Upstream said: ${text.slice(0, 400)}`;
+    }
+    // A signed-in account whose PLAN no longer covers this CLI. Distinct from "not signed in": no amount of
+    // re-authenticating fixes it, so the actionable advice is to switch the backend, not to log in again.
+    if (/IneligibleTier|no longer supported|migrate to the Antigravity/iu.test(text)) {
+      return `${agent} CLI is signed in but its account tier no longer allows this client, so it cannot serve requests. Pick a different LLM backend in the settings. Upstream said: ${text.slice(0, 300)}`;
+    }
+    return `${agent} CLI exited with code ${code}.${text ? ` ${text.slice(0, 500)}` : ""}${text ? "" : " It produced no output."}`;
   };
 
   if (wantStream) {
@@ -694,19 +751,24 @@ async function proxyLlmCliAgent(_request, response) {
         headersSent = true;
       }
     };
-    // claude streams token-level NDJSON; translate it to plain-text deltas so the client's plain-text
-    // stream reader is unchanged. Other agents have their raw stdout forwarded verbatim (works whether
-    // they emit incrementally or buffer — see the early-header grace timer below).
-    const claudeStream = wantStream && agent === "claude" && CLI_AGENT_STREAM_COMMANDS.claude ? createClaudeStreamTextParser() : undefined;
-    // Send headers shortly after spawn even before any stdout, so an agent that buffers its whole
-    // response (no incremental output) still establishes the connection fast and the client switches to
-    // an untimed body read instead of tripping its time-to-first-byte timeout. The grace delay is long
-    // enough that a spawn failure (ENOENT, fires in ms) still rejects with headers unsent → clean 502.
-    const headerGraceTimer = setTimeout(beginStream, 3000);
-    // Only claude is known to emit incrementally, so only it gets the inactivity (idle) timeout that
-    // resets on each delta. For the others we rely on the generous absolute backstop, since a buffering
-    // agent is legitimately silent until the end and an idle timeout would kill a healthy generation.
-    const idleTimeoutMs = claudeStream ? cliAgentIdleTimeoutMs : undefined;
+    // claude and agy both stream token-level NDJSON; translate it to plain-text deltas so the client's
+    // plain-text stream reader is unchanged. Other agents have their raw stdout forwarded verbatim (works
+    // whether they emit incrementally or buffer — see the early-header grace timer below).
+    const ndjsonStream = resolveCliStdoutParser(agent, wantStream);
+    // Send headers before any stdout so an agent that buffers its whole response still establishes the
+    // connection early and the client switches to an untimed body read instead of tripping its
+    // time-to-first-byte timeout.
+    //
+    // The delay must outlast a STARTUP failure, not just a spawn failure. At 3s it did not: an unauthenticated
+    // CLI takes a few seconds to reach its auth error (the gemini CLI reports IneligibleTierError at ~4.4s), so
+    // the headers were already out and the failure could no longer be reported as a 502 — the caller got an
+    // empty 200 and the real reason went to stderr and nowhere else. Every turn then lost its images with no
+    // message anywhere. The client's own request timeout is at least 90s, so waiting here is free.
+    const headerGraceTimer = setTimeout(beginStream, CLI_AGENT_HEADER_GRACE_MS);
+    // Only the NDJSON agents are known to emit incrementally, so only they get the inactivity (idle)
+    // timeout that resets on each delta. For the others we rely on the generous absolute backstop, since a
+    // buffering agent is legitimately silent until the end and an idle timeout would kill a healthy run.
+    const idleTimeoutMs = ndjsonStream ? cliAgentIdleTimeoutMs : undefined;
     // Temporary streaming probe: confirms whether the CLI emits text INCREMENTALLY (many chunks, first chunk
     // arrives early → early image dispatch can work) or buffers the whole response (1 chunk near the end → no
     // streaming, so image_cues-first vs assistant_text-first makes no difference to first-image latency).
@@ -728,8 +790,8 @@ async function proxyLlmCliAgent(_request, response) {
           if (!headersSent || response.writableEnded) {
             return;
           }
-          if (claudeStream) {
-            const text = claudeStream.push(chunk);
+          if (ndjsonStream) {
+            const text = ndjsonStream.push(chunk);
             if (text) {
               if (firstChunkMs < 0) firstChunkMs = Date.now() - streamStartedAt;
               streamedChunks += 1;
@@ -760,18 +822,21 @@ async function proxyLlmCliAgent(_request, response) {
 
     if (!headersSent) {
       // Process produced no stdout: surface an error (client checks response.ok before reading the stream).
-      if (result.code !== 0) {
+      // A zero exit code is NOT proof of success here — the gemini CLI prints its auth failure and leaves,
+      // and an empty 200 would be reported upstream as "the model said nothing" rather than "the CLI is not
+      // signed in", which is the difference between a fixable message and a silent turn.
+      if (result.code !== 0 || !result.stdout.trim()) {
         sendJson(response, 502, {
-          error: describeExitFailure(result.code, result.stderr)
+          error: describeExitFailure(result.code, result.stderr, result.stdout)
         });
         return;
       }
       beginStream();
     }
-    // Flush any trailing claude text: a final delta with no newline, or — if no deltas ever streamed
+    // Flush any trailing text: a final delta with no newline, or — if no deltas ever streamed
     // (e.g. partial messages unsupported) — the complete assistant/result text as a one-shot fallback.
-    if (claudeStream && !response.writableEnded) {
-      const tail = claudeStream.flush();
+    if (ndjsonStream && !response.writableEnded) {
+      const tail = ndjsonStream.flush();
       if (tail) {
         response.write(tail);
       }
@@ -786,11 +851,20 @@ async function proxyLlmCliAgent(_request, response) {
       cwd: agent === "claude" ? claudeNeutralCwd : undefined
     });
     if (result.code !== 0) {
-      sendJson(response, 502, { error: describeExitFailure(result.code, result.stderr) });
+      sendJson(response, 502, { error: describeExitFailure(result.code, result.stderr, result.stdout) });
       return;
     }
 
-    sendJson(response, 200, { text: result.stdout, agent, model: model || undefined });
+    // agy answers in NDJSON on this path too, so the reply has to be translated back to plain text before it
+    // reaches a caller that expects the model's answer (the annotation pass parses it as strict JSON).
+    const stdoutParser = resolveCliStdoutParser(agent, false);
+    const text = stdoutParser ? `${stdoutParser.push(result.stdout)}${stdoutParser.flush()}` : result.stdout;
+    if (!text.trim()) {
+      sendJson(response, 502, { error: describeExitFailure(result.code, result.stderr, result.stdout) });
+      return;
+    }
+
+    sendJson(response, 200, { text, agent, model: model || undefined });
   } catch (error) {
     sendJson(response, 502, { error: describeSpawnError(error) });
   } finally {
@@ -977,32 +1051,17 @@ function runCliAgentProcess(command, args, stdinText, options = {}) {
 
 // Parses claude's `--output-format stream-json` NDJSON into plain text. `push` returns the incremental
 // text to forward for each chunk; `flush` returns any trailing text once the process closes.
-function createClaudeStreamTextParser() {
+/**
+ * Line-buffers a CLI's NDJSON stdout and turns it into plain text.
+ *
+ * Both streaming agents speak NDJSON but disagree on the envelope, so the buffering and line splitting live
+ * here and only the two extractors differ per agent.
+ */
+function createNdjsonStreamTextParser({ extractDeltaText, extractCompleteText }) {
   let buffer = "";
   let emittedDelta = false;
   let completeText = "";
 
-  const extractDeltaText = (event) => {
-    // With --include-partial-messages: {"type":"stream_event","event":{"type":"content_block_delta",
-    // "delta":{"type":"text_delta","text":"..."}}}. Some builds surface the inner event at top level.
-    const inner = event?.type === "stream_event" ? event.event : event;
-    if (inner?.type === "content_block_delta" && inner?.delta?.type === "text_delta") {
-      return typeof inner.delta.text === "string" ? inner.delta.text : "";
-    }
-    return "";
-  };
-  const extractCompleteText = (event) => {
-    if (event?.type === "result" && typeof event.result === "string") {
-      return event.result;
-    }
-    if (event?.type === "assistant" && Array.isArray(event?.message?.content)) {
-      return event.message.content
-        .filter((block) => block?.type === "text" && typeof block.text === "string")
-        .map((block) => block.text)
-        .join("");
-    }
-    return "";
-  };
   const consumeLine = (line) => {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -1049,6 +1108,84 @@ function createClaudeStreamTextParser() {
       return out;
     }
   };
+}
+
+function createClaudeStreamTextParser() {
+  return createNdjsonStreamTextParser({
+    extractDeltaText: (event) => {
+      // With --include-partial-messages: {"type":"stream_event","event":{"type":"content_block_delta",
+      // "delta":{"type":"text_delta","text":"..."}}}. Some builds surface the inner event at top level.
+      const inner = event?.type === "stream_event" ? event.event : event;
+      if (inner?.type === "content_block_delta" && inner?.delta?.type === "text_delta") {
+        return typeof inner.delta.text === "string" ? inner.delta.text : "";
+      }
+      return "";
+    },
+    extractCompleteText: (event) => {
+      if (event?.type === "result" && typeof event.result === "string") {
+        return event.result;
+      }
+      if (event?.type === "assistant" && Array.isArray(event?.message?.content)) {
+        return event.message.content
+          .filter((block) => block?.type === "text" && typeof block.text === "string")
+          .map((block) => block.text)
+          .join("");
+      }
+      return "";
+    }
+  });
+}
+
+/**
+ * Translates `agy --output-format stream-json` into plain text.
+ *
+ * Prose arrives as {"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"..."}};
+ * other step types (user_input, tool activity) carry no answer text and are skipped. The closing
+ * {"event":"result","result":{"response":"..."}} repeats the whole answer and is the fallback when no delta
+ * streamed. A failed run reports a non-SUCCESS status with an empty response — that is logged rather than
+ * returned, so the bridge fails with "returned no content" instead of writing an error string into the turn.
+ */
+/**
+ * The NDJSON parser for an agent's stdout, or undefined when it emits plain text.
+ *
+ * `wantStream` matters for claude only: it speaks NDJSON just for the streaming argv, and running the parser
+ * over its plain-text reply would return nothing. agy has a single NDJSON argv, so its stdout ALWAYS needs
+ * translating — including on the non-streaming path the annotation call takes, which otherwise hands the
+ * caller a wall of raw NDJSON where a JSON answer was expected.
+ */
+function resolveCliStdoutParser(agent, wantStream) {
+  if (agent === "antigravity") {
+    return createAntigravityStreamTextParser();
+  }
+  if (agent === "claude" && wantStream) {
+    return createClaudeStreamTextParser();
+  }
+  return undefined;
+}
+
+function createAntigravityStreamTextParser() {
+  return createNdjsonStreamTextParser({
+    extractDeltaText: (event) => {
+      const step = event?.event === "step_update" ? event.step_update : undefined;
+      if (step?.step_type !== "agent_response" || typeof step?.text_delta !== "string") {
+        return "";
+      }
+      return step.text_delta;
+    },
+    extractCompleteText: (event) => {
+      const result = event?.event === "result" ? event.result : undefined;
+      if (!result) {
+        return "";
+      }
+      if (typeof result.response === "string" && result.response) {
+        return result.response;
+      }
+      if (result.status && result.status !== "SUCCESS") {
+        console.error(`agy run failed (${result.status}): ${result.error ?? "no error text"}`);
+      }
+      return "";
+    }
+  });
 }
 
 async function getObjectAsset(_request, response, [objectKey]) {

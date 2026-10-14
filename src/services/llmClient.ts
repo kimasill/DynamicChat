@@ -4680,6 +4680,25 @@ const MAX_IMAGE_CUE_TOPUP_ROUNDS = 2;
 /** Narrative short enough that additional cuts would be inventing beats the prose does not contain. */
 const MIN_TOPUP_NARRATIVE_CHARS = 240;
 
+/** Cadences whose floor is a requirement of the setting, not a suggestion the model may decline. */
+function isHardImageCueFloorCadence(state: AppState): boolean {
+  const cadence = state.imageProfile.generationCadence ?? "balanced";
+  return cadence === "paragraph" || cadence === "image_progression";
+}
+
+/**
+ * A pass that returned cues and declined every one of them, on a cadence that leaves room for that call.
+ * The tag model has said "this turn is not visual", and the pipeline takes its word for it.
+ */
+function isRespectedNonVisualJudgement(state: AppState, cues: AssistantImageCueDraft[]): boolean {
+  return cues.length > 0 && !cues.some((cue) => cue.shouldGenerate) && !isHardImageCueFloorCadence(state);
+}
+
+/** Whether the narrative carries enough beats for a cut list at all (image_progression is exempt, see topUpImageCues). */
+function narrativeSupportsImageCueRecovery(state: AppState, assistantText: string): boolean {
+  return isImageProgressionCadence(state) || assistantText.trim().length >= MIN_TOPUP_NARRATIVE_CHARS;
+}
+
 /**
  * The beat a cue is anchored to, or "" when it names none.
  *
@@ -4792,7 +4811,7 @@ async function topUpImageCues(
   state: AppState,
   input: { userText: string; assistantText: string; manualImage?: boolean },
   result: TurnAnnotationResult,
-  options: { outputTokenBudget: number; tier: PromptDetailTier }
+  options: { outputTokenBudget: number; tier: PromptDetailTier; refusals?: ModelRefusal[] }
 ): Promise<TurnAnnotationResult> {
   const floor = resolveRequiredImageCueFloor(state, options.outputTokenBudget);
   if (floor <= 0) {
@@ -4807,13 +4826,18 @@ async function topUpImageCues(
   // with suppression reasons decided this turn is not visual — respect that. A pass that returned nothing at
   // all, on a cadence that demands a cut list, is the failure mode behind "이미지가 가끔 안 생성됨": measured
   // on a weaker tag model it produced an empty array on 3 of 5 turns of substantial prose. Retry those.
-  if (generated === 0 && cues.length > 0) {
+  //
+  // The judgement is only respected where the cadence leaves room for one. `paragraph` asks for a cut per
+  // paragraph and `image_progression` IS a cut list, so "every beat is non-visual" on substantial prose
+  // there is not a judgement — it is the shape a tag model produces when it declines the material (seen on
+  // an adult_19 turn: 3,100 chars of explicit prose, state_events extracted fine, every cue suppressed).
+  if (isRespectedNonVisualJudgement(state, cues)) {
     return result;
   }
   // Enough prose to carry more beats — otherwise the extra cuts would be invented rather than observed.
   // Image-progression mode is exempt: its assistant_text is deliberately a single status line, and the cut
   // list IS the turn's output, so the prose length says nothing about how many cuts the scene supports.
-  if (!isImageProgressionCadence(state) && input.assistantText.trim().length < MIN_TOPUP_NARRATIVE_CHARS) {
+  if (!narrativeSupportsImageCueRecovery(state, input.assistantText)) {
     return result;
   }
 
@@ -4868,6 +4892,10 @@ async function topUpImageCues(
     if (!raw?.trim()) {
       break;
     }
+    const refusal = detectModelRefusal(raw);
+    if (refusal) {
+      options.refusals?.push({ by: "tag", excerpt: refusal });
+    }
     const parsed = parseAnnotationResponse(raw, true);
     const merged = mergeAdditionalImageCues(cues, parsed.imageCues, missing);
     if (merged.added === 0) {
@@ -4891,6 +4919,190 @@ async function topUpImageCues(
   return { ...result, imageCues: cues };
 }
 
+/** Whether a config can actually serve a request: enabled, a real provider, and a key where one is needed. */
+function isLlmConfigUsable(llm: AppState["llm"]): boolean {
+  if (!llm.enabled || llm.provider === "mock") {
+    return false;
+  }
+  return !getLlmProviderPreset(llm.provider).requiresApiKey || Boolean(llm.apiKey.trim());
+}
+
+/** Same backend, or merely the same object: the second config would only repeat the first's answer. */
+function isSameLlmBackend(a: AppState["llm"], b: AppState["llm"]): boolean {
+  return a.provider === b.provider && (a.model ?? "") === (b.model ?? "") && (a.baseUrl ?? "") === (b.baseUrl ?? "");
+}
+
+/**
+ * Last resort for a turn whose dedicated tag model produced no cuts at all: author the cut list with the
+ * main narrative model instead.
+ *
+ * The dedicated image-tag LLM is usually the cheaper/smaller of the two, and on a hard-floor cadence it is
+ * the one that comes back with `image_cues: []` while the main model — which just WROTE the narrative — has
+ * no trouble tagging it. Without this, that turn loses every image although a perfectly capable backend is
+ * configured one field over. The state_events already extracted are kept; this asks for cues only, using the
+ * same completion instruction as the top-up rounds so the two paths cannot drift.
+ *
+ * Returns the input unchanged when there is no distinct usable main backend, when the cadence tolerates an
+ * empty list, or when the fallback itself fails — a turn with no images is still a completed turn.
+ */
+async function authorImageCuesWithMainLlm(
+  tagLlmState: AppState,
+  state: AppState,
+  input: { userText: string; assistantText: string; manualImage?: boolean },
+  result: TurnAnnotationResult,
+  refusals?: ModelRefusal[]
+): Promise<TurnAnnotationResult> {
+  const generated = result.imageCues.filter((cue) => cue.shouldGenerate).length;
+  if (generated > 0 || isRespectedNonVisualJudgement(state, result.imageCues)) {
+    return result;
+  }
+  const requestedOutput = resolveAnnotationOutputTokenBudget(state, true);
+  const floor = resolveRequiredImageCueFloor(state, resolveAnnotationPromptBudget(tagLlmState, requestedOutput).outputTokenBudget);
+  if (floor <= 0 || !narrativeSupportsImageCueRecovery(state, input.assistantText)) {
+    return result;
+  }
+  if (isSameLlmBackend(tagLlmState.llm, state.llm) || !isLlmConfigUsable(state.llm)) {
+    return result;
+  }
+
+  // Size everything to the MAIN model's window, not the tag model's: the two commonly differ by an order
+  // of magnitude (a 16k local tagger beside a 128k+ hosted narrator, or the reverse).
+  const budget = resolveAnnotationPromptBudget(state, requestedOutput);
+  const fitted = buildWithinBudget(
+    budget,
+    (tier) => ({
+      instruction: createImageCueTopUpInstruction(state, budget.outputTokenBudget, tier, floor, []),
+      context: createAnnotationLlmContext(state, { ...input, outputTokenBudget: budget.outputTokenBudget }, true, tier)
+    }),
+    (built) => `${built.instruction}
+${built.context}
+${input.userText}`
+  );
+  console.info("[annotation] image-cue list empty after top-up; re-authoring cues with the main LLM", {
+    tagProvider: tagLlmState.llm.provider,
+    tagModel: tagLlmState.llm.model,
+    mainProvider: state.llm.provider,
+    mainModel: state.llm.model,
+    floor,
+    tier: fitted.tier
+  });
+
+  let raw: string | undefined;
+  try {
+    raw = await requestProviderText(
+      state,
+      { userText: input.userText, modules: [], evidence: [] },
+      fitted.built.instruction,
+      fitted.built.context,
+      Math.min(budget.outputTokenBudget, Math.max(700, floor * 280)),
+      { temperature: state.llm.temperature, jsonResponse: supportsJsonResponseFormat(state.llm.provider) }
+    );
+  } catch (error) {
+    if (isLlmAbortedError(error)) {
+      throw error;
+    }
+    console.warn("[annotation] main-LLM image-cue fallback failed; the turn keeps no cues", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return result;
+  }
+  if (!raw?.trim()) {
+    return result;
+  }
+  const refusal = detectModelRefusal(raw);
+  if (refusal) {
+    refusals?.push({ by: "main", excerpt: refusal });
+  }
+  const parsed = parseAnnotationResponse(raw, true);
+  const merged = mergeAdditionalImageCues([], parsed.imageCues, Math.max(floor, getImageCueMergeCeiling(state)));
+  if (merged.added === 0) {
+    console.info("[annotation] main-LLM image-cue fallback produced no renderable cues either");
+    return result;
+  }
+  console.info(`[annotation] main-LLM image-cue fallback authored ${merged.added} cue(s)`);
+  return { ...result, imageCues: merged.cues };
+}
+
+/** How many cuts a fallback may keep: the cadence's own ceiling, so a generous model does not overshoot it. */
+function getImageCueMergeCeiling(state: AppState): number {
+  const cadence = state.imageProfile.generationCadence ?? "balanced";
+  if (cadence === "image_progression") {
+    return IMAGE_PROGRESSION_CUE_TARGET;
+  }
+  return cadence === "paragraph" ? 8 : cadence === "rich" ? 4 : 2;
+}
+
+function describeStateOnlyRefusal(llmState: AppState, refusal: string): string {
+  return `상태 추출 LLM(${llmState.llm.provider}/${llmState.llm.model || "(default)"})이 이 턴을 공급자 안전 정책으로 거부해 상태 변화(의상·포즈 등)가 기록되지 않았습니다 (모델 응답: "${refusal}").`;
+}
+
+interface ModelRefusal {
+  by: "tag" | "main";
+  /** The annotation call proper, which also carries the turn's state_events. */
+  firstPass?: boolean;
+  excerpt: string;
+}
+
+const MODEL_REFUSAL_OPENING =
+  /^(?:I (?:cannot|can't|can not|am unable to|must decline|won't)|I'm (?:unable|sorry|not able)|I am sorry|Sorry, |The prompt could not be submitted)/iu;
+
+/**
+ * A reply that is a safety refusal written as prose instead of the requested JSON.
+ *
+ * Without this the refusal parsed as "no cues, no state events" and was reported as the tag model sending an
+ * empty image_cues array — which sent the user off swapping models. Measured on antigravity_cli (gemini flash
+ * and pro alike): once a long adult_19 run escalates, most annotation, top-up and fallback calls come back as
+ * "I cannot fulfill this request…" while the early turns of the same run are tagged normally.
+ */
+function detectModelRefusal(raw: string | undefined): string | undefined {
+  const text = stripReasoningWrappers(unwrapCliAgentBridgeResponse(raw ?? "")).trim();
+  if (!text || extractJsonObject(text) || !MODEL_REFUSAL_OPENING.test(text)) {
+    return undefined;
+  }
+  return text.replace(/\s+/gu, " ").slice(0, 140);
+}
+
+/**
+ * The notice for a turn that ends with no cuts on a cadence that demanded them, naming which backend(s)
+ * declined so the operator can act on it (swap the tag model) instead of reading it as a quiet beat.
+ */
+function describeEmptyImageCueOutcome(
+  tagLlmState: AppState,
+  state: AppState,
+  result: TurnAnnotationResult,
+  refusals: ModelRefusal[] = []
+): string | undefined {
+  const generated = result.imageCues.filter((cue) => cue.shouldGenerate).length;
+  if (generated > 0 || isRespectedNonVisualJudgement(state, result.imageCues)) {
+    return undefined;
+  }
+  const floor = resolveRequiredImageCueFloor(state, resolveAnnotationOutputTokenBudget(state, true));
+  if (floor <= 0) {
+    return undefined;
+  }
+  const tagLabel = `${tagLlmState.llm.provider}/${tagLlmState.llm.model || "(default)"}`;
+  const hadFallback = !isSameLlmBackend(tagLlmState.llm, state.llm) && isLlmConfigUsable(state.llm);
+  const mainLabel = `${state.llm.provider}/${state.llm.model || "(default)"}`;
+  if (refusals.length > 0) {
+    // A refusal is not an empty cut list and swapping to a sibling model of the same provider does not help —
+    // the policy is the provider's. Say what actually happened, quoting the model.
+    const tagRefused = refusals.some((refusal) => refusal.by === "tag");
+    const mainRefused = refusals.some((refusal) => refusal.by === "main");
+    const who = [tagRefused ? `이미지 태그 LLM(${tagLabel})` : "", mainRefused ? `메인 LLM(${mainLabel})` : ""]
+      .filter(Boolean)
+      .join("과 ");
+    const firstPassLost = refusals.some((refusal) => refusal.by === "tag" && refusal.firstPass);
+    return `${who}이 이 턴의 이미지 태그 작성을 공급자 안전 정책으로 거부해 이미지가 없습니다 (모델 응답: "${refusals[0].excerpt}").${
+      firstPassLost ? " 같은 호출이 상태 변화(의상·포즈 등)도 담당하므로 이 턴의 상태 갱신도 기록되지 않았습니다." : ""
+    }`;
+  }
+  const suppressed = result.imageCues.filter((cue) => !cue.shouldGenerate && cue.suppressionReason?.trim());
+  const why = suppressed.length > 0 ? ` (모델 사유: ${suppressed[0].suppressionReason?.trim().slice(0, 120)})` : "";
+  return hadFallback
+    ? `이미지 태그 LLM(${tagLabel})이 이 턴의 image_cues를 비워 보냈고, 메인 LLM(${mainLabel}) 재시도도 컷을 만들지 못해 이미지가 없습니다${why}. 태그 LLM 모델을 바꾸거나 태그 전용 LLM을 끄고 메인 LLM으로 태그를 작성하세요.`
+    : `이미지 태그 LLM(${tagLabel})이 이 턴의 image_cues를 비워 보내 이미지가 없습니다${why}. 재시도로도 컷이 나오지 않았습니다.`;
+}
+
 // NOTE: the standalone image-cue pass that once lived here was removed. Image cues and state events are
 // authored by ONE call (requestTurnAnnotations below). Keeping a second, unreferenced copy of the tag
 // contract and cue parser meant every prompt fix had to be made twice, and the diagnostics that were added
@@ -4908,6 +5120,15 @@ export interface TurnAnnotationResult {
    * blip therefore looked exactly like "이미지가 가끔 안 나온다". The caller surfaces this.
    */
   failureReason?: string;
+  /**
+   * Why the cut list is empty on a cadence that demands one, when the state extraction itself succeeded.
+   *
+   * Kept apart from `failureReason` because that one means the whole call failed (no state deltas either),
+   * whereas this is the shape the dedicated tag model produces when it refuses or under-delivers: a valid
+   * envelope with state_events and an empty (or fully suppressed) image_cues. The caller surfaces it so the
+   * turn does not read as "the model judged this beat non-visual".
+   */
+  imageCueFailureReason?: string;
 }
 
 /**
@@ -5301,11 +5522,30 @@ ${input.userText}`
       includeImageCues,
       shouldGenerate: result.imageCues.filter((c) => c.shouldGenerate).length
     });
+    const refusals: ModelRefusal[] = [];
+    const firstPassRefusal = detectModelRefusal(raw);
+    if (firstPassRefusal) {
+      refusals.push({ by: "tag", firstPass: true, excerpt: firstPassRefusal });
+      console.warn("[annotation] the annotation model refused this turn (safety policy); state events are lost", {
+        provider: llmState.llm.provider,
+        model: llmState.llm.model,
+        refusal: firstPassRefusal
+      });
+    }
     // The cadence is a creator setting, not a suggestion to the model. When the first pass undershoots it,
     // fill the gap here rather than shipping a one-cut turn on a high-density cadence.
-    return includeImageCues
-      ? await topUpImageCues(llmState, state, input, result, { outputTokenBudget, tier: fitted.tier })
-      : result;
+    if (!includeImageCues) {
+      return firstPassRefusal ? { ...result, failureReason: describeStateOnlyRefusal(llmState, firstPassRefusal) } : result;
+    }
+    const toppedUp = await topUpImageCues(llmState, state, input, result, { outputTokenBudget, tier: fitted.tier, refusals });
+    // Still nothing on a cadence that demands cuts: the dedicated tag model is the one that declined, so hand
+    // the cut list to the main model before giving up on this turn's images.
+    const recovered = await authorImageCuesWithMainLlm(llmState, state, input, toppedUp, refusals);
+    const imageCueFailureReason = describeEmptyImageCueOutcome(llmState, state, recovered, refusals);
+    if (imageCueFailureReason) {
+      console.warn("[annotation] no image cues after top-up and fallback", { reason: imageCueFailureReason });
+    }
+    return imageCueFailureReason ? { ...recovered, imageCueFailureReason } : recovered;
   } catch (error) {
     // Same reasoning as the narrative pass: a cancelled turn must abort, not degrade into an empty
     // annotation that the caller would treat as a completed (image-less, state-less) turn.

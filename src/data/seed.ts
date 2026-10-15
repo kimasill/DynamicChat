@@ -4,13 +4,18 @@ import type {
   CharacterVisualProfile,
   ContentRating,
   EvaluationScenario,
+  ImageBackendDecision,
+  ImageBackendId,
+  ImageBackendRoutingMode,
   ImageGenerationProfile,
+  ImageSceneCategory,
   ImageScenePresetExampleFile,
   ImageSceneTagPreset,
   ImageSceneTagPresetNode,
   LlmApiSettings,
   NeuralMapSettings,
   NovelAiApiSettings,
+  PhotorealApiSettings,
   PromptModule,
   RelationshipMapSettings,
   SimulationCharacterDraft,
@@ -20,10 +25,21 @@ import type {
 } from "../types";
 import { createId } from "../lib/id";
 import { createSecuritySettings, normalizeSecuritySettings } from "../services/security";
-import { toShareableLlmSettings, toShareableNovelAiSettings } from "../services/runtimeApiSettings";
+import {
+  DEFAULT_PHOTOREAL_SETTINGS,
+  normalizePhotorealSettings,
+  toShareableCharacterProfileImages,
+  toShareableLlmSettings,
+  toShareableNovelAiSettings
+} from "../services/runtimeApiSettings";
 import { createDefaultProgressRunId, normalizeProgressRuns } from "../services/progressRuns";
 import { resolveNovelAiModelName } from "../services/novelAiModels";
+import { DEFAULT_PHOTOREAL_CATEGORIES, resolveImageBackendRouting } from "../services/imageBackendRouting";
 import { womanLifeSeedState } from "./womanLifeSeed";
+
+// Defined next to the other runtime API settings helpers (see the note there on why not here); re-exported because
+// seed.ts is where the app and the evals look for simulation defaults.
+export { DEFAULT_PHOTOREAL_SETTINGS, normalizePhotorealSettings };
 
 const now = "2026-05-03T00:00:00.000Z";
 const defaultOutfitPrompt = "";
@@ -272,7 +288,12 @@ export const seedState: AppState = {
     userRules: "캐릭터의 외형 일관성을 우선한다.",
     triggerMode: "realtime_auto",
     generationCadence: "balanced",
-    cooldownTurns: 2
+    cooldownTurns: 2,
+    // NovelAI only until the user opts in; the categories are what `mixed` starts with when they do.
+    backendRouting: {
+      mode: "novelai",
+      photorealCategories: [...DEFAULT_PHOTOREAL_CATEGORIES]
+    }
   },
   userPersona: {
     ...defaultUserPersona
@@ -458,6 +479,8 @@ export const seedState: AppState = {
     vibeTransferEnabled: false,
     vibeTransferReferences: []
   },
+  // A copy, not the frozen default itself: states are spread and edited from here.
+  photoreal: { ...DEFAULT_PHOTOREAL_SETTINGS, modelFiles: {} },
   selectedModuleId: "module_main",
   selectedContextPackId: "ctx_seed"
 };
@@ -1171,7 +1194,10 @@ export function hydrateState(candidate: AppState | undefined): AppState {
   const imageProfile = {
     ...seedState.imageProfile,
     ...candidate.imageProfile,
-    model: resolveNovelAiModelName(novelAi.modelPreset, candidate.imageProfile?.model ?? seedState.imageProfile.model)
+    model: resolveNovelAiModelName(novelAi.modelPreset, candidate.imageProfile?.model ?? seedState.imageProfile.model),
+    // A simulation saved before photoreal existed has no routing and resolves to NovelAI-only — what it was drawn
+    // with. A malformed one is repaired the same way: unknown categories dropped, `explicit` never routable.
+    backendRouting: resolveImageBackendRouting(candidate.imageProfile ?? seedState.imageProfile)
   };
   const imageTagLlm = {
     ...seedState.imageTagLlm,
@@ -1226,7 +1252,8 @@ export function hydrateState(candidate: AppState | undefined): AppState {
       ...seedState.llm,
       ...candidate.llm
     },
-    novelAi
+    novelAi,
+    photoreal: normalizePhotorealSettings(candidate.photoreal)
   };
 
   const stateWithProgressRuns = {
@@ -1414,30 +1441,43 @@ function normalizeContextPacks(packs: AppState["contextPacks"] | undefined): App
 }
 
 function normalizeImageAssets(assets: AppState["imageAssets"] | undefined): AppState["imageAssets"] {
-  return (assets ?? []).map((asset) => ({
+  return (assets ?? []).map(({ backend, sceneCategory, ...asset }) => ({
     ...asset,
     characterIds: Array.isArray(asset.characterIds) ? asset.characterIds : [],
     tags: Array.isArray(asset.tags) ? asset.tags : [],
     reuseTags: Array.isArray(asset.reuseTags) ? asset.reuseTags : undefined,
-    palette: Array.isArray(asset.palette) && asset.palette.length === 3 ? asset.palette : ["#f4f0e8", "#d7c7aa", "#5f5046"]
+    palette: Array.isArray(asset.palette) && asset.palette.length === 3 ? asset.palette : ["#f4f0e8", "#d7c7aa", "#5f5046"],
+    // Absent means NovelAI (everything drawn before photoreal existed). An unknown value is dropped rather than
+    // kept, so it reads as NovelAI too instead of as a renderer nothing can run or reuse against.
+    ...(isImageBackendId(backend) ? { backend } : {}),
+    ...(isImageSceneCategory(sceneCategory) ? { sceneCategory } : {})
   }));
 }
 
 function normalizeVisualProfiles(profiles: AppState["visualProfiles"] | undefined): AppState["visualProfiles"] {
   const source = profiles?.length ? profiles : seedState.visualProfiles;
-  return source.map((profile) => ({
-    ...profile,
-    defaultOutfitPrompt: profile.defaultOutfitPrompt ?? defaultOutfitPrompt,
-    outfitPrompts:
-      profile.outfitPrompts && typeof profile.outfitPrompts === "object" && !Array.isArray(profile.outfitPrompts)
-        ? profile.outfitPrompts
-        : defaultOutfitPrompts,
-    expressionPrompts:
-      profile.expressionPrompts && typeof profile.expressionPrompts === "object" && !Array.isArray(profile.expressionPrompts)
-        ? profile.expressionPrompts
-        : defaultExpressionPrompts,
-    referenceImageAssetIds: Array.isArray(profile.referenceImageAssetIds) ? profile.referenceImageAssetIds : []
-  }));
+  return source.map(({ photorealPrompt, photorealNegativePrompt, profileImages, ...profile }) => {
+    // Whitelisted rather than spread: a profile image is an object-store reference, and anything else riding on
+    // it (a candidate's data URL) would be written into state.json and the browser cache on every save.
+    const shareableProfileImages = toShareableCharacterProfileImages(profileImages);
+    return {
+      ...profile,
+      defaultOutfitPrompt: profile.defaultOutfitPrompt ?? defaultOutfitPrompt,
+      outfitPrompts:
+        profile.outfitPrompts && typeof profile.outfitPrompts === "object" && !Array.isArray(profile.outfitPrompts)
+          ? profile.outfitPrompts
+          : defaultOutfitPrompts,
+      expressionPrompts:
+        profile.expressionPrompts && typeof profile.expressionPrompts === "object" && !Array.isArray(profile.expressionPrompts)
+          ? profile.expressionPrompts
+          : defaultExpressionPrompts,
+      referenceImageAssetIds: Array.isArray(profile.referenceImageAssetIds) ? profile.referenceImageAssetIds : [],
+      // Kept verbatim (no trim): this runs on every write, including each keystroke in the appearance field.
+      ...(typeof photorealPrompt === "string" ? { photorealPrompt } : {}),
+      ...(typeof photorealNegativePrompt === "string" ? { photorealNegativePrompt } : {}),
+      ...(shareableProfileImages ? { profileImages: shareableProfileImages } : {})
+    };
+  });
 }
 
 function normalizeImageScenePresets(presets: AppState["imageScenePresets"] | undefined, simulationId: string): AppState["imageScenePresets"] {
@@ -1552,16 +1592,73 @@ function normalizeScenePresetExampleFiles(value: unknown, legacy: unknown, path:
 }
 
 function normalizeImageJobs(jobs: AppState["imageJobs"] | undefined): AppState["imageJobs"] {
-  return (jobs ?? []).map((job) => ({
-    ...job,
-    providerPayload:
-      job.providerPayload && typeof job.providerPayload === "object" && !Array.isArray(job.providerPayload)
-        ? job.providerPayload
-        : {},
-    assetIds: Array.isArray(job.assetIds) ? job.assetIds : [],
-    contextNodeIds: Array.isArray(job.contextNodeIds) ? job.contextNodeIds : [],
-    policyWarnings: Array.isArray(job.policyWarnings) ? job.policyWarnings : undefined
-  }));
+  return (jobs ?? []).map(({ backend, routing, ...job }) => {
+    const normalizedRouting = normalizeImageBackendDecision(routing);
+    return {
+      ...job,
+      providerPayload:
+        job.providerPayload && typeof job.providerPayload === "object" && !Array.isArray(job.providerPayload)
+          ? job.providerPayload
+          : {},
+      assetIds: Array.isArray(job.assetIds) ? job.assetIds : [],
+      contextNodeIds: Array.isArray(job.contextNodeIds) ? job.contextNodeIds : [],
+      policyWarnings: Array.isArray(job.policyWarnings) ? job.policyWarnings : undefined,
+      // Absent means NovelAI, as for assets. Execution dispatches on this field, so an unknown value must not survive
+      // to reach a backend switch that has no case for it.
+      ...(isImageBackendId(backend) ? { backend } : {}),
+      ...(normalizedRouting ? { routing: normalizedRouting } : {})
+    };
+  });
+}
+
+function isImageBackendId(value: unknown): value is ImageBackendId {
+  return value === "novelai" || value === "photoreal";
+}
+
+function isImageBackendRoutingMode(value: unknown): value is ImageBackendRoutingMode {
+  return value === "novelai" || value === "mixed" || value === "photoreal";
+}
+
+// Its own exhaustive list rather than the routing UI's options: those describe what the user can pick, and if the
+// unpickable `explicit` row were ever dropped from them, hydration would strip the category off every locked cut.
+const IMAGE_SCENE_CATEGORIES: Record<ImageSceneCategory, true> = {
+  explicit: true,
+  action: true,
+  fantasy: true,
+  romance: true,
+  group: true,
+  portrait: true,
+  full_body: true,
+  scenery: true,
+  object: true
+};
+
+function isImageSceneCategory(value: unknown): value is ImageSceneCategory {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(IMAGE_SCENE_CATEGORIES, value);
+}
+
+// The router's decision is stored first-class on the job because stored runs drop providerPayload. It is kept only
+// when its backend, category and mode are all known — a half-valid decision would mislabel the cut in the inspector
+// and send "regenerate with the same backend" somewhere else. reason/signals are explanatory and are coerced.
+function normalizeImageBackendDecision(candidate: unknown): ImageBackendDecision | undefined {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return undefined;
+  }
+
+  const decision = candidate as Partial<Record<keyof ImageBackendDecision, unknown>>;
+  if (!isImageBackendId(decision.backend) || !isImageSceneCategory(decision.category) || !isImageBackendRoutingMode(decision.mode)) {
+    return undefined;
+  }
+
+  return {
+    backend: decision.backend,
+    category: decision.category,
+    mode: decision.mode,
+    reason: typeof decision.reason === "string" ? decision.reason : "",
+    ...(typeof decision.locked === "boolean" ? { locked: decision.locked } : {}),
+    ...(typeof decision.fallback === "boolean" ? { fallback: decision.fallback } : {}),
+    signals: Array.isArray(decision.signals) ? decision.signals.filter((signal): signal is string => typeof signal === "string") : []
+  };
 }
 
 function normalizeTurnTraces(traces: AppState["turnTraces"] | undefined): AppState["turnTraces"] {
@@ -1617,6 +1714,7 @@ export interface SimulationDraft {
   relationshipMap: RelationshipMapSettings;
   llm: LlmApiSettings;
   novelAi: NovelAiApiSettings;
+  photoreal: PhotorealApiSettings;
 }
 
 function createDefaultEvaluationScenarios(simulationId: string): EvaluationScenario[] {
@@ -1690,6 +1788,23 @@ function reserveImageScenePresetId(candidateId: string | undefined, fallbackPref
 }
 
 export function createStateFromDraft(draft: SimulationDraft): AppState {
+  return buildStateFromDraft(draft, { keepDraftCharacterIds: false });
+}
+
+/**
+ * A throwaway state for working with a draft before it is a simulation: the creation screen's profile-image studio
+ * test-generates against it. Built exactly like createStateFromDraft, except that the characters keep their DRAFT
+ * ids. The real ids are only minted when the draft is created, and the panel names the character it is editing by
+ * its draft id, so a preview state with new ids would make every character look unknown to the planner.
+ *
+ * Never saved and never made the active run. It gets a fresh simulation id like any new state, and whatever is
+ * generated against it stays with the caller.
+ */
+export function createDraftPreviewState(draft: SimulationDraft): AppState {
+  return buildStateFromDraft(draft, { keepDraftCharacterIds: true });
+}
+
+function buildStateFromDraft(draft: SimulationDraft, options: { keepDraftCharacterIds: boolean }): AppState {
   const simulationId = `sim_${Date.now().toString(36)}`;
   const sessionId = `session_${Date.now().toString(36)}`;
   const progressRunId = createDefaultProgressRunId(sessionId);
@@ -1713,7 +1828,16 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
             defaultSafetyLevel: "safe" as const
           }
         ];
-  const characterIdMap = new Map(draftCharacters.map((character, index) => [character.id, index === 0 ? `char_${Date.now().toString(36)}` : `char_${Date.now().toString(36)}_${index}`]));
+  const characterIdMap = new Map(
+    draftCharacters.map((character, index) => [
+      character.id,
+      options.keepDraftCharacterIds
+        ? character.id
+        : index === 0
+          ? `char_${Date.now().toString(36)}`
+          : `char_${Date.now().toString(36)}_${index}`
+    ])
+  );
   const mainCharacter = draftCharacters[0];
   const mainCharacterId = characterIdMap.get(mainCharacter.id) ?? `char_${Date.now().toString(36)}`;
   const characterName = mainCharacter.name.trim() || draft.characterName.trim() || "Main Character";
@@ -1828,7 +1952,13 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
         outfitPrompts: character.outfitPrompts ?? defaultOutfitPrompts,
         expressionPrompts: character.expressionPrompts ?? defaultExpressionPrompts,
         referenceImageAssetIds: [],
-        defaultSafetyLevel: character.defaultSafetyLevel
+        defaultSafetyLevel: character.defaultSafetyLevel,
+        // Edited per draft character in the creation screen; they land on the profile of the character's NEW id.
+        // Profile image object keys stay as they are: they were persisted under the draft's provisional simulation
+        // id and still resolve there. hydrateState below drops whatever is malformed.
+        photorealPrompt: character.photorealPrompt,
+        photorealNegativePrompt: character.photorealNegativePrompt,
+        profileImages: character.profileImages
       }
     ];
   });
@@ -1900,6 +2030,8 @@ export function createStateFromDraft(draft: SimulationDraft): AppState {
     relationshipMap: draft.relationshipMap ?? defaultRelationshipMapSettings,
     llm: toShareableLlmSettings(draft.llm),
     novelAi: toShareableNovelAiSettings(draft.novelAi),
+    // Normalized here too: a draft from a builder that predates photoreal has no `photoreal` at all.
+    photoreal: normalizePhotorealSettings(draft.photoreal),
     selectedModuleId: mainModuleId,
     selectedContextPackId: undefined
   });

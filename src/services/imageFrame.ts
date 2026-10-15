@@ -77,7 +77,7 @@ const REGION_TAG_PATTERNS: Array<{ region: ImageCueBodyRegion; pattern: RegExp }
   {
     region: "hips",
     pattern:
-      /\b(?:skirt|shorts|pants|trousers|jeans|leggings|panties|underwear|thong|briefs|hakama|belt|waist|hips?|navel|stomach|abs|abdomen|groin|crotch|buttocks|ass|butt|pubic|vagina|pussy|penis|anus|garter ?belt)\b/iu
+      /\b(?:skirt|shorts|pants|trousers|jeans|skinnies|skinny jeans|jeggings|joggers|sweatpants|slacks|chinos|leggings|panties|underwear|thong|briefs|hakama|belt|waist|hips?|navel|stomach|abs|abdomen|groin|crotch|buttocks|ass|butt|pubic|vagina|pussy|penis|anus|garter ?belt)\b/iu
   },
   {
     region: "legs",
@@ -102,7 +102,7 @@ const FACE_DEPENDENT_PATTERN =
  * deliberately (a close-up that deliberately includes a bloodied arm), so those are left alone.
  */
 const GARMENT_TAG_PATTERN =
-  /\b(?:hat|cap|beret|helmet|hood|headband|hairband|tiara|crown|veil|glasses|sunglasses|goggles|earrings?|necklace|choker|scarf|shirt|blouse|t-?shirt|sweater|hoodie|jacket|coat|blazer|vest|cardigan|uniform|kimono|yukata|robe|dress|gown|apron|bra|camisole|tank ?top|crop top|corset|necktie|bowtie|tie|suspenders|skirt|shorts|pants|trousers|jeans|leggings|panties|underwear|thong|briefs|hakama|belt|garter ?belt|thighhighs?|thigh-?highs|stockings|pantyhose|tights|socks|kneehighs?|shoes?|boots?|sneakers|heels|sandals|loafers|slippers|footwear)\b/iu;
+  /\b(?:hat|cap|beret|helmet|hood|headband|hairband|tiara|crown|veil|glasses|sunglasses|goggles|earrings?|necklace|choker|scarf|shirt|blouse|t-?shirt|sweater|hoodie|jacket|coat|blazer|vest|cardigan|uniform|kimono|yukata|robe|dress|gown|apron|bra|camisole|tank ?top|crop top|corset|necktie|bowtie|tie|suspenders|skirt|shorts|pants|trousers|jeans|skinnies|skinny jeans|jeggings|joggers|sweatpants|slacks|chinos|leggings|panties|underwear|thong|briefs|hakama|belt|garter ?belt|thighhighs?|thigh-?highs|stockings|pantyhose|tights|socks|kneehighs?|shoes?|boots?|sneakers|heels|sandals|loafers|slippers|footwear)\b/iu;
 
 export function isGarmentTag(tag: string): boolean {
   return GARMENT_TAG_PATTERN.test(toLowerBare(tag));

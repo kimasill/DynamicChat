@@ -3,12 +3,32 @@ import { unzip } from "fflate";
 import type { AppState, ImageCue, NovelAiModelPreset } from "../types";
 import { getNovelAiEncodeVibeProxyUrl, getNovelAiGenerateProxyUrl } from "./dynamicChatApi";
 import { createImageUserRulesForContentRating, isAdultContentMode, resolveEffectiveImageSafetyLevel } from "./contentRating";
+import { bytesToBase64 } from "./imageReferences";
 import { resolveNovelAiModelName } from "./novelAiModels";
 
 interface NovelAiImageResult {
   dataUrls: string[];
   payload: Record<string, unknown>;
 }
+
+/**
+ * A character's NovelAI profile image as a Precise Reference: the letterboxed reference canvas
+ * (CharacterProfileImage.referenceObjectKey) plus the user's knobs from NovelAiApiSettings.characterReference*.
+ */
+export interface NovelAiCharacterReferenceInput {
+  /** Raw base64 of the reference canvas. A data URL prefix is tolerated and stripped. */
+  imageBase64: string;
+  /** 0-1, sent as director_reference_strength_values. */
+  strength: number;
+  /** 0-1, sent inverted as director_reference_secondary_strength_values. */
+  fidelity: number;
+  /** true → base_caption "character&style", false → "character". */
+  styleAware: boolean;
+}
+
+/** Fallbacks for a non-numeric knob, matching the documented defaults on NovelAiApiSettings. */
+const CHARACTER_REFERENCE_DEFAULT_STRENGTH = 0.85;
+const CHARACTER_REFERENCE_DEFAULT_FIDELITY = 1;
 
 /**
  * Hard ceiling for one NovelAI generation. Without it a request that never settles (a dropped connection, or
@@ -39,19 +59,24 @@ export async function generateNovelAiImages(input: {
   cue: ImageCue;
   count: number;
   signal?: AbortSignal;
+  characterReference?: NovelAiCharacterReferenceInput;
 }): Promise<NovelAiImageResult> {
   const { state } = input;
+  const payload = createNovelAiPayload(input);
+  // The reference canvas is a full PNG in base64. It has to reach NovelAI, but the payload returned from here
+  // is copied into job.providerPayload and asset.providerMetadata, and from there into state.json for every
+  // cut, so the returned copy only records how big it was.
+  const storedPayload = omitCharacterReferenceImages(payload);
   // Disabled / mock is a DRY RUN: the assembled payload is returned with no images so the prompt pipeline
   // (and the prompt-quality evals) can be inspected without calling the provider. Nothing downstream should
   // reach here expecting pixels — shouldPlanImageJob refuses to plan a job while NovelAI is off, and says so.
   if (!state.novelAi.enabled || state.novelAi.requestMode === "mock") {
     return {
       dataUrls: [],
-      payload: createNovelAiPayload(input)
+      payload: storedPayload
     };
   }
 
-  const payload = createNovelAiPayload(input);
   const endpoint =
     state.novelAi.requestMode === "proxy"
       ? state.novelAi.proxyUrl.trim() || getNovelAiGenerateProxyUrl()
@@ -72,7 +97,7 @@ export async function generateNovelAiImages(input: {
   // cause of an image "sometimes" not appearing. Authentication and prompt errors are NOT retried.
   for (let attempt = 1; attempt <= NOVELAI_MAX_ATTEMPTS; attempt += 1) {
     try {
-      return await requestNovelAiImages(endpoint, headers, body, payload, input.signal);
+      return await requestNovelAiImages(endpoint, headers, body, storedPayload, input.signal);
     } catch (error) {
       lastError = error;
       const retryable = error instanceof NovelAiRequestError ? error.retryable : isTransientNetworkError(error);
@@ -122,7 +147,7 @@ async function requestNovelAiImages(
 
   const mimeType = contentType.includes("image/") ? contentType.split(";")[0] : "image/png";
   return {
-    dataUrls: [await bytesToDataUrl(bytes, mimeType)],
+    dataUrls: [bytesToDataUrl(bytes, mimeType)],
     payload
   };
 }
@@ -190,8 +215,9 @@ export async function encodeNovelAiVibe(input: {
     body: JSON.stringify({
       image: stripImageDataUrlPrefix(input.image),
       model,
-      // NovelAI encode-vibe는 camelCase 필드를 사용한다.
-      informationExtracted: clampVibeValue(input.informationExtracted)
+      // The official encode-vibe schema spells this field information_extracted, snake_case like every other
+      // NovelAI image parameter. The camelCase key this used to send is not part of that schema.
+      information_extracted: clampVibeValue(input.informationExtracted)
     }),
     signal: input.signal
   });
@@ -211,6 +237,7 @@ function createNovelAiPayload(input: {
   negativePrompt: string;
   cue: ImageCue;
   count: number;
+  characterReference?: NovelAiCharacterReferenceInput;
 }): Record<string, unknown> {
   const { state } = input;
   const model = resolveNovelAiModelName(state.novelAi.modelPreset, state.imageProfile.model);
@@ -247,23 +274,33 @@ function createNovelAiPayload(input: {
     baseParameters.skip_cfg_above_sigma = getVarPlusSigma(state.novelAi.modelPreset);
   }
 
+  const characterReference = normalizeCharacterReference(input.characterReference);
+  const supportsCharacterReference = isNovelAiV45Model(model);
+  if (characterReference && !supportsCharacterReference) {
+    // Precise Reference exists only on V4.5. On any other model the cut is drawn without the face reference,
+    // and the payload records why so the inspector can explain a character that drifted.
+    baseParameters.dynamicchat_character_reference_skipped = "model";
+  }
+  const attachedReference = supportsCharacterReference ? characterReference : undefined;
+
   if (state.novelAi.vibeTransferEnabled) {
-    if (model.includes("nai-diffusion-4") || model.includes("nai-diffusion-5")) {
-      // v4/v4.5/v5는 encode-vibe로 사전 인코딩한 vibe만 받는다. information extracted는 인코딩 단계에 반영된다.
-      const references = state.novelAi.vibeTransferReferences.filter((reference) => reference.encodedVibe?.trim());
-      if (references.length > 0) {
-        baseParameters.reference_image_multiple = references.map((reference) => reference.encodedVibe!.trim());
-        baseParameters.reference_strength_multiple = references.map((reference) => clampVibeValue(reference.referenceStrength));
-      }
-    } else {
-      // v3는 원본 이미지와 information extracted를 직접 전송한다.
-      const references = state.novelAi.vibeTransferReferences.filter((reference) => stripImageDataUrlPrefix(reference.image));
-      if (references.length > 0) {
-        baseParameters.reference_image_multiple = references.map((reference) => stripImageDataUrlPrefix(reference.image));
-        baseParameters.reference_strength_multiple = references.map((reference) => clampVibeValue(reference.referenceStrength));
-        baseParameters.reference_information_extracted_multiple = references.map((reference) => clampVibeValue(reference.informationExtracted));
+    const vibeParameters = createVibeTransferParameters(state, model);
+    if (vibeParameters) {
+      if (isNovelAiV5Model(model)) {
+        // V5 rejects vibe transfer, so the arrays never go out to a V5 model.
+        baseParameters.dynamicchat_vibe_transfer_skipped = "model";
+      } else if (attachedReference) {
+        // NovelAI does not combine Vibe Transfer with Precise Reference in one request. The face reference is
+        // what keeps the character recognisable, so it wins and the vibes sit this cut out.
+        baseParameters.dynamicchat_vibe_transfer_skipped = "character_reference";
+      } else {
+        Object.assign(baseParameters, vibeParameters);
       }
     }
+  }
+
+  if (attachedReference) {
+    Object.assign(baseParameters, createCharacterReferenceParameters(attachedReference));
   }
 
   if (model.includes("nai-diffusion-4") || model.includes("nai-diffusion-5")) {
@@ -314,6 +351,103 @@ function createNovelAiPayload(input: {
   };
 }
 
+/** The vibe arrays this model family takes, or undefined when no reference is usable. */
+function createVibeTransferParameters(state: AppState, model: string): Record<string, unknown> | undefined {
+  if (model.includes("nai-diffusion-4") || model.includes("nai-diffusion-5")) {
+    // v4/v4.5/v5는 encode-vibe로 사전 인코딩한 vibe만 받는다. information extracted는 인코딩 단계에 반영된다.
+    const references = state.novelAi.vibeTransferReferences.filter((reference) => reference.encodedVibe?.trim());
+    if (references.length === 0) {
+      return undefined;
+    }
+    return {
+      reference_image_multiple: references.map((reference) => reference.encodedVibe!.trim()),
+      reference_strength_multiple: references.map((reference) => clampVibeValue(reference.referenceStrength))
+    };
+  }
+
+  // v3는 원본 이미지와 information extracted를 직접 전송한다.
+  const references = state.novelAi.vibeTransferReferences.filter((reference) => stripImageDataUrlPrefix(reference.image));
+  if (references.length === 0) {
+    return undefined;
+  }
+  return {
+    reference_image_multiple: references.map((reference) => stripImageDataUrlPrefix(reference.image)),
+    reference_strength_multiple: references.map((reference) => clampVibeValue(reference.referenceStrength)),
+    reference_information_extracted_multiple: references.map((reference) => clampVibeValue(reference.informationExtracted))
+  };
+}
+
+function isNovelAiV45Model(model: string): boolean {
+  return model === "nai-diffusion-4-5-full" || model === "nai-diffusion-4-5-curated";
+}
+
+function isNovelAiV5Model(model: string): boolean {
+  return model.startsWith("nai-diffusion-5");
+}
+
+function normalizeCharacterReference(reference?: NovelAiCharacterReferenceInput): NovelAiCharacterReferenceInput | undefined {
+  const imageBase64 = typeof reference?.imageBase64 === "string" ? stripImageDataUrlPrefix(reference.imageBase64) : "";
+  if (!reference || !imageBase64) {
+    return undefined;
+  }
+  return {
+    imageBase64,
+    // A NaN knob would otherwise clamp to 0 and silently send a reference with no effect while still costing Anlas.
+    strength: clampUnitOr(reference.strength, CHARACTER_REFERENCE_DEFAULT_STRENGTH),
+    fidelity: clampUnitOr(reference.fidelity, CHARACTER_REFERENCE_DEFAULT_FIDELITY),
+    styleAware: reference.styleAware === true
+  };
+}
+
+/**
+ * Precise Reference is five parallel arrays with one entry per reference image, so they must always stay the
+ * same length. information_extracted stays 1: Precise Reference has no such control, its knobs are strength
+ * and fidelity (sent inverted as the secondary strength).
+ */
+function createCharacterReferenceParameters(reference: NovelAiCharacterReferenceInput): Record<string, unknown> {
+  return {
+    director_reference_images: [reference.imageBase64],
+    director_reference_descriptions: [
+      {
+        caption: {
+          base_caption: reference.styleAware ? "character&style" : "character",
+          char_captions: []
+        },
+        legacy_uc: false
+      }
+    ],
+    director_reference_information_extracted: [1],
+    director_reference_strength_values: [reference.strength],
+    director_reference_secondary_strength_values: [roundToHundredths(1 - reference.fidelity)]
+  };
+}
+
+function omitCharacterReferenceImages(payload: Record<string, unknown>): Record<string, unknown> {
+  const parameters = payload.parameters;
+  if (!isRecord(parameters) || !Array.isArray(parameters.director_reference_images)) {
+    return payload;
+  }
+  return {
+    ...payload,
+    parameters: {
+      ...parameters,
+      director_reference_images: parameters.director_reference_images.map((image) =>
+        typeof image === "string" ? `<omitted:${countBase64Bytes(image)} bytes>` : image
+      )
+    }
+  };
+}
+
+function countBase64Bytes(base64: string): number {
+  const compact = base64.replace(/\s+/gu, "");
+  const padding = compact.endsWith("==") ? 2 : compact.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((compact.length * 3) / 4) - padding);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function resolveNovelAiCharacterPrompts(cue: ImageCue): NonNullable<ImageCue["characterPrompts"]> {
   const explicitPrompts = cue.characterPrompts?.filter((prompt) => prompt.prompt.trim()) ?? [];
   if (explicitPrompts.length > 0) {
@@ -362,6 +496,14 @@ function clampVibeValue(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
+function clampUnitOr(value: number, fallback: number): number {
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
+}
+
+function roundToHundredths(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 function getVarPlusSigma(preset: NovelAiModelPreset): number {
   return preset === "NAID5F" || preset === "NAID5C" || preset === "NAID5" || preset === "NAID4.5F" || preset === "NAID4.5C" ? 58 : 19;
 }
@@ -372,7 +514,7 @@ function normalizeApiToken(value: string): string {
 
 async function extractZipImages(bytes: Uint8Array): Promise<string[]> {
   const files = await unzipImages(bytes);
-  return Promise.all(Object.entries(files)
+  return Object.entries(files)
     .filter(([name]) => /\.(png|webp|jpg|jpeg)$/iu.test(name))
     .map(([name, data]) => {
       const mimeType = name.endsWith(".webp")
@@ -381,7 +523,7 @@ async function extractZipImages(bytes: Uint8Array): Promise<string[]> {
           ? "image/jpeg"
           : "image/png";
       return bytesToDataUrl(data, mimeType);
-    }));
+    });
 }
 
 function unzipImages(bytes: Uint8Array): Promise<Record<string, Uint8Array>> {
@@ -401,33 +543,8 @@ function looksLikeZip(bytes: Uint8Array): boolean {
   return bytes[0] === 0x50 && bytes[1] === 0x4b;
 }
 
-function bytesToBase64(bytes: Uint8Array): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const arrayBuffer = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(arrayBuffer).set(bytes);
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      const commaIndex = result.indexOf(",");
-      commaIndex >= 0
-        ? resolve(result.slice(commaIndex + 1))
-        : reject(new Error("NovelAI encode-vibe 응답을 base64로 변환하지 못했습니다."));
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("NovelAI encode-vibe 응답을 읽지 못했습니다."));
-    reader.readAsDataURL(new Blob([arrayBuffer], { type: "application/octet-stream" }));
-  });
-}
-
-function bytesToDataUrl(bytes: Uint8Array, mimeType: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const arrayBuffer = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(arrayBuffer).set(bytes);
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      result ? resolve(result) : reject(new Error("NovelAI image payload could not be converted to a data URL."));
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("NovelAI image payload could not be read."));
-    reader.readAsDataURL(new Blob([arrayBuffer], { type: mimeType }));
-  });
+// Same bytes out as FileReader.readAsDataURL, but this also runs in Node, where FileReader does not exist and
+// where the evals exercise the real request path against stub servers.
+function bytesToDataUrl(bytes: Uint8Array, mimeType: string): string {
+  return `data:${mimeType};base64,${bytesToBase64(bytes)}`;
 }

@@ -9,6 +9,11 @@ const viteBin = path.join(workspaceRoot, "node_modules", "vite", "bin", "vite.js
 const neuralMapRoot = path.resolve(process.env.NEURALMAP_ROOT ?? path.join(workspaceRoot, "..", "NeuralMap"));
 const neuralMapHealthUrl = process.env.NEURALMAP_HEALTH_URL ?? "http://127.0.0.1:4317/health";
 const shouldStartNeuralMap = process.env.DYNAMICCHAT_START_NEURALMAP !== "0";
+// Photoreal images need a local ComfyUI. It is started only when told where the portable install lives
+// (DYNAMICCHAT_COMFYUI_DIR = the folder holding python_embeded/ and ComfyUI/), because a ComfyUI already running —
+// ComfyUI Desktop, or one started by hand — must not get a second copy fighting it for the GPU.
+const comfyUiDir = process.env.DYNAMICCHAT_COMFYUI_DIR ? path.resolve(process.env.DYNAMICCHAT_COMFYUI_DIR) : undefined;
+const comfyUiUrl = process.env.DYNAMICCHAT_COMFYUI_URL ?? "http://127.0.0.1:8188";
 
 const children = [];
 
@@ -16,7 +21,41 @@ let shuttingDown = false;
 
 registerChild(start("api", process.execPath, [path.join(workspaceRoot, "server", "dynamicchat-server.mjs")]));
 await startNeuralMapIfNeeded();
+await startComfyUiIfConfigured();
 registerChild(start("web", process.execPath, [viteBin, "--host", "127.0.0.1"]));
+
+async function startComfyUiIfConfigured() {
+  if (await isHealthy(`${comfyUiUrl.replace(/\/+$/u, "")}/system_stats`)) {
+    console.log(`[comfyui] existing server detected at ${comfyUiUrl}`);
+    return;
+  }
+  if (!comfyUiDir) {
+    // Not an error: NovelAI-only setups never need it, and the settings screen explains how to connect one.
+    return;
+  }
+  const python = path.join(comfyUiDir, "python_embeded", process.platform === "win32" ? "python.exe" : "python");
+  const main = path.join(comfyUiDir, "ComfyUI", "main.py");
+  if (!existsSync(python) || !existsSync(main)) {
+    console.log(`[comfyui] DYNAMICCHAT_COMFYUI_DIR=${comfyUiDir} has no python_embeded/ + ComfyUI/main.py; skipping`);
+    return;
+  }
+  const port = (() => {
+    try {
+      return new URL(comfyUiUrl).port || "8188";
+    } catch {
+      return "8188";
+    }
+  })();
+  // Loopback only and no CORS header: the browser never talks to ComfyUI directly, the API relay does.
+  registerChild(
+    start(
+      "comfyui",
+      python,
+      ["-s", main, "--windows-standalone-build", "--disable-auto-launch", "--listen", "127.0.0.1", "--port", port, "--preview-method", "none"],
+      { cwd: comfyUiDir, optional: true }
+    )
+  );
+}
 
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);

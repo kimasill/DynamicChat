@@ -1,4 +1,5 @@
 import type { AppState } from "../types";
+import { DEFAULT_PHOTOREAL_SETTINGS } from "../services/runtimeApiSettings";
 
 export const womanLifeSeedState: AppState = {
   "simulation": {
@@ -4954,6 +4955,8 @@ export const womanLifeSeedState: AppState = {
     "vibeTransferReferences": [],
     "verificationMessage": ""
   },
+  // Saved before photoreal existed, so it starts from the defaults (off) like any other older simulation.
+  "photoreal": { ...DEFAULT_PHOTOREAL_SETTINGS, "modelFiles": {} },
   "selectedModuleId": "module_main_mtbn49ch",
   "selectedContextPackId": "ctx_seed",
   "updatedAt": "2026-08-27T16:06:02.766Z"

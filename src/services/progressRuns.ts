@@ -208,7 +208,7 @@ function uniqueIds(values: Array<string | undefined>): string[] {
 /**
  * Returns a slimmed copy of a ProgressRun suitable for long-term storage.
  *
- * Removes heavy per-run data that accumulates rapidly (NAI provider metadata /
+ * Removes heavy per-run data that accumulates rapidly (provider metadata /
  * request payloads) and clears debug-only trace arrays. Core content fields
  * (messages, memoryEvents, handoffs, imageAssets with objectKey, imageJobs with
  * assetIds, session IDs, timestamps) are preserved so the run remains usable
@@ -223,11 +223,15 @@ export function slimProgressRunForStorage(run: SimulationProgressRun): Simulatio
     sidecarTraces: [],
     turnTraces: [],
     promptModuleUsages: [],
-    // Strip NAI response metadata (~151 KB/asset). objectKey / mimeType / tags
-    // / palette etc. are preserved for image display and vibe reuse.
+    // Strip provider response metadata (~151 KB/asset for NovelAI). objectKey / mimeType / tags
+    // / palette etc. are preserved for image display and vibe reuse, and so are `backend` /
+    // `sceneCategory`: reuse only matches an asset drawn by the same backend, and an asset that
+    // lost its backend here would read as NovelAI and be offered for anime cuts.
     imageAssets: run.imageAssets.map(({ providerMetadata: _pm, ...rest }) => rest),
-    // Strip NAI request payload (~89 KB/job). assetIds / status / prompt etc.
-    // are preserved for asset linkage and display.
+    // Strip the provider request payload (~89 KB/job for NovelAI; the whole ComfyUI graph for
+    // photoreal). assetIds / status / prompt etc. are preserved for asset linkage and display.
+    // `backend` and `routing` are top-level precisely because the payload — which also names the
+    // provider — disappears here: without them a stored photoreal job would regenerate on NovelAI.
     imageJobs: run.imageJobs.map((job): ImageGenerationJob => ({ ...job, providerPayload: {} }))
   };
 }

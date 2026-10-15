@@ -21,7 +21,27 @@
  *
  * Env: OSS_EVAL_BASE_URL, OSS_EVAL_MODEL, OSS_EVAL_PROVIDER, OSS_EVAL_CONTEXT, OSS_EVAL_SEED (demo|womanlife),
  *      E2E_TURNS, E2E_CADENCES (comma list), E2E_SKIP_DISPATCH=1 to stay off the network.
+ *
+ * Photoreal leg (opt-in). E2E_PHOTOREAL=mixed|photoreal turns the photoreal backend on with that routing mode, so
+ * cuts split between NovelAI and the local ComfyUI the way the router decides. The per-job NovelAI assertions then
+ * apply to NovelAI jobs only; photoreal jobs are held to their own contract (English prose, no NovelAI tokens, a
+ * camera sentence when the cut has a frame, every planned face reference named in the prompt).
+ *
+ *   E2E_COMFYUI_URL       ComfyUI base URL (default http://127.0.0.1:8188)
+ *   E2E_RELAY_URL         DynamicChat relay (default http://127.0.0.1:8788/photoreal/comfyui — run `npm run api`)
+ *   E2E_PHOTOREAL_DISPATCH=all|first
+ *                         actually render photoreal jobs through the relay: every one, or the first of each turn.
+ *                         Turns and renders share one localGpuCoordinator, so the local LLM and the photo model
+ *                         hand the GPU over instead of spilling. Each image is written to E2E_IMAGE_DIR (default
+ *                         <tmp>/dynamicchat-e2e-images) as <cadence>_<turn>_<job>_<category>.png with a .txt beside
+ *                         it holding the prompt. SKIPs (not fails) when the relay or ComfyUI is not answering.
+ *                         Not affected by E2E_SKIP_DISPATCH, which only keeps the NovelAI leg off novelai.net.
+ *
+ *   E2E_PHOTOREAL=mixed E2E_PHOTOREAL_DISPATCH=first OSS_EVAL_MODEL=qwen3:14b node server/end-to-end-run-eval.mjs
  */
+import { mkdir, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createServer } from "vite";
 
 const baseUrl = process.env.OSS_EVAL_BASE_URL ?? "http://127.0.0.1:11434/v1";
@@ -33,6 +53,11 @@ const seedName = process.env.OSS_EVAL_SEED ?? "demo";
 const turnsPerCadence = Number(process.env.E2E_TURNS ?? 1);
 const cadences = (process.env.E2E_CADENCES ?? "balanced,rich,image_progression").split(",").map((c) => c.trim()).filter(Boolean);
 const skipDispatch = process.env.E2E_SKIP_DISPATCH === "1";
+const photorealMode = ["mixed", "photoreal"].includes(process.env.E2E_PHOTOREAL ?? "") ? process.env.E2E_PHOTOREAL : undefined;
+const comfyUiUrl = process.env.E2E_COMFYUI_URL ?? "http://127.0.0.1:8188";
+const relayUrl = process.env.E2E_RELAY_URL ?? "http://127.0.0.1:8788/photoreal/comfyui";
+const photorealDispatchMode = ["all", "first"].includes(process.env.E2E_PHOTOREAL_DISPATCH ?? "") ? process.env.E2E_PHOTOREAL_DISPATCH : undefined;
+const imageDir = process.env.E2E_IMAGE_DIR ?? path.join(os.tmpdir(), "dynamicchat-e2e-images");
 
 try {
   const probe = await fetch(`${baseUrl}/models`, {
@@ -60,6 +85,15 @@ const { executeImageJob } = await vite.ssrLoadModule("/src/services/imageOrchest
 // hand-written "footwear" regex got this wrong first time: thighhighs, stockings and socks are LEG
 // garments, so a cowboy shot — which shows legs but not feet — keeps them correctly.
 const { readTagBodyRegion, isGarmentTag } = await vite.ssrLoadModule("/src/services/imageFrame.ts");
+const { DEFAULT_PHOTOREAL_CATEGORIES } = await vite.ssrLoadModule("/src/services/imageBackendRouting.ts");
+const { PHOTOREAL_WORKFLOW_PRESETS } = await vite.ssrLoadModule("/src/services/comfyWorkflows.ts");
+const { freeComfyUiMemory, probeComfyUi } = await vite.ssrLoadModule("/src/services/comfyUiClient.ts");
+const { createLocalGpuCoordinator } = await vite.ssrLoadModule("/src/services/localGpuCoordinator.ts");
+// One coordinator for the whole run, as in the app: the lock only means something if every turn and every render
+// queue on the same instance. It is a pass-through unless the LLM and ComfyUI are both on this machine.
+const localGpu = createLocalGpuCoordinator({
+  onHandoff: (event) => console.log(`  [GPU] ${event.from} → ${event.to}: ${event.detail}`)
+});
 
 const activeSeed = seedName === "womanlife" ? womanLifeSeedState : seedState;
 const base = hydrateState(structuredClone(activeSeed));
@@ -88,12 +122,27 @@ function freshState(cadence) {
     neuralMap: { ...base.neuralMap, enabled: false },
     // enabled so jobs are planned; `direct` with no token so the dispatch leg reaches the real endpoint.
     novelAi: { ...base.novelAi, enabled: true, requestMode: "direct", apiKey: "", modelPreset: "NAID4.5C" },
+    // The photoreal leg only when asked for: without E2E_PHOTOREAL the seed's routing (NovelAI only) stands and
+    // the run is exactly the NovelAI-only chain this eval was written for.
+    ...(photorealMode
+      ? {
+          photoreal: {
+            ...base.photoreal,
+            enabled: true,
+            requestMode: "proxy",
+            baseUrl: comfyUiUrl,
+            proxyUrl: relayUrl,
+            vramHandoff: "auto"
+          }
+        }
+      : {}),
     imageProfile: {
       ...base.imageProfile,
       enabled: true,
       triggerMode: "realtime_auto",
       generationCadence: cadence,
-      cooldownTurns: 0
+      cooldownTurns: 0,
+      ...(photorealMode ? { backendRouting: { mode: photorealMode, photorealCategories: [...DEFAULT_PHOTOREAL_CATEGORIES] } } : {})
     }
   });
 }
@@ -110,8 +159,25 @@ const CADENCE_FLOOR = { image_progression: 10, paragraph: 6, rich: 2, balanced: 
 
 const SHOT_TAG = /close-?up|face focus|upper body|cowboy shot|full body|wide shot|portrait/iu;
 const SUBJECT_TAG = /\b(?:1girl|1boy|\dgirls|\dboys|solo)\b/iu;
+// What a photo prompt must never carry: NovelAI's quality/artist/rating vocabulary and its weight syntax.
+const NAI_TOKEN = /masterpiece|best quality|very aesthetic|absurdres|\bartist:|\byear \d{4}\b|\brating:|score_\d|::|[{}[\]]/iu;
 
 let dispatched = null;
+
+// Probed once, up front: a relay or ComfyUI that is not running is a SKIP for the render leg, never a failure of
+// the planning checks that do not need it. Independent of E2E_SKIP_DISPATCH, which keeps the run off novelai.net:
+// the relay and ComfyUI are on this machine, and asking for a render with E2E_PHOTOREAL_DISPATCH is explicit.
+let photorealDispatch = Boolean(photorealMode && photorealDispatchMode);
+if (photorealDispatch) {
+  const probe = await probeComfyUi(freshState(cadences[0] ?? "balanced"));
+  if (probe.ok) {
+    console.log(`실사 디스패치: ${photorealDispatchMode} — ${probe.message} (relay ${relayUrl}, 저장 위치 ${imageDir})`);
+  } else {
+    console.log(`SKIP 실사 디스패치: ${probe.message}`);
+    photorealDispatch = false;
+  }
+}
+const photorealStats = { planned: 0, dispatched: 0, completed: 0 };
 
 // Frame declaration is the MODEL's contribution and varies run to run, so it is reported as a rate
 // with a floor rather than asserted per cut — a hard assert would make the eval flaky against
@@ -128,7 +194,10 @@ for (const cadence of cadences) {
     const startedAt = Date.now();
     let turn;
     try {
-      turn = await runSimulationTurn(state, userText, false, { deferImagePlanning: true, deferMemoryIngest: true });
+      // Through the GPU lock: after a photoreal render this frees ComfyUI's VRAM before the local LLM reloads.
+      turn = await localGpu.run("llm", state, () =>
+        runSimulationTurn(state, userText, false, { deferImagePlanning: true, deferMemoryIngest: true })
+      );
     } catch (error) {
       check(cadence, false, `턴 ${index + 1} 실행`, error instanceof Error ? error.message : String(error));
       continue;
@@ -196,6 +265,18 @@ for (const cadence of cadences) {
       const frame = job.providerPayload?.cue?.frame;
       const label = `턴 ${index + 1} 작업 ${jobIndex + 1}`;
 
+      // The frame is the MODEL's declaration on the cue, so it is counted for every cut, whichever backend draws it.
+      frameStats.total += 1;
+      if (frame?.shot) frameStats.declared += 1;
+
+      // A photoreal cut's prompt is English prose, not tags: the tag assertions below would fail it for being
+      // exactly what it should be. It is held to its own contract instead.
+      if (job.backend === "photoreal") {
+        photorealStats.planned += 1;
+        checkPhotorealJob(cadence, label, job, frame);
+        continue;
+      }
+
       check(cadence, SHOT_TAG.test(job.prompt ?? ""), `${label}: 구도 태그 존재`, (job.prompt ?? "").slice(0, 60));
       check(cadence, SUBJECT_TAG.test(composed), `${label}: 피사체 수 태그 존재`);
       check(cadence, !/[가-힣]/u.test(composed), `${label}: 프롬프트에 한국어 없음`);
@@ -203,8 +284,6 @@ for (const cadence of cadences) {
       // `frame`, resolveImageCueFrame tries to infer one from the cut's own tags — and the cuts that
       // lack a frame also lack any composition tag (pure scene tags), so there is nothing to infer
       // and no code defect. The cost is that region gating is skipped for that one cut.
-      frameStats.total += 1;
-      if (frame?.shot) frameStats.declared += 1;
 
       const named = (job.providerPayload?.characterPrompts ?? []).filter((e) => e.characterId);
       const showsHead = (frame?.visibleRegions ?? ["head"]).includes("head");
@@ -243,7 +322,17 @@ for (const cadence of cadences) {
       }
     }
 
-    if (!dispatched && jobs.length) dispatched = { state: hydrateState(nextState), job: jobs[0] };
+    // The NovelAI leg below needs a NovelAI job; with photoreal routing on, the first job may be a photo.
+    const firstNovelAiJob = jobs.find((job) => (job.backend ?? "novelai") === "novelai");
+    if (!dispatched && firstNovelAiJob) dispatched = { state: hydrateState(nextState), job: firstNovelAiJob };
+
+    if (photorealDispatch) {
+      const photorealJobs = jobs.filter((job) => job.backend === "photoreal");
+      const toRender = photorealDispatchMode === "all" ? photorealJobs : photorealJobs.slice(0, 1);
+      for (const job of toRender) {
+        await renderPhotorealJob(hydrateState(nextState), job, { cadence, turn: index + 1, jobNumber: jobs.indexOf(job) + 1 });
+      }
+    }
     state = hydrateState(nextState);
   }
 
@@ -263,6 +352,9 @@ for (const cadence of cadences) {
 console.log(`\n────────── 큐 → NovelAI 호출 ──────────`);
 if (skipDispatch) {
   console.log("  E2E_SKIP_DISPATCH=1 — 네트워크 호출 건너뜀");
+} else if (!dispatched && photorealMode) {
+  // In photoreal routing only locked cuts stay on NovelAI, and a run without one has nothing to send there.
+  console.log(`  SKIP: E2E_PHOTOREAL=${photorealMode} 에서 NovelAI로 라우팅된 컷이 없어 NovelAI 호출 구간을 건너뜀`);
 } else if (!dispatched) {
   check("dispatch", false, "디스패치할 작업이 없음");
 } else {
@@ -287,9 +379,108 @@ if (skipDispatch) {
   check("dispatch", result.assets.length === 0, "이미지 자산은 생성되지 않았다 (토큰이 없으므로)");
 }
 
+if (photorealMode) {
+  console.log(`\n────────── 실사 (${photorealMode}) ──────────`);
+  console.log(
+    `  계획된 실사 컷 ${photorealStats.planned}개` +
+      (photorealDispatch
+        ? `, 렌더 ${photorealStats.completed}/${photorealStats.dispatched} 완료 → ${imageDir}`
+        : photorealDispatchMode
+          ? " (렌더 건너뜀)"
+          : " (E2E_PHOTOREAL_DISPATCH 없음 — 렌더하지 않음)")
+  );
+  if (photorealDispatch && photorealStats.dispatched === 0) {
+    console.log("  (이번 실행에서 실사로 라우팅된 컷이 없었습니다 — 렌더 구간은 검증되지 않았습니다.)");
+  }
+  if (photorealStats.dispatched > 0) {
+    // The run ends on a render, and ComfyUI keeps the model (~13 GB) resident until told otherwise; leave the card
+    // as the run found it rather than starving whatever uses the local LLM next.
+    await freeComfyUiMemory(freshState(cadences[0] ?? "balanced"));
+  }
+}
+
 await vite.close();
 
 const failures = checks.filter((c) => !c.ok);
 console.log("");
 console.log(`End-to-end run checks: ${checks.length - failures.length} passed, ${failures.length} failures`);
 if (failures.length) process.exitCode = 1;
+
+/**
+ * The photoreal job contract. The prompt was translated from the same composed plan NovelAI would have received,
+ * so what is checked is the translation: prose a photo model can read, nothing that only means something to an
+ * anime tag model, a camera sentence for a cut whose crop was decided, and every planned face reference named.
+ */
+function checkPhotorealJob(cadence, label, job, frame) {
+  const prompt = job.prompt ?? "";
+  const payload = job.providerPayload ?? {};
+  check(cadence, prompt.trim().length > 0 && !/[가-힣]/u.test(prompt), `${label} [실사]: 영어 프롬프트 (한국어 없음)`, prompt.slice(0, 80));
+  check(cadence, !NAI_TOKEN.test(prompt), `${label} [실사]: NovelAI 전용 토큰 없음`, prompt.match(NAI_TOKEN)?.[0]);
+  if (frame?.shot) {
+    check(cadence, Boolean(payload.photorealSections?.cameraSentence?.trim()), `${label} [실사]: 구도 문장 존재`, `shot=${frame.shot}`);
+  }
+  const references = Array.isArray(payload.photorealReferences) ? payload.photorealReferences : [];
+  const syntax = PHOTOREAL_WORKFLOW_PRESETS[payload.presetId]?.referenceSyntax ?? "none";
+  if (references.length > 0 && syntax !== "none") {
+    const missing = references
+      .map((_, slot) => (syntax === "qwen21" ? `<image${slot + 1}>` : `image ${slot + 1}`))
+      .filter((token) => !prompt.includes(token));
+    check(cadence, missing.length === 0, `${label} [실사]: 계획된 얼굴 참조가 프롬프트에 명시됨`, missing.join(", "));
+  }
+  const named = (payload.characterPrompts ?? []).filter((entry) => entry.characterId);
+  if (named.length > 0) {
+    // Safety floor §2.4: a person in a photo prompt is an adult noun (or the creator's own appearance text).
+    check(cadence, /\b(?:wom[ae]n|m[ae]n|person|people|adults?)\b/iu.test(prompt), `${label} [실사]: 인물이 성인 명사로 서술됨`, prompt.slice(0, 120));
+  }
+  const showsHead = (frame?.visibleRegions ?? ["head"]).includes("head");
+  if (named.length > 0 && showsHead && seedName !== "womanlife") {
+    // The demo profiles carry a known appearance and no photoreal appearance text, so it arrives translated.
+    check(cadence, /black hair/iu.test(prompt), `${label} [실사]: 저장된 외형이 실사 문장에 반영됨`, prompt.slice(0, 160));
+  }
+}
+
+/**
+ * Renders one photoreal job for real through the relay, holding the local GPU, and keeps the picture: an eval that
+ * only reports "completed" cannot show whether the image is any good, and the person running it wants to look.
+ */
+async function renderPhotorealJob(state, job, { cadence, turn, jobNumber }) {
+  photorealStats.dispatched += 1;
+  const category = job.routing?.category ?? "unknown";
+  const name = `${cadence}_${turn}_${jobNumber}_${category}`;
+  const started = Date.now();
+  let result;
+  try {
+    result = await localGpu.run("image", state, () => executeImageJob(state, job));
+  } catch (error) {
+    check("photoreal-dispatch", false, `${name}: 실사 렌더`, error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const took = ((Date.now() - started) / 1000).toFixed(1);
+  const asset = result.assets[0];
+  const image = /^data:(image\/[\w.+-]+);base64,(.+)$/u.exec(asset?.dataUrl ?? "");
+  const completed = result.job.status === "completed" && Boolean(image);
+  console.log(`  [실사] ${name}: ${result.job.status} ${took}s${result.job.error ? ` — ${result.job.error.slice(0, 120)}` : ""}`);
+  check("photoreal-dispatch", completed, `${name}: 디스패치한 실사 작업이 이미지 자산으로 완료됨`, result.job.error ?? result.job.status);
+  if (!completed) {
+    return;
+  }
+  photorealStats.completed += 1;
+  const extension = image[1] === "image/jpeg" ? "jpg" : image[1] === "image/webp" ? "webp" : "png";
+  await mkdir(imageDir, { recursive: true });
+  await writeFile(path.join(imageDir, `${name}.${extension}`), Buffer.from(image[2], "base64"));
+  const payload = result.job.providerPayload ?? {};
+  await writeFile(
+    path.join(imageDir, `${name}.txt`),
+    [
+      job.prompt,
+      "",
+      `NEGATIVE: ${job.negativePrompt}`,
+      `PRESET: ${payload.presetId ?? ""}  SIZE: ${payload.width}x${payload.height}  SEED: ${payload.seed ?? ""}  ${took}s`,
+      `ROUTING: ${job.routing?.reason ?? ""}`,
+      `REFERENCES: ${JSON.stringify(payload.photorealReferences ?? [])}`,
+      `NOVELAI TAGS: ${payload.novelAiPrompt ?? ""}`,
+      `CAPTIONS: ${(payload.characterPrompts ?? []).map((entry) => entry.prompt).join(" | ")}`
+    ].join("\n"),
+    "utf8"
+  );
+}

@@ -150,6 +150,44 @@ function startMockProvider() {
           });
           return;
 
+        // Two backends behind one mock, told apart by the model id. The dedicated tag model comes back with a
+        // valid envelope whose cut list is empty (or fully declined) while the main model tags the same
+        // narrative without trouble — the shape measured on a real adult_19 turn (gemini flash as the tag
+        // model beside gemini pro as the narrator).
+        case "tag_empty_main_tags":
+        case "tag_declines_main_tags":
+        case "tag_empty_main_empty": {
+          const isTagModel = parsed.model === "tag-model";
+          const stateEvents = [
+            { memory_kind: "state", state_type: "ActionTags", state_value: "sitting on sofa, legs spread", actor_id: "char_yuna" }
+          ];
+          if (isTagModel) {
+            const cues =
+              behaviour === "tag_declines_main_tags"
+                ? [
+                    { should_generate: false, suppression_reason: "explicit content cannot be depicted", anchor_text: "소파 위로 올라가" },
+                    { should_generate: false, suppression_reason: "explicit content cannot be depicted", anchor_text: "카메라를 향해" }
+                  ]
+                : [];
+            send(200, { choices: [{ message: { content: JSON.stringify({ image_cues: cues, state_events: stateEvents }) }, finish_reason: "stop" }] });
+            return;
+          }
+          if (behaviour === "tag_empty_main_empty") {
+            send(200, { choices: [{ message: { content: JSON.stringify({ image_cues: [] }) }, finish_reason: "stop" }] });
+            return;
+          }
+          const anchors = ["지하실 스튜디오", "소파 위로 올라가", "카메라를 향해", "눈을 질끈 감고", "채팅을 치기", "알림음이 울리며"];
+          const mainCues = anchors.map((anchor, index) => ({
+            should_generate: true,
+            anchor_text: anchor,
+            frame: { shot: index % 2 === 0 ? "full_body" : "upper_body", viewpoint: "front" },
+            base_tags: ["1girl", "indoors", `beat${index}`],
+            character_prompts: [{ character_id: "char_yuna", prompt: `long black hair, green eyes, cut ${index}` }]
+          }));
+          send(200, { choices: [{ message: { content: JSON.stringify({ image_cues: mainCues }) }, finish_reason: "stop" }] });
+          return;
+        }
+
         case "stream": {
           res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
           for (const piece of ["{\"assistant", "_text\":\"안녕", "하세요\"}"]) {
@@ -509,6 +547,107 @@ try {
     );
   }
 
+
+  // ─── 3a. Tag model returns no cuts ──────────────────────────────────────────────────────────────
+  group("3a. 태그 LLM 빈 cue 복구 (empty cut list from the dedicated tag model)");
+
+  // A paragraph-cadence turn with enough prose to carry a cut list. The dedicated tag model is a distinct
+  // backend (different model id) from the main model, both served by the mock.
+  const LONG_NARRATIVE = [
+    "홍대 뒷골목의 퀴퀴한 지하실 스튜디오. 낡은 에어컨에서 미지근한 바람이 불어오고 있었다.",
+    "유나는 덜덜 떨리는 손으로 카메라 앞의 차가운 가죽 소파 위로 올라가 다리를 벌렸다.",
+    "\"자, 방송 켠다.\" 실장의 목소리가 낮게 깔렸고, 그녀는 눈을 질끈 감고 카메라를 향해 고개를 들었다.",
+    "노트북 화면에 알림음이 울리며 시청자들이 미친 듯이 채팅을 치기 시작했다. 그녀의 뺨이 붉게 달아올랐다.",
+    "실장은 담배를 비벼 끄고 카메라 뒤로 물러섰다. 조명이 한 단계 더 밝아지자 소파의 가죽이 번들거렸고, 유나는 손끝으로 치맛자락을 움켜쥔 채 숨을 골랐다."
+  ].join("\n\n");
+  if (LONG_NARRATIVE.length < 300) {
+    throw new Error("eval narrative must exceed the top-up minimum (240 chars)");
+  }
+
+  async function runSplitAnnotation(behaviour, options = {}) {
+    mock.reset();
+    mock.setBehaviour(behaviour);
+    const preset = getLlmProviderPreset("deepseek");
+    const originalRequiresProxy = preset.requiresProxy;
+    preset.requiresProxy = false;
+    const base = withProvider(
+      createState({ imageProfile: { ...createState().imageProfile, generationCadence: options.cadence ?? "paragraph" } }),
+      "deepseek",
+      { baseUrl: mockBaseUrl, model: "main-model" }
+    );
+    const state = {
+      ...base,
+      imageTagLlm: options.tagLlmEnabled === false ? { ...base.llm, enabled: false } : { ...base.llm, enabled: true, model: "tag-model" }
+    };
+    try {
+      return await llmClient.requestTurnAnnotations(state, { userText: "계속", assistantText: LONG_NARRATIVE, manualImage: false });
+    } finally {
+      preset.requiresProxy = originalRequiresProxy;
+      mock.setBehaviour("ok");
+    }
+  }
+  const requestsFor = (model) => mock.received.filter((r) => r.url === "/v1/chat/completions" && r.body.model === model);
+
+  {
+    const result = await runSplitAnnotation("tag_empty_main_tags");
+    const generated = result.imageCues.filter((cue) => cue.shouldGenerate);
+    check(
+      generated.length >= 2 && generated.every((cue) => (cue.baseTags ?? []).length > 0),
+      "태그 LLM이 image_cues를 비워 보내면 메인 LLM이 컷 목록을 다시 작성한다",
+      `generated=${generated.length} cues=${JSON.stringify(result.imageCues.map((c) => c.baseTags))}`
+    );
+    check(requestsFor("main-model").length === 1, "메인 LLM 재작성은 정확히 1회 호출된다", `main=${requestsFor("main-model").length}`);
+    check(
+      requestsFor("tag-model").length <= 3,
+      "태그 LLM은 첫 패스 + 유한한 top-up 라운드만 쓴다 (빈 라운드에서 즉시 중단)",
+      `tag=${requestsFor("tag-model").length}`
+    );
+    check(result.stateEvents.length === 1, "태그 LLM이 추출한 state_events는 그대로 유지된다", `events=${result.stateEvents.length}`);
+    check(result.imageCueFailureReason === undefined, "복구된 턴에는 실패 사유가 붙지 않는다", result.imageCueFailureReason);
+  }
+
+  {
+    const result = await runSplitAnnotation("tag_declines_main_tags");
+    const generated = result.imageCues.filter((cue) => cue.shouldGenerate);
+    check(
+      generated.length >= 2,
+      "paragraph cadence에서 태그 LLM이 모든 cue를 should_generate=false로 내면 판단이 아니라 실패로 보고 복구한다",
+      `generated=${generated.length}`
+    );
+    check(requestsFor("main-model").length === 1, "전부 거절된 목록도 메인 LLM 재작성으로 이어진다", `main=${requestsFor("main-model").length}`);
+  }
+
+  {
+    const result = await runSplitAnnotation("tag_declines_main_tags", { cadence: "rich" });
+    check(
+      result.imageCues.filter((cue) => cue.shouldGenerate).length === 0 && requestsFor("main-model").length === 0,
+      "rich cadence에서는 억제 사유가 붙은 should_generate=false 목록을 판단으로 존중한다 (재시도 없음)",
+      `main=${requestsFor("main-model").length}`
+    );
+  }
+
+  {
+    const result = await runSplitAnnotation("tag_empty_main_empty");
+    check(
+      result.imageCues.filter((cue) => cue.shouldGenerate).length === 0 && Boolean(result.imageCueFailureReason),
+      "양쪽 모두 컷을 못 내면 어느 백엔드가 비워 보냈는지 사유로 알린다",
+      result.imageCueFailureReason
+    );
+    check(
+      /tag-model/.test(result.imageCueFailureReason ?? "") && /main-model/.test(result.imageCueFailureReason ?? ""),
+      "사유에 태그 LLM과 메인 LLM 모델명이 모두 들어간다",
+      result.imageCueFailureReason
+    );
+  }
+
+  {
+    const result = await runSplitAnnotation("tag_empty_main_empty", { tagLlmEnabled: false });
+    check(
+      requestsFor("main-model").length <= 2 && Boolean(result.imageCueFailureReason),
+      "태그 전용 LLM이 꺼져 있으면 같은 백엔드로 재작성하지 않고 사유만 남긴다",
+      `main=${requestsFor("main-model").length} reason=${result.imageCueFailureReason}`
+    );
+  }
 
   // ─── 3b. Local-first (no API key) ───────────────────────────────────────────────────────────────
   group("3b. 로컬 우선 / 키 없음 (local-first, keyless)");

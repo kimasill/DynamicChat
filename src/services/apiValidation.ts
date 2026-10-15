@@ -18,7 +18,7 @@ export interface ApiValidationResult {
  * llama.cpp, vLLM) implements GET /v1/models, so one call covers them all. Returns [] rather than throwing:
  * a server that does not implement it should degrade to manual entry, not block the settings panel.
  */
-export async function listLocalLlmModels(settings: LlmApiSettings): Promise<string[]> {
+export async function listLocalLlmModels(settings: Pick<LlmApiSettings, "baseUrl" | "apiKey">): Promise<string[]> {
   const baseUrl = settings.baseUrl.replace(/\/$/u, "");
   if (!baseUrl) {
     return [];

@@ -17333,6 +17333,71 @@ function PersonaPanel({
   );
 }
 
+/**
+ * Keeps the model list of a local backend in sync with what that server is actually serving.
+ *
+ * Local presets ship no model names on purpose — the list lives on the machine, not in the code — so until
+ * something asks the server the dropdown is empty and the keyless path looks broken. Selecting the provider
+ * is the moment the address becomes known, so that is when discovery runs; the button only exists to retry
+ * after the user starts the server. The auto pass is silent because the base-URL field updates per
+ * keystroke: it is debounced, and only an explicit retry reports what it found.
+ */
+function useLocalLlmModelDiscovery(
+  settings: Pick<LlmApiSettings, "provider" | "baseUrl" | "apiKey">,
+  onNotify: (message: string) => void
+): { models: string[]; isLoading: boolean; reload: () => void } {
+  const { provider, baseUrl, apiKey } = settings;
+  const [models, setModels] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const isLocalProvider = getLlmProviderOption(provider).group === "local";
+
+  useEffect(() => {
+    // A provider switch invalidates whatever the previous server reported.
+    setModels([]);
+    if (!isLocalProvider || !baseUrl.trim()) {
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setIsLoading(true);
+      void listLocalLlmModels({ baseUrl, apiKey })
+        .then((found) => {
+          if (!cancelled) {
+            setModels(found);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setIsLoading(false);
+          }
+        });
+    }, 400);
+
+    return () => {
+      // Guards against a switch mid-flight publishing the previous server's list.
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [apiKey, baseUrl, isLocalProvider, provider]);
+
+  const reload = useCallback(() => {
+    setIsLoading(true);
+    void listLocalLlmModels({ baseUrl, apiKey })
+      .then((found) => {
+        setModels(found);
+        onNotify(
+          found.length > 0
+            ? `로컬 서버에서 모델 ${found.length}개를 불러왔습니다.`
+            : "로컬 서버에서 모델 목록을 가져오지 못했습니다. 서버가 실행 중인지, 기본 URL이 맞는지 확인하세요."
+        );
+      })
+      .finally(() => setIsLoading(false));
+  }, [apiKey, baseUrl, onNotify]);
+
+  return { models, isLoading, reload };
+}
+
 function SettingsPanel({
   state,
   onImageProfileChange,
@@ -17422,54 +17487,23 @@ function SettingsPanel({
   const notifyApplied = useCallback((message: string) => onNotify?.(message), [onNotify]);
   // Models discovered from a running local server, merged into the preset list. Keeps the keyless local
   // path usable without asking the user to type an exact model id from memory.
-  const [discoveredLocalModels, setDiscoveredLocalModels] = useState<string[]>([]);
-  const [isLoadingLocalModels, setIsLoadingLocalModels] = useState(false);
+  const {
+    models: discoveredLocalModels,
+    isLoading: isLoadingLocalModels,
+    reload: loadLocalModels
+  } = useLocalLlmModelDiscovery(state.llm, notifyApplied);
   const availableLlmModels = uniqueIds([...discoveredLocalModels, ...llmProvider.models]).filter(
     (model) => model !== "custom"
   );
   const selectedLlmModel = availableLlmModels.includes(state.llm.model) ? state.llm.model : "custom";
-  const loadLocalModels = useCallback(async () => {
-    setIsLoadingLocalModels(true);
-    try {
-      const models = await listLocalLlmModels(state.llm);
-      setDiscoveredLocalModels(models);
-      notifyApplied(
-        models.length > 0
-          ? `로컬 서버에서 모델 ${models.length}개를 불러왔습니다.`
-          : "로컬 서버에서 모델 목록을 가져오지 못했습니다. 서버가 실행 중인지, 기본 URL이 맞는지 확인하세요."
-      );
-    } finally {
-      setIsLoadingLocalModels(false);
-    }
-  }, [notifyApplied, state.llm]);
-  // A provider switch invalidates whatever was discovered for the previous one.
-  useEffect(() => {
-    setDiscoveredLocalModels([]);
-  }, [state.llm.provider, state.llm.baseUrl]);
   // The image-tag model gets its own discovery and its own context size. Running the tag pass on a second,
   // smaller local model is the setup that makes a high-density cadence affordable — but it only works if
   // that model can be picked and sized independently, which previously it could not.
-  const [discoveredImageTagLocalModels, setDiscoveredImageTagLocalModels] = useState<string[]>([]);
-  const [isLoadingImageTagLocalModels, setIsLoadingImageTagLocalModels] = useState(false);
-  const loadImageTagLocalModels = useCallback(async () => {
-    setIsLoadingImageTagLocalModels(true);
-    try {
-      const models = await listLocalLlmModels(state.imageTagLlm);
-      setDiscoveredImageTagLocalModels(models);
-      notifyApplied(
-        models.length > 0
-          ? `이미지 태그 모델 목록 ${models.length}개를 불러왔습니다.`
-          : "로컬 서버에서 모델 목록을 가져오지 못했습니다. 서버가 실행 중인지, 기본 URL이 맞는지 확인하세요."
-      );
-    } finally {
-      setIsLoadingImageTagLocalModels(false);
-    }
-  }, [notifyApplied, state.imageTagLlm]);
-  useEffect(() => {
-    setDiscoveredImageTagLocalModels([]);
-  }, [state.imageTagLlm.provider, state.imageTagLlm.baseUrl]);
-  // Declared after the discovery state it reads: as a plain const in the component body this is evaluated on
-  // every render, so hoisting it above the useState would be a temporal-dead-zone throw, not a warning.
+  const {
+    models: discoveredImageTagLocalModels,
+    isLoading: isLoadingImageTagLocalModels,
+    reload: loadImageTagLocalModels
+  } = useLocalLlmModelDiscovery(state.imageTagLlm, notifyApplied);
   const availableImageTagLlmModels = uniqueIds([
     ...discoveredImageTagLocalModels,
     ...imageTagLlmProvider.models
@@ -17925,10 +17959,14 @@ function SettingsPanel({
               a typo surfaces as an opaque upstream 404. Every local server implements GET /v1/models. */}
           {llmProvider.group === "local" ? (
             <label>
-              설치된 모델 불러오기
+              설치된 모델
               <button className="icon-text-button full" type="button" onClick={loadLocalModels} disabled={isLoadingLocalModels}>
                 <RefreshCcw size={15} />
-                {isLoadingLocalModels ? "불러오는 중…" : "로컬 서버에서 불러오기"}
+                {isLoadingLocalModels
+                  ? "불러오는 중…"
+                  : discoveredLocalModels.length > 0
+                    ? `${discoveredLocalModels.length}개 — 다시 불러오기`
+                    : "서버를 찾지 못함 — 다시 시도"}
               </button>
             </label>
           ) : null}
@@ -18078,7 +18116,7 @@ function SettingsPanel({
             </div>
             {imageTagLlmProvider.group === "local" ? (
               <label>
-                설치된 모델 불러오기
+                설치된 모델
                 <button
                   className="icon-text-button full"
                   type="button"
@@ -18086,7 +18124,11 @@ function SettingsPanel({
                   disabled={isLoadingImageTagLocalModels}
                 >
                   <RefreshCcw size={15} />
-                  {isLoadingImageTagLocalModels ? "불러오는 중…" : "로컬 서버에서 불러오기"}
+                  {isLoadingImageTagLocalModels
+                    ? "불러오는 중…"
+                    : discoveredImageTagLocalModels.length > 0
+                      ? `${discoveredImageTagLocalModels.length}개 — 다시 불러오기`
+                      : "서버를 찾지 못함 — 다시 시도"}
                 </button>
               </label>
             ) : null}

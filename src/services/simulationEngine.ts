@@ -68,7 +68,10 @@ const STICKY_TOPIC_MODULE_KINDS = new Set<PromptModuleKind>(["sub_prompt", "worl
 const RETRIEVAL_RECENT_MESSAGE_CHARS = 520;
 const RETRIEVAL_LATEST_ASSISTANT_CHARS = 1400;
 const RETRIEVAL_SETTING_MODULE_CHARS = 360;
-const MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON = "메인 LLM image_cues.tags가 비어 있어 이미지 작업을 만들지 않음";
+// "이미지 태그 LLM", not "메인 LLM": since the annotation pass split off, the cut list is authored by the
+// dedicated tag model (or the main model standing in for it), so naming the main model here sent the
+// operator to the wrong settings card.
+const MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON = "이미지 태그 LLM의 image_cues.tags가 비어 있어 이미지 작업을 만들지 않음";
 const IMAGE_PROGRESSION_CUE_TARGET = 10;
 
 interface RunSimulationTurnOptions {
@@ -320,7 +323,7 @@ export async function runSimulationTurn(
       sidecarTrace,
       sidecar: mergedSidecar,
       sidecarExpansion: assistantGeneration.sidecarExpansion,
-    annotationFailureReason: annotationResult.failureReason,
+    annotationFailureReason: annotationResult.failureReason ?? annotationResult.imageCueFailureReason,
       imageCue,
       turnTrace,
       imageJob: job,
@@ -364,7 +367,7 @@ export async function runSimulationTurn(
     // it the narrative sidecar handed the App an empty cue list and no image was ever dispatched.
     sidecar: mergedSidecar,
     sidecarExpansion: assistantGeneration.sidecarExpansion,
-    annotationFailureReason: annotationResult.failureReason,
+    annotationFailureReason: annotationResult.failureReason ?? annotationResult.imageCueFailureReason,
     imageCue,
     turnTrace,
     imageJobs: jobs,

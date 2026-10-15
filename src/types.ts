@@ -962,7 +962,9 @@ export interface TurnResult {
   /**
    * Set when the annotation pass failed rather than deciding the turn was non-visual. That call authors
    * BOTH the image cues and the state deltas, so its failure is invisible on screen — the turn just quietly
-   * produces no image and no state update. Surfaced to the user by the caller.
+   * produces no image and no state update. Also set when only the cut list came back empty on a cadence that
+   * demands one (the tag model declined and the main-model fallback could not recover it). Surfaced to the
+   * user by the caller.
    */
   annotationFailureReason?: string;
 }

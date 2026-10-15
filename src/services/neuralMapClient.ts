@@ -384,7 +384,14 @@ export class NeuralMapClient {
       }, NEURALMAP_GRAPH_REQUEST_TIMEOUT_MS);
 
       return createContextPackFromNeuralMapPack(state, response, query);
-    } catch {
+    } catch (error) {
+      // A TIMEOUT means the server is there but not answering in time; retrying the same server on the older
+      // endpoint just spends its own timeout before failing too, and the two waits are strictly additive at
+      // the front of every turn (8s + 2.5s = the 10.5s retrieval seen in the turn metrics). Only a genuine
+      // error — a 404 from an older NeuralMap that has no /context/compose, a 5xx — is worth the second try.
+      if (isAbortError(error)) {
+        return createLocalContextPack(state, query);
+      }
       return this.getLegacySimulationContext(state, query);
     }
   }
@@ -1494,6 +1501,11 @@ function hashText(value: string): string {
     hash = (hash * 33) ^ value.charCodeAt(index);
   }
   return (hash >>> 0).toString(36);
+}
+
+/** True when a request was cut off by its own timeout rather than answered with an error. */
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException ? error.name === "AbortError" : (error as { name?: string })?.name === "AbortError";
 }
 
 function createNeuralMapScope(state: AppState): NeuralMapScope {

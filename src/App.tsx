@@ -31,6 +31,7 @@ import {
   RefreshCcw,
   RotateCcw,
   Save,
+  ScanFace,
   Search,
   Send,
   Settings2,
@@ -60,9 +61,9 @@ import type {
   SetStateAction,
   WheelEvent as ReactWheelEvent
 } from "react";
-import { Children, Component, cloneElement, createContext, isValidElement, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Children, Component, Fragment, cloneElement, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-import { builtInSimulationStates, createStateFromDraft, hydrateState, seedState, type SimulationDraft } from "./data/seed";
+import { builtInSimulationStates, createDraftPreviewState, createStateFromDraft, hydrateState, seedState, type SimulationDraft } from "./data/seed";
 import { createId } from "./lib/id";
 import {
   MAX_FOUNDATION_MODULE_BODY_CHARS,
@@ -70,10 +71,38 @@ import {
   promptModuleBodyCharLimit
 } from "./lib/promptLimits";
 import { listLocalLlmModels, normalizeApiToken, validateLlmApi, validateNovelAiApi } from "./services/apiValidation";
-import { canUserRunQueuedImageJob, executeImageJob, planImageJob, shouldAutoRunImageJob } from "./services/imageOrchestrator";
+import {
+  canUserRunQueuedImageJob,
+  executeImageJob,
+  planImageJob,
+  screenPhotorealText,
+  shouldAutoRunImageJob,
+  validatePhotorealCustomWorkflow,
+  type ImageJobExecutionResult
+} from "./services/imageOrchestrator";
 import { generateAssistantText, isLlmAbortedError, setActiveTurnAbortSignal } from "./services/llmClient";
 import { LLM_PROVIDER_GROUP_LABELS, LLM_PROVIDER_PRESETS, type LlmProviderPreset } from "./services/llmProviders";
-import { describeImageCueFrame } from "./services/imageFrame";
+import { describeImageCueFrame, normalizeImageCueFrame } from "./services/imageFrame";
+import { IMAGE_SCENE_CATEGORY_OPTIONS, resolveImageBackendRouting } from "./services/imageBackendRouting";
+import {
+  COMFY_CUSTOM_PLACEHOLDERS,
+  PHOTOREAL_MIN_CFG,
+  PHOTOREAL_WORKFLOW_PRESETS,
+  QWEN21_TURBO_SIGMAS,
+  resolvePhotorealModelFiles,
+  resolvePhotorealOutputSize,
+  type PhotorealPresetDownload
+} from "./services/comfyWorkflows";
+import { getPhotorealRelayBase, probeComfyUi, type ComfyUiProbeResult } from "./services/comfyUiClient";
+import { createLocalGpuCoordinator, shouldCoordinateLocalGpu } from "./services/localGpuCoordinator";
+import {
+  createProfileImageRecord,
+  planCharacterProfileTestJobs,
+  runCharacterProfileTestJobs,
+  type CharacterProfileTestVariant
+} from "./services/characterProfileStudio";
+import { bytesToBase64, letterboxForNovelAiReference } from "./services/imageReferences";
+import { PHOTOREAL_STYLE_PRESETS } from "./services/photorealPrompt";
 import { encodeNovelAiVibe } from "./services/novelAiClient";
 import {
   NeuralMapClient,
@@ -82,7 +111,14 @@ import {
   type NeuralMapLiveGraph,
   type NeuralMapLiveNode
 } from "./services/neuralMapClient";
-import { toShareableLlmSettings, toShareableNovelAiSettings } from "./services/runtimeApiSettings";
+import {
+  DEFAULT_PHOTOREAL_SETTINGS,
+  normalizePhotorealSettings,
+  toShareableCharacterProfileImages,
+  toShareableLlmSettings,
+  toShareableNovelAiSettings,
+  toShareablePhotorealSettings
+} from "./services/runtimeApiSettings";
 import {
   readStateMemoryKind,
   readStateMemoryOwnerId,
@@ -94,6 +130,7 @@ import {
   clearState,
   configureDynamicChatApiBaseUrl,
   createDynamicChatApiClient,
+  DEFAULT_DYNAMICCHAT_API_BASE_URL,
   getConfiguredDynamicChatApiBaseUrl,
   getNovelAiGenerateProxyUrl,
   loadState,
@@ -110,16 +147,22 @@ import type {
   ApiRegistrationStatus,
   AssistantImageCueDraft,
   AssistantSidecar,
+  CharacterProfileImage,
+  CharacterProfileImages,
   ContentRating,
   ContextEvidence,
   ContextPack,
   EvaluationScenario,
   ImageAsset,
+  ImageBackendId,
+  ImageBackendRouting,
+  ImageBackendRoutingMode,
   ImageCue,
   ImageFeedbackRating,
   ImageGenerationCadence,
   ImageGenerationJob,
   ImageGenerationProfile,
+  ImageSceneCategory,
   ImageScenePresetExampleFile,
   ImageSceneTagPreset,
   ImageSceneTagPresetNode,
@@ -133,6 +176,9 @@ import type {
   NovelAiVibeTransferReference,
   NovelAiModelPreset,
   NovelAiNoiseSchedule,
+  PhotorealApiSettings,
+  PhotorealStylePresetId,
+  PhotorealWorkflowPresetId,
   PromptModule,
   PromptModuleKind,
   PromptModuleUsage,
@@ -223,11 +269,42 @@ const imageJobStatusLabels: Record<ImageGenerationJob["status"], string> = {
   failed: "실패",
   canceled: "취소"
 };
+/** A cut whose render stopped because the user left its run (or reloaded the page) before it finished. */
+const ABANDONED_IMAGE_JOB_ERROR = "생성이 끝나기 전에 진행을 떠나거나 페이지를 새로 고쳐 중단되었습니다. 재생성하면 다시 만듭니다.";
 const imageAssetSourceLabels: Record<ImageAsset["source"], string> = {
   stored: "기본 에셋",
   generated: "생성 결과",
   fallback: "대체 이미지"
 };
+// Long form for copy ("실사 이미지 생성 실패"), short form for the badge on the picture itself.
+const imageBackendLabels: Record<ImageBackendId, string> = {
+  novelai: "NovelAI",
+  photoreal: "실사"
+};
+const imageBackendBadgeLabels: Record<ImageBackendId, string> = {
+  novelai: "NAI",
+  photoreal: "실사"
+};
+const imageBackendRoutingModeOptions: Array<{ value: ImageBackendRoutingMode; label: string; detail: string }> = [
+  { value: "novelai", label: "NAI만", detail: "모든 컷을 NovelAI로" },
+  { value: "mixed", label: "장면별 혼합", detail: "고른 장면만 실사" },
+  { value: "photoreal", label: "전부 실사", detail: "성적 장면은 NovelAI" }
+];
+// Precise Reference exists only on these two; every other preset draws the cut without the face reference.
+const novelAiCharacterReferencePresets: ReadonlySet<NovelAiModelPreset> = new Set<NovelAiModelPreset>(["NAID4.5F", "NAID4.5C"]);
+// Same fallbacks novelAiClient applies to an unset knob, so the sliders show what will actually be sent.
+const NOVELAI_CHARACTER_REFERENCE_DEFAULT_STRENGTH = 0.85;
+const NOVELAI_CHARACTER_REFERENCE_DEFAULT_FIDELITY = 1;
+const photorealWorkflowPresetOrder: PhotorealWorkflowPresetId[] = [
+  "qwen_image_2_1_turbo",
+  "qwen_image_2_1",
+  "z_image_turbo",
+  "qwen_image_edit_2511",
+  "custom"
+];
+const photorealStylePresetOrder: Array<Exclude<PhotorealStylePresetId, "custom">> = ["daily_look", "film_portrait", "cinematic", "studio_editorial"];
+// The 31-bit range the ComfyUI client keeps seeds in, so the seed typed here is the seed the graph receives.
+const PHOTOREAL_MAX_SEED = 2_147_483_647;
 
 // Provider metadata (label, base URL, model list, key placeholder) and runtime capabilities (wire format,
 // JSON mode, temperature ceiling, extra headers/body, CORS routing) live together in one registry so adding
@@ -809,6 +886,7 @@ const CrackMarkerImage = memo(function CrackMarkerImage({
         alt={asset.title}
         onNaturalSize={(width, height) => setMeasuredAspectRatio(`${width} / ${height}`)}
       />
+      <ImageBackendBadge asset={asset} />
       {onFeedback ? (
         <span className="crack-marker-image-actions">
           <button type="button" onClick={() => onFeedback(asset.id, "liked")} aria-label="이미지 선호">
@@ -822,6 +900,23 @@ const CrackMarkerImage = memo(function CrackMarkerImage({
     </span>
   );
 });
+
+/**
+ * Which renderer drew the picture, on the picture itself. In a mixed story an anime cut and a photo-model cut sit
+ * in the same transcript, and the only other place that says which is which is the inspector, a tab away. Art
+ * that was never generated (stored / fallback) gets no badge rather than a guess.
+ */
+function ImageBackendBadge({ asset }: { asset: ImageAsset }) {
+  const backend = readImageAssetBackend(asset);
+  if (!backend) {
+    return null;
+  }
+  return (
+    <span className="image-backend-badge" title={`${imageBackendLabels[backend]}로 생성한 이미지`}>
+      {imageBackendBadgeLabels[backend]}
+    </span>
+  );
+}
 
 /**
  * Where an image was going to be, showing why it is not there.
@@ -1959,7 +2054,10 @@ function stripLibrarySecrets(state: AppState): AppState {
       verifiedAt: undefined,
       verificationMessage: ""
     },
-    novelAi: toShareableNovelAiSettings(state.novelAi)
+    novelAi: toShareableNovelAiSettings(state.novelAi),
+    // No secret here (ComfyUI runs keyless on this machine), but the last connection check describes this machine,
+    // not the simulation. A library entry that predates photoreal has no settings at all and gets the defaults.
+    photoreal: toShareablePhotorealSettings(state.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS)
   };
 }
 
@@ -2301,8 +2399,6 @@ async function createVerifiedNovelAiPatch(settings: NovelAiApiSettings): Promise
   };
 }
 
-const IMAGE_JOB_CONCURRENCY = 2;
-
 // The subset of a turn that image dispatch actually needs. A full TurnResult satisfies it, and the
 // early (mid-stream) dispatch synthesizes a minimal one before the turn has fully resolved.
 interface ImageDispatchTurn {
@@ -2335,22 +2431,83 @@ async function runRunnableImageJobs(
     return;
   }
 
-  // Run every job through the concurrency pool from the start. Previously the first job was awaited ALONE
-  // before the rest began, which serialized it — with no early-dispatch path anymore that just made the first
-  // image an isolated wait. Now the first IMAGE_JOB_CONCURRENCY jobs start together. (setState merges via
-  // upsertImageAssets, so concurrent completions are race-safe.)
-  const queue = [...runnableJobs];
-  const workerCount = Math.min(IMAGE_JOB_CONCURRENCY, queue.length);
+  // One feeder per renderer, each handing its chain the next cut as the previous one finishes. A shared pool of
+  // workers waited on whichever chain its cut belonged to, so a turn opening with two photoreal cuts parked both
+  // workers on the photoreal chain while the NovelAI chain sat idle (and the reverse) — undoing the per-backend
+  // chains. Feeding one cut at a time, rather than queueing the whole turn at once, also lets a regeneration the
+  // user asks for meanwhile run next instead of behind the rest of this turn. (setState merges via
+  // upsertImageAssets, so concurrent completions on the two chains are race-safe.)
+  const byBackend = new Map<ImageBackendId, ImageGenerationJob[]>();
+  for (const job of runnableJobs) {
+    const backend = readImageJobBackend(job);
+    byBackend.set(backend, [...(byBackend.get(backend) ?? []), job]);
+  }
   await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (queue.length > 0) {
-        const job = queue.shift();
-        if (job) {
-          await runJob(job, snapshot);
-        }
+    Array.from(byBackend.values(), async (backendJobs) => {
+      for (const job of backendJobs) {
+        await runJob(job, snapshot);
       }
     })
   );
+}
+
+/**
+ * Appends `work` to one renderer's serial chain and returns its result. The story's cuts and the builder's profile
+ * tests share these chains: NovelAI answers a second concurrent generation on one account with 429, and photoreal
+ * renders share one GPU, while the two renderers never compete with each other. The stored tail always settles
+ * fulfilled, so one failed task releases the chain instead of jamming every task behind it.
+ */
+function chainImageBackendWork<T>(
+  queues: Map<ImageBackendId, Promise<void>>,
+  backend: ImageBackendId,
+  work: () => Promise<T>
+): Promise<T> {
+  const queued = (queues.get(backend) ?? Promise.resolve()).then(work, work);
+  queues.set(
+    backend,
+    queued.then(
+      () => undefined,
+      () => undefined
+    )
+  );
+  return queued;
+}
+
+/**
+ * Waits for `work`, but gives up the moment `signal` aborts while the work is still QUEUED (`hasStarted()` false).
+ *
+ * A turn can wait in the local GPU queue behind a photoreal render — seconds, tens of seconds on a cold model
+ * load — and 중지 has to end the turn then, not when the picture finishes; the queued task checks the signal
+ * itself before it starts, so a cancelled turn never runs. Once the work HAS started, its own cancellation (the
+ * provider fetch abort) is what ends it, exactly as before: settling early there would roll the partial turn back
+ * while the stream could still deliver one more chunk and write it back on screen.
+ */
+function awaitQueuedWork<T>(work: Promise<T>, signal: AbortSignal, hasStarted: () => boolean): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      if (!hasStarted()) {
+        reject(createQueuedWorkCancelledError());
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    }
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+function createQueuedWorkCancelledError(): Error {
+  return new DOMException("대기 중이던 턴을 취소했습니다.", "AbortError");
 }
 
 function runAfterNextPaint(callback: () => void): void {
@@ -2381,6 +2538,101 @@ function readImageCuePlannerSource(payload: Record<string, unknown>): string | u
 
 function getImageJobStatusLabel(status: ImageGenerationJob["status"]): string {
   return imageJobStatusLabels[status] ?? status;
+}
+
+/**
+ * The renderer a job runs on. `backend` is the first-class field; the payload's `provider` covers a job whose
+ * field was lost, and absence means NovelAI — every job planned before photoreal existed.
+ */
+function readImageJobBackend(job: ImageGenerationJob): ImageBackendId {
+  if (job.backend === "novelai" || job.backend === "photoreal") {
+    return job.backend;
+  }
+  return job.providerPayload?.provider === "photoreal" ? "photoreal" : "novelai";
+}
+
+/** The dispatch that claimed this job record (see runQueuedImageJob), or undefined for a record no run has claimed. */
+function readImageJobDispatchToken(job: ImageGenerationJob | undefined): string | undefined {
+  const token = job?.providerPayload?.dispatchToken;
+  return typeof token === "string" && token ? token : undefined;
+}
+
+/**
+ * A job error without the "<renderer> 이미지 생성 실패:" lead the clients already put on it. Every place that shows
+ * one adds that lead itself (the toast, the card title), and the photoreal client's errors carry it too, so the
+ * failure used to read "실사 이미지 생성 실패: 실사 이미지 생성 실패: …". Empty when the error was nothing but the
+ * lead: the caller's own lead already says all there is.
+ */
+function stripImageFailureLead(message: string, backend: ImageBackendId): string {
+  const lead = new RegExp(`^(?:\\s*${imageBackendLabels[backend]}\\s*이미지\\s*생성\\s*실패\\s*[:：]?\\s*)+`, "u");
+  return message.replace(lead, "").trim();
+}
+
+/**
+ * The steps a photoreal preset really samples when its graph fixes the schedule. Qwen-Image 2.1 Turbo runs the
+ * distilled sigma list baked into its graph (ManualSigmas), so the 스텝 setting recorded on the job never reaches
+ * the sampler; one step per sigma interval.
+ */
+function readFixedPhotorealSteps(presetId: string | undefined): number | undefined {
+  return presetId === "qwen_image_2_1_turbo" ? QWEN21_TURBO_SIGMAS.split(",").length - 1 : undefined;
+}
+
+/**
+ * The renderer that drew an asset, or undefined when none did: stored and fallback art was never generated, so
+ * it gets no badge rather than a guessed "NAI". A generated asset without the field predates photoreal.
+ */
+function readImageAssetBackend(asset: ImageAsset): ImageBackendId | undefined {
+  if (asset.backend === "novelai" || asset.backend === "photoreal") {
+    return asset.backend;
+  }
+  return asset.source === "generated" ? "novelai" : undefined;
+}
+
+/**
+ * Names of the characters whose profile image a photoreal cut used as its face reference. The planner records them
+ * as `photorealReferences` and the ComfyUI client as `references`; both carry characterId, never the image bytes.
+ */
+function readPhotorealReferenceCharacterNames(state: AppState, payload: Record<string, unknown>): string[] {
+  const entries = [payload.photorealReferences, payload.references].find((value): value is unknown[] => Array.isArray(value)) ?? [];
+  const names = entries.flatMap((entry) => {
+    if (!isPlainRecord(entry)) {
+      return [];
+    }
+    const characterId = typeof entry.characterId === "string" ? entry.characterId : undefined;
+    const character = characterId ? state.characters.find((candidate) => candidate.id === characterId) : undefined;
+    const name = character?.name ?? (typeof entry.name === "string" ? entry.name : undefined);
+    return name ? [name] : [];
+  });
+  return uniqueIds(names);
+}
+
+function getImageSceneCategoryLabel(category: ImageSceneCategory | undefined): string | undefined {
+  return category ? IMAGE_SCENE_CATEGORY_OPTIONS.find((option) => option.id === category)?.label ?? category : undefined;
+}
+
+/**
+ * The renderers this simulation's cuts actually reach. Routing says where a cut WANTS to go; only a connected
+ * backend draws it, and an off backend hands its cuts to the other one (decideImageBackend's fallback). A
+ * photoreal setup that routing never sends anything to — NovelAI-only mode with NovelAI on — is not listed.
+ */
+function listActiveImageBackends(state: Pick<AppState, "imageProfile" | "novelAi" | "photoreal">): ImageBackendId[] {
+  const routing = resolveImageBackendRouting(state.imageProfile);
+  const novelAiOn = state.novelAi?.enabled === true;
+  const photorealOn = state.photoreal?.enabled === true;
+  const routesToPhotoreal = routing.mode === "photoreal" || (routing.mode === "mixed" && routing.photorealCategories.length > 0);
+  const backends: ImageBackendId[] = [];
+  if (novelAiOn) {
+    backends.push("novelai");
+  }
+  if (photorealOn && (routesToPhotoreal || !novelAiOn)) {
+    backends.push("photoreal");
+  }
+  return backends;
+}
+
+function describeActiveImageBackends(state: Pick<AppState, "imageProfile" | "novelAi" | "photoreal">): string | undefined {
+  const backends = listActiveImageBackends(state);
+  return backends.length > 0 ? backends.map((backend) => imageBackendLabels[backend]).join(" + ") : undefined;
 }
 
 function readProviderPayloadNumber(payload: Record<string, unknown>, key: string): number | undefined {
@@ -2498,16 +2750,23 @@ function createImageCueForRegeneration(state: AppState, job: ImageGenerationJob)
     .filter(Boolean)
     .join(" | ");
 
+  const tags = Array.isArray(cue.tags) ? cue.tags : [];
+  const baseTags = Array.isArray(cue.baseTags) ? cue.baseTags : undefined;
   return {
     shouldGenerate: true,
     reason: job.reason || cue.reason || "이미지 재생성",
     characters,
-    tags: Array.isArray(cue.tags) ? cue.tags : [],
-    baseTags: Array.isArray(cue.baseTags) ? cue.baseTags : undefined,
+    tags,
+    baseTags,
     characterPrompts: Array.isArray(cue.characterPrompts) ? cue.characterPrompts : undefined,
     scene: typeof cue.scene === "string" ? cue.scene : "current simulation scene",
     suppressionReason: undefined,
-    visualContext: [cue.scene, state.simulation.title, characterVisualContext].filter(Boolean).join(", ")
+    visualContext: [cue.scene, state.simulation.title, characterVisualContext].filter(Boolean).join(", "),
+    // The crop the original cut committed to, so "regenerate" redraws the SAME shot instead of re-guessing it from
+    // tags (a face close-up must not come back as a full-body cut with shoes injected), and the beat kind the scene
+    // classifier reads. Both are re-validated: a stored payload is old data, not a trusted shape.
+    frame: cue.frame ? normalizeImageCueFrame(cue.frame, [...(baseTags ?? []), ...tags]) : undefined,
+    kind: typeof cue.kind === "string" && cue.kind.trim() ? cue.kind.trim() : undefined
   };
 }
 
@@ -2623,7 +2882,13 @@ function applyPromptModePresetToDraft(current: SimulationDraft, promptMode: Pres
     defaultOutfitPrompt: current.characters[0]?.defaultOutfitPrompt ?? defaultOutfitPrompt,
     outfitPrompts: current.characters[0]?.outfitPrompts ?? defaultOutfitPrompts,
     expressionPrompts: current.characters[0]?.expressionPrompts ?? defaultExpressionPrompts,
-    defaultSafetyLevel: current.characters[0]?.defaultSafetyLevel ?? "safe"
+    defaultSafetyLevel: current.characters[0]?.defaultSafetyLevel ?? "safe",
+    // The creator's photoreal work on this slot is not part of any preset: a mode card rewrites the character's
+    // NovelAI identity, not the faces picked in the profile studio or the 실사 외형 text. Rebuilding the character
+    // without these keys lost a fresh pick on create, and on edit made updateStateFromDraft fall back to the STORED
+    // profile — so the saved simulation brought back what the editor showed as gone. Copied key for key, so a key
+    // the draft never had stays absent.
+    ...pickCharacterPhotorealFields(current.characters[0])
   };
   const characters = current.characters.length > 0 ? [primaryCharacter, ...current.characters.slice(1)] : [primaryCharacter];
   const modeTags = ["mode-rule", ...preset.activationTags];
@@ -2766,6 +3031,19 @@ function applyPromptModePresetToDraft(current: SimulationDraft, promptMode: Pres
       temperature: preset.temperature,
       maxTokens: preset.maxTokens
     }
+  };
+}
+
+function pickCharacterPhotorealFields(
+  character: SimulationCharacterDraft | undefined
+): Pick<SimulationCharacterDraft, "photorealPrompt" | "photorealNegativePrompt" | "profileImages"> {
+  if (!character) {
+    return {};
+  }
+  return {
+    ...("photorealPrompt" in character ? { photorealPrompt: character.photorealPrompt } : {}),
+    ...("photorealNegativePrompt" in character ? { photorealNegativePrompt: character.photorealNegativePrompt } : {}),
+    ...("profileImages" in character ? { profileImages: character.profileImages } : {})
   };
 }
 
@@ -3185,15 +3463,23 @@ function createDraftFromState(source: AppState): SimulationDraft {
         defaultOutfitPrompt: visual?.defaultOutfitPrompt ?? defaultOutfitPrompt,
         outfitPrompts: visual?.outfitPrompts ?? defaultOutfitPrompts,
         expressionPrompts: visual?.expressionPrompts ?? defaultExpressionPrompts,
-        defaultSafetyLevel: visual?.defaultSafetyLevel ?? "safe"
+        defaultSafetyLevel: visual?.defaultSafetyLevel ?? "safe",
+        // Always written, undefined included: updateStateFromDraft reads a PRESENT-but-undefined key as "cleared
+        // in the editor". Without these the builder silently dropped a character's photoreal appearance and its
+        // picked profile images on every edit. Profile images go through the shareable whitelist so a
+        // candidate's in-memory bytes can never ride along into the draft.
+        photorealPrompt: visual?.photorealPrompt,
+        photorealNegativePrompt: visual?.photorealNegativePrompt,
+        profileImages: toShareableCharacterProfileImages(visual?.profileImages)
       };
     }),
     modules: source.modules.map((module) => ({ ...module })),
-    imageProfile: { ...source.imageProfile },
+    imageProfile: { ...source.imageProfile, backendRouting: resolveImageBackendRouting(source.imageProfile) },
     neuralMap: { ...source.neuralMap },
     relationshipMap: { ...source.relationshipMap },
     llm: toShareableLlmSettings(source.llm),
-    novelAi: toShareableNovelAiSettings(source.novelAi)
+    novelAi: toShareableNovelAiSettings(source.novelAi),
+    photoreal: toShareablePhotorealSettings(source.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS)
   };
 }
 
@@ -3204,7 +3490,12 @@ function normalizeBuilderDraft(draft: SimulationDraft): SimulationDraft {
       ...draft.relationshipMap,
       parameters: ensureUniqueRelationshipParameterIds(draft.relationshipMap.parameters)
     },
-    imageScenePresets: ensureDraftImageScenePresetIds(draft.imageScenePresets ?? [])
+    imageScenePresets: ensureDraftImageScenePresetIds(draft.imageScenePresets ?? []),
+    // The builder reads these unguarded (routing card, photoreal section), and a draft handed in by an older build
+    // has neither. Normalizing once on entry is safe: the builder exposes no numeric photoreal field for the clamps
+    // in normalizePhotorealSettings to fight with.
+    imageProfile: { ...draft.imageProfile, backendRouting: resolveImageBackendRouting(draft.imageProfile) },
+    photoreal: normalizePhotorealSettings(draft.photoreal)
   };
 }
 
@@ -3276,7 +3567,13 @@ function updateStateFromDraft(existing: AppState, draft: SimulationDraft): AppSt
       outfitPrompts: character.outfitPrompts ?? previous?.outfitPrompts ?? defaultOutfitPrompts,
       expressionPrompts: character.expressionPrompts ?? previous?.expressionPrompts ?? defaultExpressionPrompts,
       referenceImageAssetIds: previous?.referenceImageAssetIds ?? [],
-      defaultSafetyLevel: character.defaultSafetyLevel
+      defaultSafetyLevel: character.defaultSafetyLevel,
+      // The draft is the editor's copy and wins, including an explicit undefined (a profile the creator removed).
+      // `previous` only fills in for a draft from a builder that never carried the keys at all; hydrateState below
+      // re-validates the profile images either way.
+      photorealPrompt: "photorealPrompt" in character ? character.photorealPrompt : previous?.photorealPrompt,
+      photorealNegativePrompt: "photorealNegativePrompt" in character ? character.photorealNegativePrompt : previous?.photorealNegativePrompt,
+      profileImages: "profileImages" in character ? character.profileImages : previous?.profileImages
     };
   });
   const scenePresetSeenIds = new Set<string>();
@@ -3360,6 +3657,14 @@ function updateStateFromDraft(existing: AppState, draft: SimulationDraft): AppSt
       verifiedAt: existing.novelAi.verifiedAt,
       verificationMessage: existing.novelAi.verificationMessage,
       subscriptionTier: existing.novelAi.subscriptionTier
+    },
+    // Same split as NovelAI: the builder owns the configuration, this machine's last connection check survives the
+    // edit. A draft from a builder that predates photoreal keeps the simulation's current settings.
+    photoreal: {
+      ...toShareablePhotorealSettings(draft.photoreal ?? existing.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS),
+      registrationStatus: existing.photoreal?.registrationStatus ?? "idle",
+      verifiedAt: existing.photoreal?.verifiedAt,
+      verificationMessage: existing.photoreal?.verificationMessage
     },
     selectedModuleId: modules[0]?.id,
     selectedContextPackId: existing.selectedContextPackId
@@ -4508,6 +4813,23 @@ interface RunOwner {
   progressRunId: string;
 }
 
+/** Runs an LLM call outside a turn on the app's local-GPU lock (localGpuCoordinator). */
+type LocalLlmTaskRunner = <T>(state: AppState, task: () => Promise<T>) => Promise<T>;
+
+/** A settings section a button outside the settings tab asked to show. `id` makes a repeated click a new request. */
+interface SettingsJumpRequest {
+  section: "photoreal";
+  id: string;
+}
+
+/** One execution of an image job (see runQueuedImageJob). */
+interface ImageJobDispatch {
+  /** Stamped on the job record as providerPayload.dispatchToken when this dispatch claims it. */
+  token: string;
+  owner: RunOwner;
+  controller: AbortController;
+}
+
 function readRunOwner(state: AppState): RunOwner {
   return { simulationId: state.simulation.id, progressRunId: state.activeProgressRunId };
 }
@@ -4831,7 +5153,15 @@ function App() {
   const [runtimeNotices, setRuntimeNotices] = useState<RuntimeNotice[]>([]);
   const runtimeNoticeTimersRef = useRef<Map<string, number>>(new Map());
   const [storageReady, setStorageReady] = useState(false);
-  const imageJobQueueRef = useRef<Promise<void>>(Promise.resolve());
+  // One serial chain PER RENDERER, not one for all images. NovelAI is a remote API and photoreal is the local GPU;
+  // behind a single chain a paragraph-cadence turn's eight NovelAI cuts held every photoreal cut back (and the
+  // reverse), although the two never compete for anything. Each backend stays serial within itself.
+  const imageJobQueuesRef = useRef<Map<ImageBackendId, Promise<void>>>(new Map());
+  // The dispatch that currently owns each executing image job, keyed by job id. A cancel, a regeneration and a run
+  // switch end a dispatch here, synchronously: its controller aborts the provider request (for photoreal the relay
+  // then interrupts ComfyUI, so the GPU lock and the photoreal chain are released at once), and its token stops
+  // every later write of that dispatch from landing on the cut.
+  const imageJobDispatchesRef = useRef<Map<string, ImageJobDispatch>>(new Map());
   const imageAssetHydrationAttemptsRef = useRef<Map<string, number>>(new Map());
   const imagePayloadCompactionAttemptsRef = useRef<Map<string, number>>(new Map());
   const neuralMapPrimeAttemptsRef = useRef<Set<string>>(new Set());
@@ -4862,6 +5192,36 @@ function App() {
   const dismissRuntimeNotice = useCallback((noticeId: string) => {
     setRuntimeNotices((current) => current.filter((notice) => notice.id !== noticeId));
   }, []);
+
+  // A 16 GB card holds a local Ollama model or a photoreal model, not both; whichever spills runs at a fraction of a
+  // token per second. ONE coordinator for the whole app, because the lock only works if every turn and every
+  // photoreal job queue on the same instance. It decides per call whether to engage (shouldCoordinateLocalGpu) and
+  // is a pass-through otherwise, so it costs nothing for hosted LLMs or a remote ComfyUI.
+  const localGpuHandoffNoticeShownRef = useRef(false);
+  const localGpuCoordinatorRef = useRef<ReturnType<typeof createLocalGpuCoordinator> | null>(null);
+  if (localGpuCoordinatorRef.current === null) {
+    localGpuCoordinatorRef.current = createLocalGpuCoordinator({
+      onHandoff: () => {
+        // Once per page session: the first handoff explains the pause before a cut; every later one would only
+        // repeat it on each turn.
+        if (localGpuHandoffNoticeShownRef.current) {
+          return;
+        }
+        localGpuHandoffNoticeShownRef.current = true;
+        pushRuntimeNotice(
+          "로컬 GPU 교대를 시작했습니다. Ollama 모델과 실사 모델이 VRAM에 함께 올라가지 않아, 턴과 실사 이미지 사이에 서로의 모델을 내리고 다시 올립니다.",
+          "info"
+        );
+      }
+    });
+  }
+  const localGpu = localGpuCoordinatorRef.current;
+  // For LLM calls made outside a turn (the settings panel's '실제 API 턴 테스트'): the same lock a turn takes, so a local
+  // Ollama never loads beside a photoreal model still resident on a 16 GB card, where it spills to 0.1 tok/s.
+  const runLocalLlmTask = useCallback(
+    <T,>(taskState: AppState, task: () => Promise<T>): Promise<T> => localGpu.run("llm", taskState, task),
+    [localGpu]
+  );
 
   const flushPendingStateSaves = useCallback(() => {
     const pending = [...pendingStateSavesRef.current.values()];
@@ -5438,7 +5798,10 @@ function App() {
   );
 
   const resolveStateWithRuntimeSecrets = useCallback(
-    async (sourceState: AppState): Promise<AppState> => {
+    // `syncActiveState: false` is for a state that is not the active run (the builder's profile test): a recovered
+    // vault is still saved, and the vault effects bring it to the active simulation the usual way, but this call
+    // itself leaves App state alone.
+    async (sourceState: AppState, options: { syncActiveState?: boolean } = {}): Promise<AppState> => {
       let nextVault = personalApiVault;
       let nextState = applyPersonalApiVault(sourceState, nextVault);
       const needsLlmSecret = nextState.llm.provider !== "mock" && !hasStoredSecret(nextState.llm);
@@ -5462,7 +5825,9 @@ function App() {
         if (recoveredLlm || recoveredNovelAi) {
           savePersonalApiVault(mergedVault);
           setPersonalApiVault(mergedVault);
-          setState((current) => applyPersonalApiVault(current, mergedVault));
+          if (options.syncActiveState !== false) {
+            setState((current) => applyPersonalApiVault(current, mergedVault));
+          }
           showRuntimeNotice(
             [
               recoveredLlm ? `${getLlmProviderOption(mergedState.llm.provider).label} 키 복원` : undefined,
@@ -5481,6 +5846,72 @@ function App() {
       return nextState;
     },
     [personalApiVault, setState, showRuntimeNotice]
+  );
+
+  // The builder's profile-image test. A draft is not a simulation yet and is never the active run, so the test runs
+  // against a throwaway state built from it (createDraftPreviewState keeps the draft's character ids) with this
+  // person's secrets applied. Nothing here writes App state: the candidates go back to the builder, which holds them
+  // in component state only. The work still joins the renderer's serial chain, and photoreal work takes the local GPU
+  // lock, because a test spends the same NovelAI account and the same GPU as the story's cuts.
+  const testGenerateCharacterImage = useCallback(
+    async (request: CharacterProfileTestRequest): Promise<CharacterProfileTestResult> => {
+      const { signal } = request;
+      signal.throwIfAborted();
+      const runtimeState = await resolveStateWithRuntimeSecrets(createDraftPreviewState(request.draft), { syncActiveState: false });
+      signal.throwIfAborted();
+      const jobs = planCharacterProfileTestJobs(runtimeState, {
+        characterId: request.draftCharacterId,
+        backend: request.backend,
+        prompt: request.prompt,
+        negativePrompt: request.negativePrompt,
+        variant: request.variant,
+        count: request.count
+      });
+      // The candidates run where the panel asked, or not at all. The planner already refuses a photoreal request the
+      // safety floor would move to NovelAI — the panel labels a photoreal test free, so it must never quietly spend
+      // Anlas — and checking every job here keeps that true whatever the planner hands back. Thrown before
+      // onPlanned, so the panel shows it as a refusal (nothing ran), not as a failed run.
+      const backend = request.backend;
+      const moved = jobs.find((job) => readImageJobBackend(job) !== backend);
+      if (moved) {
+        throw new Error([`이 프롬프트는 ${imageBackendLabels[backend]}로 생성할 수 없습니다.`, moved.routing?.reason].filter(Boolean).join(" "));
+      }
+      request.onPlanned?.({ total: jobs.length });
+
+      // Started means generating, not merely out of the chain: a photoreal test can still wait for the local GPU behind
+      // a turn after that, and a cancel during that wait must answer at once (awaitQueuedWork), not when the lock comes.
+      let started = false;
+      const notRun = (): { assets: ImageAsset[]; errors: string[] } => ({ assets: [], errors: [] });
+      const render = async (): Promise<{ assets: ImageAsset[]; errors: string[] }> => {
+        // Cancelled while it waited in the chain: the caller has already been answered, so hand the slot straight on.
+        if (signal.aborted) {
+          return notRun();
+        }
+        const run = () => {
+          started = true;
+          request.onStart?.();
+          return runCharacterProfileTestJobs(runtimeState, jobs, {
+            signal,
+            onImage: (asset) => request.onImage?.(asset),
+            onSettled: request.onSettled
+          });
+        };
+        if (backend !== "photoreal") {
+          return run();
+        }
+        // The lock decides from the LLM the App's turns run on, since that is the model that may be holding the card,
+        // and from the draft's photoreal settings, which are the ones this render uses. A test cancelled while it
+        // waited is skipped when its turn comes, before Ollama is unloaded for it.
+        const live = latestStateRef.current;
+        return localGpu.run("image", { ...runtimeState, llm: live.llm, imageTagLlm: live.imageTagLlm }, run, {
+          shouldRun: () => !signal.aborted,
+          onSkip: notRun
+        });
+      };
+      const result = await awaitQueuedWork(chainImageBackendWork(imageJobQueuesRef.current, backend, render), signal, () => started);
+      return { ...result, backend };
+    },
+    [localGpu, resolveStateWithRuntimeSecrets]
   );
 
   const updateLlmSettings = useCallback((patch: Partial<LlmApiSettings>) => {
@@ -5581,13 +6012,15 @@ function App() {
   }, [persistPersonalApiVault]);
 
   const runQueuedImageJob = useCallback((job: ImageGenerationJob, snapshot: AppState, confirmed = false): Promise<void> => {
+    const backend = readImageJobBackend(job);
+    const backendLabel = imageBackendLabels[backend];
     const run = async () => {
-    // Image generation is the longest-running async path in the app — a NovelAI round-trip behind a serialized
-    // queue — so it is the most likely to outlive a navigation, and it was the only major path with no
-    // ownership check at all. Every setState below is gated on the job still belonging to the open run;
+    // Image generation is the longest-running async path in the app — a NovelAI round-trip or a local GPU render
+    // behind a serialized queue — so it is the most likely to outlive a navigation, and it was the only major path
+    // with no ownership check at all. Every setState below is gated on the job still belonging to the open run;
     // without this, assets and jobs from simulation A appeared in simulation B's library.
     const jobOwner = readRunOwner(snapshot);
-    const executableJob = confirmed
+    const confirmedJob = confirmed
       ? {
           ...job,
           providerPayload: {
@@ -5598,174 +6031,346 @@ function App() {
         }
       : job;
 
-    if (!shouldAutoRunImageJob(executableJob, snapshot)) {
+    if (!shouldAutoRunImageJob(confirmedJob, snapshot)) {
       return;
     }
 
-    const markJob = (patch: Partial<ImageGenerationJob>) => {
-      setState((current) => (!ownsActiveRun(current, jobOwner) ? current : {
-        ...current,
-        imageJobs: current.imageJobs.map((candidate) =>
-          candidate.id === executableJob.id && candidate.status !== "canceled"
-            ? {
-                ...candidate,
-                ...patch,
-                updatedAt: new Date().toISOString()
-              }
-            : candidate
-        )
-      }));
+    // The job may have waited behind earlier cuts for a while, and the live job can have moved on since this
+    // dispatch was queued: the user left the run, cancelled the cut, or regenerated it — a regeneration reuses
+    // the id and queues its own run (possibly on the other backend's chain). Running this copy then would spend a
+    // paid NovelAI request or a local GPU render on a result every write below discards, or execute the stale
+    // plan next to the new one and clobber it. A live copy NEWER than this one means superseded. An equally old
+    // one only counts when cancelled; an older cancelled one is the regeneration of a cancelled cut, whose fresh
+    // copy the live view simply has not caught up with yet.
+    const liveState = latestStateRef.current;
+    const liveJob = liveState.imageJobs.find((candidate) => candidate.id === confirmedJob.id);
+    const liveUpdatedAt = liveJob?.updatedAt ?? "";
+    const queuedUpdatedAt = confirmedJob.updatedAt ?? "";
+    const superseded =
+      Boolean(liveJob) && (liveUpdatedAt > queuedUpdatedAt || (liveJob?.status === "canceled" && liveUpdatedAt === queuedUpdatedAt));
+    if (!ownsActiveRun(liveState, jobOwner) || superseded) {
+      return;
+    }
+
+    // This dispatch's identity. "The record is not cancelled" cannot tell whose write is whose: a regeneration
+    // reuses the job id and may run on the other renderer's chain while this copy still renders, and a cancelled
+    // cut can be regenerated before its own request returns. With one chain for every renderer the regeneration
+    // always ran last, so it won; with a chain per renderer the stale result could land on top of it. So the
+    // dispatch claims the record by stamping this token on it, and each later write lands only while the record
+    // still carries it.
+    const dispatchToken = createId("image_dispatch");
+    const controller = new AbortController();
+    const dispatches = imageJobDispatchesRef.current;
+    // A dispatch of the same job that is still running is one this copy supersedes; its result could only be
+    // discarded, so its request is stopped rather than left to finish.
+    dispatches.get(confirmedJob.id)?.controller.abort();
+    dispatches.set(confirmedJob.id, { token: dispatchToken, owner: jobOwner, controller });
+    const isCurrentDispatch = () => !controller.signal.aborted && dispatches.get(confirmedJob.id)?.token === dispatchToken;
+    const executableJob: ImageGenerationJob = {
+      ...confirmedJob,
+      providerPayload: { ...confirmedJob.providerPayload, dispatchToken }
     };
+    const ownsRecord = (record: ImageGenerationJob | undefined) =>
+      Boolean(record) && record?.status !== "canceled" && readImageJobDispatchToken(record) === dispatchToken;
 
-    markJob({ ...executableJob, status: "generating" });
-
-    let result: Awaited<ReturnType<typeof executeImageJob>>;
     try {
-      result = await executeImageJob(snapshot, executableJob, {
-        onProgress: async (progress) => {
-          const progressAssets = await persistRuntimeImagePayloads(snapshot.simulation.id, progress.assets);
-          const progressAssetIds = progressAssets.map((asset) => asset.id);
-          const progressJob = {
-            ...progress.job,
-            assetIds: progressAssetIds,
-            representativeAssetId: progressAssets[0]?.id ?? progress.job.representativeAssetId
+      // Claims the record when the work actually starts. Judged on the authoritative state, not on the live view
+      // above, which can trail a cancel or a regeneration by a render: a record cancelled since, or replaced by a
+      // newer copy, is left alone, and then nothing this dispatch does afterwards can reach it either.
+      const claimJob = () => {
+        setState((current) => {
+          if (!ownsActiveRun(current, jobOwner)) {
+            return current;
+          }
+          const record = current.imageJobs.find((candidate) => candidate.id === executableJob.id);
+          if (!record || record.status === "canceled" || (record.updatedAt ?? "") > queuedUpdatedAt) {
+            return current;
+          }
+          return {
+            ...current,
+            imageJobs: current.imageJobs.map((candidate) =>
+              candidate.id === executableJob.id
+                ? { ...candidate, ...executableJob, status: "generating", updatedAt: new Date().toISOString() }
+                : candidate
+            )
           };
-          setState((current) => {
-            if (!ownsActiveRun(current, jobOwner)) {
-              return current;
-            }
-            const existing = current.imageJobs.find((candidate) => candidate.id === progressJob.id);
-            if (existing?.status === "canceled") {
-              return current;
-            }
+        });
+      };
 
-            const nextState = {
-              ...current,
-              imageJobs: current.imageJobs.map((candidate) =>
-                candidate.id === progressJob.id
-                  ? {
-                      ...candidate,
-                      ...progressJob,
-                      status: candidate.status === "canceled" ? candidate.status : progressJob.status
-                    }
-                  : candidate
-              ),
-              imageAssets: upsertImageAssets(current.imageAssets, progressAssets),
-              messages: current.messages.map((message) =>
-                message.id === progressJob.turnId
-                  ? {
-                      ...message,
-                      imageAssetIds: mergeGeneratedMessageImageAssetIds(message.imageAssetIds, current.imageAssets, progressAssets)
-                    }
-                  : message
-              ),
-              turnTraces: current.turnTraces.map((trace) => {
-                if (trace.imageJobId !== progressJob.id && trace.assistantMessageId !== progressJob.turnId) {
-                  return trace;
-                }
-
-                const nextImageAssetIds = uniqueIds([...trace.imageAssetIds, ...progressAssetIds]);
-                return {
-                  ...trace,
-                  imageAssetIds: nextImageAssetIds,
-                  metrics: {
-                    ...trace.metrics,
-                    imageAssetCount: Math.max(trace.metrics.imageAssetCount, nextImageAssetIds.length)
+      const markJob = (patch: Partial<ImageGenerationJob>) => {
+        setState((current) => {
+          if (!ownsActiveRun(current, jobOwner) || !ownsRecord(current.imageJobs.find((candidate) => candidate.id === executableJob.id))) {
+            return current;
+          }
+          return {
+            ...current,
+            imageJobs: current.imageJobs.map((candidate) =>
+              candidate.id === executableJob.id
+                ? {
+                    ...candidate,
+                    ...patch,
+                    updatedAt: new Date().toISOString()
                   }
-                };
-              })
-            };
-            scheduleStatePersistence(nextState);
-            return nextState;
-          });
+                : candidate
+            )
+          };
+        });
+      };
+
+      // Asked again once the local GPU is this cut's, before anything is unloaded for it: a render can wait a minute
+      // behind a local LLM turn, and its cut can be cancelled, regenerated or left behind meanwhile. A cut nobody
+      // wants any more must not evict the LLM it was waiting on, nor hold the lock for the next turn.
+      const stillWanted = () => {
+        if (!isCurrentDispatch()) {
+          return false;
         }
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown NovelAI generation error";
-      markJob({
-        status: "failed",
-        error: message,
-        completedAt: new Date().toISOString()
-      });
-      showRuntimeNotice(`NovelAI 이미지 생성 실패: ${message}`);
-      return;
-    }
+        const live = latestStateRef.current;
+        if (!ownsActiveRun(live, jobOwner)) {
+          return false;
+        }
+        const record = live.imageJobs.find((candidate) => candidate.id === executableJob.id);
+        // The live view may not show the record yet, or still show the queued copy (the claim comes after this);
+        // it only has to show no cancel and no newer copy.
+        return !record || ownsRecord(record) || (record.status !== "canceled" && (record.updatedAt ?? "") <= queuedUpdatedAt);
+      };
 
-    // executeImageJob reports provider errors by RETURNING a failed job rather than throwing (the policy-block
-    // and partial-variant paths both do), so the catch above never saw them. Those failures were completely
-    // silent in auto mode — the only trace was a status chip in a panel the user may not have open.
-    if (result.job.status === "failed") {
-      showRuntimeNotice(`NovelAI 이미지 생성 실패: ${result.job.error ?? "알 수 없는 오류"}`);
-    }
+      // Precise Reference costs Anlas per image, so a queued NovelAI cut follows the toggle as it is when the cut
+      // runs, not as it was when its turn queued it: unticking it has to stop the cuts still waiting on the chain.
+      // Same run as the snapshot (checked above), so these are this simulation's own settings.
+      const liveNovelAi = liveState.novelAi;
+      const executionState: AppState =
+        backend === "novelai"
+          ? {
+              ...snapshot,
+              novelAi: {
+                ...snapshot.novelAi,
+                characterReferenceEnabled: liveNovelAi.characterReferenceEnabled,
+                characterReferenceStrength: liveNovelAi.characterReferenceStrength,
+                characterReferenceFidelity: liveNovelAi.characterReferenceFidelity,
+                characterReferenceStyleAware: liveNovelAi.characterReferenceStyleAware
+              }
+            }
+          : snapshot;
 
-    const resultAssets = await persistRuntimeImagePayloads(snapshot.simulation.id, result.assets);
-    result = {
-      ...result,
-      assets: resultAssets,
-      job: {
-        ...result.job,
-        assetIds: resultAssets.map((asset) => asset.id),
-        representativeAssetId: resultAssets[0]?.id ?? result.job.representativeAssetId
+      const execute = (): Promise<ImageJobExecutionResult> => {
+        claimJob();
+        return executeImageJob(executionState, executableJob, {
+          // Cancel, regeneration and a run switch abort this; a cancelled request comes back `canceled`, and for
+          // photoreal the relay interrupts the ComfyUI prompt when the request goes away.
+          signal: controller.signal,
+          onProgress: async (progress) => {
+            // A dispatch that was cancelled or superseded meanwhile stores nothing: its images would be orphaned.
+            if (!isCurrentDispatch()) {
+              return;
+            }
+            const progressAssets = await persistRuntimeImagePayloads(snapshot.simulation.id, progress.assets);
+            const progressAssetIds = progressAssets.map((asset) => asset.id);
+            const progressJob = {
+              ...progress.job,
+              assetIds: progressAssetIds,
+              representativeAssetId: progressAssets[0]?.id ?? progress.job.representativeAssetId
+            };
+            setState((current) => {
+              if (!ownsActiveRun(current, jobOwner) || !ownsRecord(current.imageJobs.find((candidate) => candidate.id === progressJob.id))) {
+                return current;
+              }
+
+              const nextState = {
+                ...current,
+                imageJobs: current.imageJobs.map((candidate) =>
+                  candidate.id === progressJob.id
+                    ? {
+                        ...candidate,
+                        ...progressJob
+                      }
+                    : candidate
+                ),
+                imageAssets: upsertImageAssets(current.imageAssets, progressAssets),
+                messages: current.messages.map((message) =>
+                  message.id === progressJob.turnId
+                    ? {
+                        ...message,
+                        imageAssetIds: mergeGeneratedMessageImageAssetIds(message.imageAssetIds, current.imageAssets, progressAssets)
+                      }
+                    : message
+                ),
+                turnTraces: current.turnTraces.map((trace) => {
+                  if (trace.imageJobId !== progressJob.id && trace.assistantMessageId !== progressJob.turnId) {
+                    return trace;
+                  }
+
+                  const nextImageAssetIds = uniqueIds([...trace.imageAssetIds, ...progressAssetIds]);
+                  return {
+                    ...trace,
+                    imageAssetIds: nextImageAssetIds,
+                    metrics: {
+                      ...trace.metrics,
+                      imageAssetCount: Math.max(trace.metrics.imageAssetCount, nextImageAssetIds.length)
+                    }
+                  };
+                })
+              };
+              scheduleStatePersistence(nextState);
+              return nextState;
+            });
+          }
+        });
+      };
+
+      let result: ImageJobExecutionResult | undefined;
+      try {
+        // Only a photoreal render takes the local GPU lock: NovelAI renders on NovelAI's servers, and holding the
+        // lock for it would stall a local LLM turn for nothing. The coordinator itself decides whether this machine
+        // needs a handoff at all (Ollama and ComfyUI both local); otherwise run() just runs the render. While it
+        // waits for the lock the cut stays "queued" (it is claimed as "generating" only once it starts), and
+        // stillWanted() skips it when its turn comes if it is no longer wanted.
+        result =
+          backend === "photoreal"
+            ? await localGpu.run<ImageJobExecutionResult | undefined>("image", snapshot, execute, {
+                shouldRun: stillWanted,
+                onSkip: () => undefined
+              })
+            : await execute();
+      } catch (error) {
+        if (!isCurrentDispatch()) {
+          return;
+        }
+        const message = error instanceof Error && error.message.trim() ? error.message : `${backendLabel} 이미지 생성 중 알 수 없는 오류`;
+        markJob({
+          status: "failed",
+          error: message,
+          completedAt: new Date().toISOString()
+        });
+        showRuntimeNotice(`${backendLabel} 이미지 생성 실패: ${stripImageFailureLead(message, backend) || "알 수 없는 오류"}`);
+        return;
       }
+
+      // Skipped on its GPU turn, cancelled, or superseded while it ran: nothing of this dispatch reaches the cut —
+      // not its status, not its images, and no failure toast for a cut the user has already moved on from.
+      if (!result || result.job.status === "canceled" || !isCurrentDispatch()) {
+        return;
+      }
+
+      // executeImageJob reports provider errors by RETURNING a failed job rather than throwing (the policy-block
+      // and partial-variant paths both do), so the catch above never saw them. Those failures were completely
+      // silent in auto mode — the only trace was a status chip in a panel the user may not have open.
+      if (result.job.status === "failed") {
+        showRuntimeNotice(`${backendLabel} 이미지 생성 실패: ${stripImageFailureLead(result.job.error ?? "", backend) || "알 수 없는 오류"}`);
+      }
+
+      const resultAssets = await persistRuntimeImagePayloads(snapshot.simulation.id, result.assets);
+      const finalResult: ImageJobExecutionResult = {
+        ...result,
+        assets: resultAssets,
+        job: {
+          ...result.job,
+          assetIds: resultAssets.map((asset) => asset.id),
+          representativeAssetId: resultAssets[0]?.id ?? result.job.representativeAssetId
+        }
+      };
+
+      setState((current) => {
+        // Not this dispatch's record any more (cancelled, or replaced by a regeneration): the result is dropped
+        // whole, its images included, so the cut keeps showing what the user asked for last.
+        if (!ownsActiveRun(current, jobOwner) || !ownsRecord(current.imageJobs.find((candidate) => candidate.id === executableJob.id))) {
+          return current;
+        }
+
+        const nextState = {
+          ...current,
+          imageJobs: current.imageJobs.map((candidate) => (candidate.id === finalResult.job.id ? finalResult.job : candidate)),
+          imageAssets: upsertImageAssets(current.imageAssets, finalResult.assets),
+          auditLog: [
+            ...current.auditLog,
+            createAuditEvent(current, "generation_job_completed", "image_job", finalResult.job.id, {
+              status: finalResult.job.status,
+              assetCount: finalResult.assets.length,
+              error: finalResult.job.error
+            })
+          ],
+          turnTraces: current.turnTraces.map((trace) => {
+            if (trace.imageJobId !== finalResult.job.id && trace.assistantMessageId !== finalResult.job.turnId) {
+              return trace;
+            }
+
+            const nextImageAssetIds = uniqueIds([...trace.imageAssetIds, ...finalResult.assets.map((asset) => asset.id)]);
+            return {
+              ...trace,
+              imageAssetIds: nextImageAssetIds,
+              metrics: {
+                ...trace.metrics,
+                imageAssetCount: nextImageAssetIds.length,
+                imageEstimatedCost: readProviderCost(finalResult.job.providerPayload) ?? trace.metrics.imageEstimatedCost
+              }
+            };
+          }),
+          messages: current.messages.map((message) =>
+            message.id === finalResult.job.turnId
+              ? {
+                  ...message,
+                  imageAssetIds: mergeGeneratedMessageImageAssetIds(message.imageAssetIds, current.imageAssets, finalResult.assets)
+                }
+              : message
+          )
+        };
+        scheduleStatePersistence(nextState, { includeImagePayloads: finalResult.assets.some((asset) => Boolean(asset.dataUrl)) });
+        return nextState;
+      });
+    } finally {
+      if (dispatches.get(confirmedJob.id)?.token === dispatchToken) {
+        dispatches.delete(confirmedJob.id);
+      }
+    }
     };
 
+    return chainImageBackendWork(imageJobQueuesRef.current, backend, run);
+  }, [localGpu, scheduleStatePersistence, showRuntimeNotice]);
+
+  // Leaving a run abandons its image work: every write of a running cut is gated on the run it started in, so a
+  // render that outlived the switch would only spend the GPU or the NovelAI account on a picture nobody sees, and
+  // keep the next run's cuts and turns waiting behind it.
+  const activeRunSimulationId = state.simulation.id;
+  const activeRunProgressId = state.activeProgressRunId;
+  useEffect(() => {
+    const activeOwner: RunOwner = { simulationId: activeRunSimulationId, progressRunId: activeRunProgressId };
+    const dispatches = imageJobDispatchesRef.current;
+    dispatches.forEach((dispatch, jobId) => {
+      if (dispatch.owner.simulationId !== activeOwner.simulationId || dispatch.owner.progressRunId !== activeOwner.progressRunId) {
+        dispatches.delete(jobId);
+        dispatch.controller.abort();
+      }
+    });
+    // The other half, for the run now open: a cut a dispatch had claimed as generating, with no dispatch left to
+    // finish it — its render was abandoned when the user left this run, or the page was reloaded mid-render. Its
+    // record still says "생성 중" and would say so forever, with a spinner and no way to regenerate. It was in fact
+    // stopped, so it is marked as stopped. Safe against a render that is finishing right now: a dispatch holds the
+    // job in `dispatches` until after its final write is queued, and that write is applied before this one.
     setState((current) => {
-      if (!ownsActiveRun(current, jobOwner)) {
+      if (!ownsActiveRun(current, activeOwner) || !current.imageJobs.some((job) => job.status === "generating" && !dispatches.has(job.id))) {
         return current;
       }
-      const existing = current.imageJobs.find((candidate) => candidate.id === executableJob.id);
-      if (existing?.status === "canceled") {
-        return current;
-      }
-
-      const nextState = {
+      const stoppedAt = new Date().toISOString();
+      return {
         ...current,
-        imageJobs: current.imageJobs.map((candidate) => (candidate.id === result.job.id ? result.job : candidate)),
-        imageAssets: upsertImageAssets(current.imageAssets, result.assets),
-        auditLog: [
-          ...current.auditLog,
-          createAuditEvent(current, "generation_job_completed", "image_job", result.job.id, {
-            status: result.job.status,
-            assetCount: result.assets.length,
-            error: result.job.error
-          })
-        ],
-        turnTraces: current.turnTraces.map((trace) => {
-          if (trace.imageJobId !== result.job.id && trace.assistantMessageId !== result.job.turnId) {
-            return trace;
-          }
-
-          const nextImageAssetIds = uniqueIds([...trace.imageAssetIds, ...result.assets.map((asset) => asset.id)]);
-          return {
-            ...trace,
-            imageAssetIds: nextImageAssetIds,
-            metrics: {
-              ...trace.metrics,
-              imageAssetCount: nextImageAssetIds.length,
-              imageEstimatedCost: readProviderCost(result.job.providerPayload) ?? trace.metrics.imageEstimatedCost
-            }
-          };
-        }),
-        messages: current.messages.map((message) =>
-          message.id === result.job.turnId
-            ? {
-                ...message,
-                imageAssetIds: mergeGeneratedMessageImageAssetIds(message.imageAssetIds, current.imageAssets, result.assets)
-              }
-            : message
+        imageJobs: current.imageJobs.map((job) =>
+          job.status === "generating" && !dispatches.has(job.id)
+            ? { ...job, status: "canceled", error: ABANDONED_IMAGE_JOB_ERROR, completedAt: stoppedAt, updatedAt: stoppedAt }
+            : job
         )
       };
-      scheduleStatePersistence(nextState, { includeImagePayloads: result.assets.some((asset) => Boolean(asset.dataUrl)) });
-      return nextState;
     });
-    };
-
-    const queued = imageJobQueueRef.current.then(run, run);
-    imageJobQueueRef.current = queued.catch(() => undefined);
-    return queued;
-  }, [scheduleStatePersistence, showRuntimeNotice]);
+    // storageReady re-runs this once the persisted copy has been restored, which can bring its own stranded cuts.
+  }, [activeRunSimulationId, activeRunProgressId, setState, storageReady]);
 
   const cancelImageJob = useCallback((jobId: string) => {
+    // Stops the request as well as the record. Marking the cut cancelled used to leave a photoreal render running
+    // to its end (or its timeout), holding the local GPU lock and the photoreal chain, so the next turn and every
+    // later cut waited behind a picture that was then thrown away.
+    const dispatch = imageJobDispatchesRef.current.get(jobId);
+    if (dispatch) {
+      imageJobDispatchesRef.current.delete(jobId);
+      dispatch.controller.abort();
+    }
     setState((current) => ({
       ...current,
       imageJobs: current.imageJobs.map((job) =>
@@ -5788,9 +6393,25 @@ function App() {
     }));
   }, []);
 
-  const regenerateImageJob = useCallback((job: ImageGenerationJob) => {
+  const regenerateImageJob = useCallback((job: ImageGenerationJob, backendOverride?: ImageBackendId) => {
+    // The copy being replaced may still be running — a cut waiting for its turn on the local GPU, or a cancelled one
+    // whose request has not come back — and its result could only be discarded now, so its request stops here.
+    const previousDispatch = imageJobDispatchesRef.current.get(job.id);
+    if (previousDispatch) {
+      imageJobDispatchesRef.current.delete(job.id);
+      previousDispatch.controller.abort();
+    }
     const now = new Date().toISOString();
-    const replannedJob = planImageJob(state, job.turnId, createImageCueForRegeneration(state, job), job.contextNodeIds, true);
+    // A regeneration redraws the SAME cut: on the renderer it was routed to (re-routing today's settings would
+    // silently turn a photoreal cut into an anime one, or back), with its crop and beat kind. The user can ask
+    // for the other renderer explicitly; the safety floor in decideImageBackend still beats that request.
+    const originalBackend = readImageJobBackend(job);
+    const requestedBackend = backendOverride ?? originalBackend;
+    const regenerationCue = createImageCueForRegeneration(state, job);
+    const replannedJob = planImageJob(state, job.turnId, regenerationCue, job.contextNodeIds, true, {
+      backend: requestedBackend,
+      cueKind: regenerationCue.kind
+    });
     // Reuse the original job's id and cue position so the regenerated image REPLACES the failed one in
     // place (same slot) instead of appearing as an extra image elsewhere. The fresh prompt comes from the
     // re-plan; identity/turn linkage (turnId, cueIndex) is preserved.
@@ -5828,8 +6449,21 @@ function App() {
       ]
     }));
     void runQueuedImageJob(nextJob, state, true);
-    showRuntimeNotice("이미지 재생성 작업을 시작했습니다.");
-  }, [runQueuedImageJob, showRuntimeNotice, state]);
+    const plannedBackend = readImageJobBackend(nextJob);
+    if (backendOverride && plannedBackend !== backendOverride) {
+      // The safety floor kept the cut where it was. Said plainly, because the button promised another renderer.
+      pushRuntimeNotice(
+        `이 컷은 ${imageBackendLabels[plannedBackend]}로 고정되어 있어 ${imageBackendLabels[plannedBackend]}로 다시 생성합니다. ${nextJob.routing?.reason ?? ""}`.trim(),
+        "info"
+      );
+    } else {
+      showRuntimeNotice(
+        backendOverride && backendOverride !== originalBackend
+          ? `${imageBackendLabels[plannedBackend]}로 이미지 재생성 작업을 시작했습니다.`
+          : "이미지 재생성 작업을 시작했습니다."
+      );
+    }
+  }, [pushRuntimeNotice, runQueuedImageJob, showRuntimeNotice, state]);
 
   const updateImageFeedback = useCallback((assetId: string, rating: ImageFeedbackRating) => {
     setState((current) => {
@@ -6058,6 +6692,9 @@ function App() {
           (sum, job) => sum + (readProviderCost(job.providerPayload) ?? 0),
           0
         );
+        // The engine leaves the trace's job counts at zero when planning is deferred, which is how the app runs every
+        // turn, so the counts come from the jobs planned here; photorealJobCount used to stay 0 in every saved trace.
+        const countPhotorealJobs = (jobs: ImageGenerationJob[]) => jobs.filter((job) => readImageJobBackend(job) === "photoreal").length;
 
         setState((current) => {
           if (!ownsActiveRun(current, imageOwner)) {
@@ -6089,6 +6726,9 @@ function App() {
                   metrics: {
                     ...trace.metrics,
                     imageJobCount: isExpansion ? (trace.metrics.imageJobCount ?? 0) + newImageJobs.length : imageJobs.length,
+                    photorealJobCount: isExpansion
+                      ? (trace.metrics.photorealJobCount ?? 0) + countPhotorealJobs(newImageJobs)
+                      : countPhotorealJobs(imageJobs),
                     imageAssetCount: Math.max(trace.metrics.imageAssetCount, uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]).length),
                     imageEstimatedCost: isExpansion
                       ? (trace.metrics.imageEstimatedCost ?? 0) + imageEstimatedCost
@@ -6149,6 +6789,7 @@ function App() {
                     metrics: {
                       ...trace.metrics,
                       imageJobCount: imageJobs.length,
+                      photorealJobCount: countPhotorealJobs(imageJobs),
                       imageAssetCount: Math.max(trace.metrics.imageAssetCount, uniqueIds([...trace.imageAssetIds, ...reusedAssetIds]).length),
                       imageEstimatedCost:
                         imageEstimatedCost > 0 ? imageEstimatedCost : trace.metrics.imageEstimatedCost
@@ -6255,43 +6896,57 @@ function App() {
         // messages/result into whatever run is now active (otherwise the old run "continues" in the new one).
         // Both ids are stable across an auto session reset.
         const turnOwner = readRunOwner(turnBaseState);
-        const result = await runSimulationTurn(turnBaseState, text, shouldPlanManualImage, {
-          deferImagePlanning: true,
-          deferMemoryIngest: true,
-          // Retrieval/module selection finished; the long part from here is the LLM call itself, so flip the card
-          // to "generating" now instead of waiting for the first streamed assistant_text. Surface unusually slow
-          // retrieval (e.g. an unreachable NeuralMap).
-          onGenerationStart: ({ retrievalLatencyMs }) => {
-            setTurnPhase("generating");
-            if (retrievalLatencyMs > 12_000) {
-              showRuntimeNotice(`문맥 검색이 ${Math.round(retrievalLatencyMs / 1000)}초 걸렸습니다. NeuralMap 서버 상태를 확인하세요.`);
+        // The LLM part of the turn (narrative + annotation pass) holds the local GPU lock, so on a 16 GB card a
+        // local Ollama model never loads while a photoreal render owns the VRAM, and the reverse. Image planning
+        // below stays outside it: photoreal jobs take the lock themselves, after this turn has released it.
+        let turnStarted = false;
+        const result = await awaitQueuedWork(
+          localGpu.run("llm", turnBaseState, () => {
+            turnStarted = true;
+            if (turnAbortController.signal.aborted) {
+              return Promise.reject(createQueuedWorkCancelledError());
             }
-          },
-          onAssistantText: ({ userMessage, assistantMessage }) => {
-            setTurnPhase("generating");
-            // Remembered so a cancel can roll the partial turn back out: the narrative streams into state
-            // every ~220ms, so by the time the user hits 중지 both messages are already on screen, and
-            // leaving them there commits a truncated turn as if it had completed.
-            streamedTurnMessageIds = [userMessage.id, assistantMessage.id];
-            setState((current) => {
-              if (!ownsActiveRun(current, turnOwner)) {
-                return current;
+            return runSimulationTurn(turnBaseState, text, shouldPlanManualImage, {
+              deferImagePlanning: true,
+              deferMemoryIngest: true,
+              // Retrieval/module selection finished; the long part from here is the LLM call itself, so flip the card
+              // to "generating" now instead of waiting for the first streamed assistant_text. Surface unusually slow
+              // retrieval (e.g. an unreachable NeuralMap).
+              onGenerationStart: ({ retrievalLatencyMs }) => {
+                setTurnPhase("generating");
+                if (retrievalLatencyMs > 12_000) {
+                  showRuntimeNotice(`문맥 검색이 ${Math.round(retrievalLatencyMs / 1000)}초 걸렸습니다. NeuralMap 서버 상태를 확인하세요.`);
+                }
+              },
+              onAssistantText: ({ userMessage, assistantMessage }) => {
+                setTurnPhase("generating");
+                // Remembered so a cancel can roll the partial turn back out: the narrative streams into state
+                // every ~220ms, so by the time the user hits 중지 both messages are already on screen, and
+                // leaving them there commits a truncated turn as if it had completed.
+                streamedTurnMessageIds = [userMessage.id, assistantMessage.id];
+                setState((current) => {
+                  if (!ownsActiveRun(current, turnOwner)) {
+                    return current;
+                  }
+                  const baseState =
+                    autoResetApplied && current.simulation.activeSessionId !== turnBaseState.simulation.activeSessionId
+                      ? layerSessionResetOntoLiveState(current, turnBaseState)
+                      : current;
+                  return upsertStreamingTurnMessages(baseState, userMessage, assistantMessage);
+                });
+              },
+              onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
+                setState((current) =>
+                  !ownsActiveRun(current, turnOwner)
+                    ? current
+                    : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
+                );
               }
-              const baseState =
-                autoResetApplied && current.simulation.activeSessionId !== turnBaseState.simulation.activeSessionId
-                  ? layerSessionResetOntoLiveState(current, turnBaseState)
-                  : current;
-              return upsertStreamingTurnMessages(baseState, userMessage, assistantMessage);
             });
-          },
-          onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
-            setState((current) =>
-              !ownsActiveRun(current, turnOwner)
-                ? current
-                : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
-            );
-          }
-        });
+          }),
+          turnAbortController.signal,
+          () => turnStarted
+        );
         const committedTurnState = applyTurnResultToState(turnBaseState, result);
         setState((current) => {
           if (!ownsActiveRun(current, turnOwner)) {
@@ -6359,7 +7014,7 @@ function App() {
         setTurnPhase(undefined);
       }
     },
-    [dispatchEarlyTurnImages, planTurnImagesWithExpansion, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
+    [dispatchEarlyTurnImages, localGpu, planTurnImagesWithExpansion, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
   );
 
   const handleSubmit = useCallback(
@@ -6556,29 +7211,41 @@ function App() {
         // Same ownership guard as runTurnFromText: drop these updates if the user switched simulation OR
         // progress run mid-regeneration, so the regenerated turn never bleeds into another run.
         const turnOwner = readRunOwner(turnBaseState);
-        const result = await runSimulationTurn(turnBaseState, regeneration.userMessage.content, regeneration.manualImage, {
-          deferImagePlanning: true,
-          deferMemoryIngest: true,
-          onAssistantText: ({ userMessage, assistantMessage }) => {
-            setState((current) => {
-              if (!ownsActiveRun(current, turnOwner)) {
-                return current;
+        // Same local GPU lock as a normal turn (see runTurnFromText).
+        let regenerationStarted = false;
+        const result = await awaitQueuedWork(
+          localGpu.run("llm", turnBaseState, () => {
+            regenerationStarted = true;
+            if (turnAbortController.signal.aborted) {
+              return Promise.reject(createQueuedWorkCancelledError());
+            }
+            return runSimulationTurn(turnBaseState, regeneration.userMessage.content, regeneration.manualImage, {
+              deferImagePlanning: true,
+              deferMemoryIngest: true,
+              onAssistantText: ({ userMessage, assistantMessage }) => {
+                setState((current) => {
+                  if (!ownsActiveRun(current, turnOwner)) {
+                    return current;
+                  }
+                  const baseState =
+                    autoResetApplied && current.simulation.activeSessionId !== turnBaseState.simulation.activeSessionId
+                      ? layerSessionResetOntoLiveState(current, turnBaseState)
+                      : current;
+                  return upsertStreamingTurnMessages(baseState, userMessage, assistantMessage);
+                });
+              },
+              onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
+                setState((current) =>
+                  !ownsActiveRun(current, turnOwner)
+                    ? current
+                    : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
+                );
               }
-              const baseState =
-                autoResetApplied && current.simulation.activeSessionId !== turnBaseState.simulation.activeSessionId
-                  ? layerSessionResetOntoLiveState(current, turnBaseState)
-                  : current;
-              return upsertStreamingTurnMessages(baseState, userMessage, assistantMessage);
             });
-          },
-          onMemoryIngested: ({ turnId, memoryEvents, memoryIngestMs }) => {
-            setState((current) =>
-              !ownsActiveRun(current, turnOwner)
-                ? current
-                : applyMemoryIngestResultToState(current, turnId, memoryEvents, memoryIngestMs)
-            );
-          }
-        });
+          }),
+          turnAbortController.signal,
+          () => regenerationStarted
+        );
         const committedTurnState = applyTurnResultToState(turnBaseState, result);
         setState((current) =>
           !ownsActiveRun(current, turnOwner)
@@ -6623,7 +7290,7 @@ function App() {
         setIsSending(false);
       }
     },
-    [dispatchEarlyTurnImages, isResetting, isSending, planTurnImagesWithExpansion, pushRuntimeNotice, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
+    [dispatchEarlyTurnImages, isResetting, isSending, localGpu, planTurnImagesWithExpansion, pushRuntimeNotice, resolveStateWithRuntimeSecrets, showRuntimeNotice, state]
   );
 
   const resetSession = useCallback(async () => {
@@ -6846,6 +7513,7 @@ function App() {
   );
 
   const simulationNavClass = `nav-button ${view === "simulation" ? "active" : ""}`;
+  const activeImageBackendsLabel = describeActiveImageBackends(state);
 
   return (
     <main className="app-shell">
@@ -6899,7 +7567,15 @@ function App() {
                 시뮬레이션
               </button>
               <StatusPill icon={<Database size={15} />} label={state.neuralMap.enabled ? "NeuralMap 연결" : "로컬 모드"} tone={state.neuralMap.enabled ? "good" : "neutral"} />
-              <StatusPill icon={<ImageIcon size={15} />} label={state.simulation.realtimeImageEnabled ? "실시간 이미지" : "저장 이미지만"} tone={state.simulation.realtimeImageEnabled ? "good" : "neutral"} />
+              <StatusPill
+                icon={<ImageIcon size={15} />}
+                label={
+                  state.simulation.realtimeImageEnabled
+                    ? `실시간 이미지${activeImageBackendsLabel ? ` · ${activeImageBackendsLabel}` : ""}`
+                    : "저장 이미지만"
+                }
+                tone={state.simulation.realtimeImageEnabled ? "good" : "neutral"}
+              />
               <button className="icon-text-button" type="button" onClick={() => setPersonalSettingsOpen(true)}>
                 <KeyRound size={16} />
                 개인 설정
@@ -6936,8 +7612,12 @@ function App() {
           key={builderSource?.simulation.id ?? "new-simulation"}
           mode={builderMode}
           initialDraft={builderSource ? createDraftFromState(builderSource) : createInitialSimulationDraft(state)}
+          simulationId={builderMode === "edit" ? builderSource?.simulation.id : undefined}
+          novelAiTokenRegistered={hasStoredSecret(normalizeStoredNovelAiSecretRecord(personalApiVault.novelAi))}
           onCancel={() => setView("home")}
           onCreate={builderMode === "edit" ? updateSimulation : createSimulation}
+          onTestGenerateCharacterImage={testGenerateCharacterImage}
+          onPersistProfileImage={persistCharacterProfileImage}
         />
       ) : (
         <SimulationRunErrorBoundary resetKey={`${state.simulation.id}:${state.messages.length}:${state.imageJobs.length}:${rightPanel}`}>
@@ -6984,6 +7664,7 @@ function App() {
             onStartAutoProgress={startAutoProgress}
             onStopAutoProgress={stopAutoProgress}
             onCancelTurn={cancelActiveTurn}
+            onRunLocalLlmTask={runLocalLlmTask}
           />
         </SimulationRunErrorBoundary>
       )}
@@ -7275,7 +7956,8 @@ function CrackSimulationRunPage({
   turnPhase,
   onStartAutoProgress,
   onStopAutoProgress,
-  onCancelTurn
+  onCancelTurn,
+  onRunLocalLlmTask
 }: {
   state: AppState;
   latestAssets: ImageAsset[];
@@ -7296,6 +7978,8 @@ function CrackSimulationRunPage({
   onStopAutoProgress: () => void;
   /** Aborts the in-flight turn's provider request. */
   onCancelTurn: () => void;
+  /** Runs an LLM call outside a turn on the shared local-GPU lock. */
+  onRunLocalLlmTask: LocalLlmTaskRunner;
   onCancelImageJob: (jobId: string) => void;
   onDeleteImageAsset: (assetId: string) => void;
   onDraftChange: (value: string) => void;
@@ -7310,7 +7994,7 @@ function CrackSimulationRunPage({
   onOpenProgressRun: (progressRunId: string) => void;
   onOpenPersonalSettings: () => void;
   onRegenerateAssistantMessage: (assistantMessageId: string) => void;
-  onRegenerateImageJob: (job: ImageGenerationJob) => void;
+  onRegenerateImageJob: (job: ImageGenerationJob, backend?: ImageBackendId) => void;
   onResetDemo: () => void;
   onResetSession: () => void;
   onStartNewRun: () => void;
@@ -7341,6 +8025,10 @@ function CrackSimulationRunPage({
   }, [readerSettings.theme]);
   const storyScrollRef = useRef<HTMLDivElement>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const opsRailRef = useRef<HTMLElement>(null);
+  // A pending "show me this settings section" from a button outside the settings tab; the settings panel that is on
+  // screen scrolls to it, focuses it and clears it.
+  const [settingsJump, setSettingsJump] = useState<SettingsJumpRequest>();
   const assetsById = useMemo(() => new Map(state.imageAssets.map((asset) => [asset.id, asset])), [state.imageAssets]);
   const allJobsByTurnId = useMemo(() => {
     const groupedJobs = new Map<string, ImageGenerationJob[]>();
@@ -7398,7 +8086,8 @@ function CrackSimulationRunPage({
   }, [state.messages]);
   const markerDate = new Date(state.messages.at(-1)?.createdAt ?? state.simulation.updatedAt);
   const latestImageJob = state.imageJobs.at(-1);
-  const rightMenuStatus = state.novelAi.enabled ? "NovelAI 연결" : "저장 이미지";
+  const activeImageBackendLabel = describeActiveImageBackends(state);
+  const rightMenuStatus = activeImageBackendLabel ? `${activeImageBackendLabel} 연결` : "저장 이미지";
   const autoResetDecision = useMemo(() => createAutoResetAgentSessionDecision(state), [state]);
   const activePendingUserText = isSending ? pendingUserText || createTurnSubmissionText(draft) : draft;
 
@@ -7423,6 +8112,19 @@ function CrackSimulationRunPage({
     onRightPanelChange(panel);
     setMobilePanelOpen(true);
   };
+
+  // '실사 설정 열기' used to switch the rail to 설정 and leave it at the top, eleven rail-heights above the ComfyUI
+  // section it names. Below 1180px the rail is hidden and the settings live in the mobile drawer, which has to open.
+  const openPhotorealSettings = () => {
+    const railHidden = !opsRailRef.current || opsRailRef.current.getClientRects().length === 0;
+    if (railHidden) {
+      openMobilePanel("settings");
+    } else {
+      onRightPanelChange("settings");
+    }
+    setSettingsJump({ section: "photoreal", id: createId("settings_jump") });
+  };
+  const clearSettingsJump = useCallback(() => setSettingsJump(undefined), []);
 
   const handleOpsRailResizePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -7725,7 +8427,11 @@ function CrackSimulationRunPage({
           <form className="crack-composer" onSubmit={onSubmit}>
             {/* Inside the composer card rather than above it: the card is position:absolute with z-index 20,
                 so a sibling in normal flow renders behind it. */}
-            <CrackSetupNotice state={state} onOpenPersonalSettings={onOpenPersonalSettings} />
+            <CrackSetupNotice
+              state={state}
+              onOpenPersonalSettings={onOpenPersonalSettings}
+              onOpenImageSettings={openPhotorealSettings}
+            />
             <textarea
               ref={composerTextareaRef}
               aria-label="메시지 보내기"
@@ -7843,7 +8549,7 @@ function CrackSimulationRunPage({
           </form>
         </section>
 
-        <aside className={`crack-ops-rail ${opsRailResizing ? "is-resizing" : ""}`} aria-label="운영 패널">
+        <aside className={`crack-ops-rail ${opsRailResizing ? "is-resizing" : ""}`} aria-label="운영 패널" ref={opsRailRef}>
           {/* role="separator" rather than button: there is nothing here to press, and the window-splitter
               role is what lets a screen reader read the current width back out of aria-valuenow while the
               arrow keys move it. The class selectors in styles.css are element-agnostic, so keeping the
@@ -7896,6 +8602,9 @@ function CrackSimulationRunPage({
               onResetDemo={onResetDemo}
               onRunImageJob={onRunImageJob}
               onStateChange={onStateChange as Dispatch<SetStateAction<AppState>>}
+              settingsJump={settingsJump}
+              onSettingsJumpHandled={clearSettingsJump}
+              onRunLocalLlmTask={onRunLocalLlmTask}
             />
           </div>
         </aside>
@@ -7922,6 +8631,9 @@ function CrackSimulationRunPage({
           onResetDemo={onResetDemo}
           onRunImageJob={onRunImageJob}
           onStateChange={onStateChange as Dispatch<SetStateAction<AppState>>}
+          settingsJump={settingsJump}
+          onSettingsJumpHandled={clearSettingsJump}
+          onRunLocalLlmTask={onRunLocalLlmTask}
         />
       </MobileOpsDock>
     </section>
@@ -7948,7 +8660,10 @@ function RuntimePanelContent({
   onRegenerateImageJob,
   onResetDemo,
   onRunImageJob,
-  onStateChange
+  onStateChange,
+  settingsJump,
+  onSettingsJumpHandled,
+  onRunLocalLlmTask
 }: {
   panel: RightPanel;
   state: AppState;
@@ -7966,10 +8681,13 @@ function RuntimePanelContent({
   onNotify: (message: string) => void;
   onOpenPersonalSettings: () => void;
   onRedactMemory: (memoryId: string) => void;
-  onRegenerateImageJob: (job: ImageGenerationJob) => void;
+  onRegenerateImageJob: (job: ImageGenerationJob, backend?: ImageBackendId) => void;
   onResetDemo: () => void;
   onRunImageJob: (job: ImageGenerationJob) => void;
   onStateChange: Dispatch<SetStateAction<AppState>>;
+  settingsJump?: SettingsJumpRequest;
+  onSettingsJumpHandled?: () => void;
+  onRunLocalLlmTask?: LocalLlmTaskRunner;
 }) {
   if (panel === "image") {
     return (
@@ -8013,6 +8731,9 @@ function RuntimePanelContent({
       onOpenPersonalSettings={onOpenPersonalSettings}
         onStateChange={onStateChange}
         onResetDemo={onResetDemo}
+        jumpRequest={settingsJump}
+        onJumpHandled={onSettingsJumpHandled}
+        onRunLocalLlmTask={onRunLocalLlmTask}
       />
     </>
   );
@@ -8183,16 +8904,100 @@ function useModalDialog(open: boolean, onClose: () => void) {
   return containerRef;
 }
 
-function CrackSetupNotice({ state, onOpenPersonalSettings }: { state: AppState; onOpenPersonalSettings: () => void }) {
+interface ImageBackendSetupNotice {
+  id: string;
+  title: string;
+  detail: string;
+  /** The backends whose settings fix it: NovelAI lives in personal settings, photoreal in the run's settings tab. */
+  backends: ImageBackendId[];
+}
+
+/**
+ * What the image routing promises that the connected backends cannot deliver, judged per ROUTED backend. Routing
+ * names where cuts want to go; an off backend hands its cuts to the other one when that one is on (so the cut
+ * still renders, just not as the screen implies), and with both off nothing renders at all. Safety-locked cuts
+ * never move to photoreal, so NovelAI being off matters even in 전부 실사 — but that is only worth a standing
+ * notice where such cuts are expected (19+); elsewhere the cut's own marker explains it.
+ */
+function describeImageBackendSetupNotices(state: AppState): ImageBackendSetupNotice[] {
+  const routing = resolveImageBackendRouting(state.imageProfile);
+  const novelAiOn = state.novelAi?.enabled === true;
+  const photorealOn = state.photoreal?.enabled === true;
+  const wantsPhotoreal = routing.mode === "photoreal" || (routing.mode === "mixed" && routing.photorealCategories.length > 0);
+  const wantsNovelAi = routing.mode !== "photoreal";
+  const lockedCutNote = "성적 장면처럼 NovelAI로 고정된 컷은 NovelAI를 켜야 생성되고, 그 전까지는 대기합니다.";
+
+  if (!novelAiOn && !photorealOn) {
+    if (wantsPhotoreal && wantsNovelAi) {
+      return [
+        {
+          id: "both-off",
+          title: "이미지 생성이 켜져 있지만 NovelAI와 실사 이미지(ComfyUI)가 모두 연결되지 않았습니다.",
+          detail: "매 턴 이미지 컷이 예약만 되고 생성되지 않습니다.",
+          backends: ["novelai", "photoreal"]
+        }
+      ];
+    }
+    return [
+      wantsPhotoreal
+        ? {
+            id: "photoreal-off",
+            title: "이미지 생성이 켜져 있지만 실사 이미지(ComfyUI)가 연결되지 않았습니다.",
+            detail: "매 턴 이미지 컷이 예약만 되고 생성되지 않습니다.",
+            backends: ["photoreal"]
+          }
+        : {
+            id: "novelai-off",
+            title: "이미지 생성이 켜져 있지만 NovelAI가 연결되지 않았습니다.",
+            detail: "매 턴 이미지 컷이 예약만 되고 생성되지 않습니다.",
+            backends: ["novelai"]
+          }
+    ];
+  }
+
+  const notices: ImageBackendSetupNotice[] = [];
+  if (wantsPhotoreal && !photorealOn) {
+    notices.push({
+      id: "photoreal-fallback",
+      title: "실사 라우팅이 켜져 있지만 실사 이미지(ComfyUI)가 꺼져 있습니다.",
+      detail: "실사로 보낼 컷도 지금은 NovelAI로 대신 생성합니다.",
+      backends: ["photoreal"]
+    });
+  }
+  if (!novelAiOn && routing.mode === "novelai") {
+    notices.push({
+      id: "novelai-fallback",
+      title: "NovelAI가 꺼져 있어 'NAI만' 모드의 컷을 실사로 대신 생성합니다.",
+      detail: lockedCutNote,
+      backends: ["novelai"]
+    });
+  } else if (!novelAiOn && state.simulation.contentRating === "adult_19") {
+    notices.push({ id: "novelai-locked", title: "성적 장면은 실사로 생성하지 않습니다.", detail: lockedCutNote, backends: ["novelai"] });
+  }
+  return notices;
+}
+
+function CrackSetupNotice({
+  state,
+  onOpenPersonalSettings,
+  onOpenImageSettings
+}: {
+  state: AppState;
+  onOpenPersonalSettings: () => void;
+  /** Opens the run's 설정 tab, where the photoreal (ComfyUI) section lives. */
+  onOpenImageSettings: () => void;
+}) {
   const llmUnconfigured = !state.llm.enabled || state.llm.provider === "mock";
   const imagesWanted =
     state.imageProfile.enabled &&
     state.simulation.realtimeImageEnabled &&
     state.imageProfile.triggerMode !== "stored_only" &&
     state.imageProfile.triggerMode !== "manual";
-  const imagesUnconfigured = imagesWanted && !state.novelAi.enabled;
+  const imageNotices = imagesWanted ? describeImageBackendSetupNotices(state) : [];
+  const needsPhotorealSettings = imageNotices.some((notice) => notice.backends.includes("photoreal"));
+  const needsNovelAiSettings = imageNotices.some((notice) => notice.backends.includes("novelai"));
 
-  if (!llmUnconfigured && !imagesUnconfigured) {
+  if (!llmUnconfigured && imageNotices.length === 0) {
     return null;
   }
 
@@ -8205,15 +9010,26 @@ function CrackSetupNotice({ state, onOpenPersonalSettings }: { state: AppState; 
             실제로 진행되지는 않습니다.
           </p>
         ) : null}
-        {imagesUnconfigured ? (
-          <p>
-            <strong>이미지 생성이 켜져 있지만 NovelAI가 연결되지 않았습니다.</strong> 매 턴 이미지가 예약되었다가 그대로 실패합니다.
+        {imageNotices.map((notice) => (
+          <p key={notice.id}>
+            <strong>{notice.title}</strong> {notice.detail}
           </p>
+        ))}
+      </div>
+      <div className="crack-setup-notice-actions">
+        {/* The NovelAI token and the LLM key live in personal settings; ComfyUI has no secret, so its section is
+            in the run's settings tab instead. Each notice gets the button that actually leads to its fix. */}
+        {llmUnconfigured || needsNovelAiSettings ? (
+          <button type="button" onClick={onOpenPersonalSettings}>
+            설정 열기
+          </button>
+        ) : null}
+        {needsPhotorealSettings ? (
+          <button type="button" onClick={onOpenImageSettings}>
+            실사 설정 열기
+          </button>
         ) : null}
       </div>
-      <button type="button" onClick={onOpenPersonalSettings}>
-        설정 열기
-      </button>
     </div>
   );
 }
@@ -8233,9 +9049,18 @@ function CrackPendingTurn({
   const referenceLabel = state.neuralMap.enabled ? "NeuralMap 참조" : "로컬 참조";
   const imageExpected = manualImage || state.imageProfile.triggerMode !== "stored_only";
   // Live image-job progress for the current turn (jobs update in React state during generation).
-  const activeImageJobs = state.imageJobs.filter(
+  const activeImageJobList = state.imageJobs.filter(
     (job) => job.status === "queued" || job.status === "planning" || job.status === "generating"
-  ).length;
+  );
+  const activeImageJobs = activeImageJobList.length;
+  // Per renderer, because the two queues run side by side and the photoreal one may be waiting on the local GPU.
+  const activeImageJobSummary = (["novelai", "photoreal"] as const)
+    .map((backend) => {
+      const count = activeImageJobList.filter((job) => readImageJobBackend(job) === backend).length;
+      return count > 0 ? `${imageBackendLabels[backend]} ${count}개` : undefined;
+    })
+    .filter((item): item is string => Boolean(item))
+    .join(" · ");
   const renderedImageAssets = state.imageJobs
     .filter((job) => job.status === "generating" || job.status === "completed")
     .reduce((sum, job) => sum + job.assetIds.length, 0);
@@ -8258,7 +9083,7 @@ function CrackPendingTurn({
       : phase === "generating"
         ? "대화 흐름을 쓰면서 이미지 컷 계획을 함께 정리하고 있습니다. 응답은 생성되는 대로 위에 나타납니다."
         : activeImageJobs > 0
-          ? `NovelAI 이미지 작업 ${activeImageJobs}개 진행 중${renderedImageAssets > 0 ? ` · ${renderedImageAssets}장 완료` : ""}.`
+          ? `이미지 작업 진행 중 (${activeImageJobSummary})${renderedImageAssets > 0 ? ` · ${renderedImageAssets}장 완료` : ""}.`
           : "이미지 작업을 마무리하는 중입니다.";
 
   return (
@@ -8534,6 +9359,7 @@ const CrackInlineImage = memo(function CrackInlineImage({ asset, onFeedback }: {
           alt={asset.title}
           onNaturalSize={(width, height) => setMeasuredSize({ width, height })}
         />
+        <ImageBackendBadge asset={asset} />
       </div>
       <figcaption>
         <span>{asset.title}</span>
@@ -8575,24 +9401,42 @@ const CrackInlineImageJob = memo(function CrackInlineImageJob({
 }) {
   const canCancel = ["queued", "planning", "generating"].includes(job.status);
   const canRegenerate = ["queued", "failed", "canceled", "completed"].includes(job.status);
+  // Named per renderer: with two queues running side by side, "이미지 생성 대기" no longer says which one the cut is
+  // waiting on — and a photoreal cut can be waiting on the local GPU, not on a provider.
+  const jobBackend = readImageJobBackend(job);
+  const backendLabel = imageBackendLabels[jobBackend];
+  const setupBlockedReason =
+    typeof job.providerPayload?.setupBlockedReason === "string" ? job.providerPayload.setupBlockedReason.trim() : "";
   const statusLabel =
     job.status === "queued"
-      ? "이미지 생성 대기"
+      ? setupBlockedReason
+        ? `${backendLabel} 설정 필요`
+        : `${backendLabel} 이미지 생성 대기`
       : job.status === "planning"
-        ? "이미지 준비 중"
+        ? `${backendLabel} 이미지 준비 중`
         : job.status === "generating"
-          ? "이미지 생성 중"
+          ? `${backendLabel} 이미지 생성 중`
           : job.status === "failed"
-            ? "이미지 생성 실패"
+            ? `${backendLabel} 이미지 생성 실패`
             : job.status === "canceled"
               ? "이미지 생성 취소됨"
-              : "이미지 생성 완료";
+              : `${backendLabel} 이미지 생성 완료`;
+  // The specific reason the pipeline already wrote onto the job, which is what the reader needs here: the cut's
+  // own description says what it would show, not why it is not showing.
+  // A failure's lead is already the title, so the detail starts at the reason.
+  const detail =
+    job.status === "queued"
+      ? setupBlockedReason
+      : job.status === "failed"
+        ? stripImageFailureLead(job.error ?? "", jobBackend)
+        : "";
   return (
     <div className={`crack-inline-image-job ${job.status}`}>
       <ImageIcon size={18} />
       <div className="crack-inline-image-job-copy">
         <strong>{statusLabel}</strong>
         <p>{job.reason}</p>
+        {detail && detail !== job.reason ? <p className="crack-inline-image-job-detail">{detail}</p> : null}
       </div>
       <div className="crack-inline-image-job-actions">
         {canUserRunQueuedImageJob(job) ? (
@@ -8883,6 +9727,7 @@ function HomePage({
   onStartNewRun: (simulationId: string) => void;
 }) {
   const activeState = simulations.find((item) => item.simulation.id === activeSimulationId) ?? simulations[0] ?? seedState;
+  const activeImageBackendsLabel = describeActiveImageBackends(activeState);
   const latestMessage = activeState.messages.at(-1);
   const latestAsset = activeState.imageAssets.at(-1) ?? seedState.imageAssets[0];
   const totalMessages = simulations.reduce((sum, item) => sum + item.messages.length, 0);
@@ -8931,7 +9776,7 @@ function HomePage({
             <div className="library-hero-meta">
               <StatusPill icon={<MessageSquareText size={15} />} label={`대화 ${activeState.messages.length}개`} tone="neutral" />
               <StatusPill icon={<Brain size={15} />} label={`기억 ${activeState.memoryEvents.length}개`} tone="neutral" />
-              <StatusPill icon={<ImageIcon size={15} />} label={activeState.novelAi.enabled ? "NovelAI" : "기본 에셋"} tone={activeState.novelAi.enabled ? "good" : "neutral"} />
+              <StatusPill icon={<ImageIcon size={15} />} label={activeImageBackendsLabel ?? "기본 에셋"} tone={activeImageBackendsLabel ? "good" : "neutral"} />
             </div>
             <div className="discover-actions">
               <button className="send-button" type="button" onClick={() => onOpen(activeState.simulation.id)}>
@@ -9029,7 +9874,7 @@ function SimulationLibraryCard({
     <article className={`simulation-library-card ${active ? "active" : ""}`} style={style}>
       <button className="simulation-card-cover" type="button" onClick={onOpen}>
         <AssetImage src={createImageAssetSrc(asset)} alt={state.simulation.title} />
-        <span>{active ? "진행 중" : state.novelAi.enabled ? "NovelAI" : "로컬"}</span>
+        <span>{active ? "진행 중" : describeActiveImageBackends(state) ?? "로컬"}</span>
       </button>
       <div className="simulation-card-copy">
         <div>
@@ -9772,15 +10617,33 @@ function getImageScenePresetDropPosition(event: ReactDragEvent<HTMLElement>): Im
 function CreateSimulationPage({
   mode,
   initialDraft,
+  simulationId,
+  novelAiTokenRegistered,
   onCancel,
-  onCreate
+  onCreate,
+  onTestGenerateCharacterImage,
+  onPersistProfileImage
 }: {
   mode: BuilderMode;
   initialDraft?: SimulationDraft;
+  /** The simulation being edited. Undefined while creating: the draft has no id until 생성 mints one. */
+  simulationId?: string;
+  /** Whether this person has a NovelAI token. Only a yes/no reaches the page; the token stays with the App. */
+  novelAiTokenRegistered: boolean;
   onCancel: () => void;
   onCreate: (draft: SimulationDraft) => void;
+  /** Runs a profile test for a draft character. The page has no runtime access by design, so the App runs it. */
+  onTestGenerateCharacterImage: (request: CharacterProfileTestRequest) => Promise<CharacterProfileTestResult>;
+  /** Stores a picked candidate and returns the profile record to put on the draft character. */
+  onPersistProfileImage: (request: CharacterProfileImagePersistRequest) => Promise<CharacterProfileImage>;
 }) {
   const [draft, setDraft] = useState<SimulationDraft>(() => normalizeBuilderDraft(initialDraft ?? createInitialSimulationDraft()));
+  // Where profile images picked in this builder session are stored. Editing stores them under the simulation itself.
+  // A new draft has no id until 생성, so it gets a provisional one for as long as this page (and so this draft)
+  // lives. Object keys carry their directory, so a key stored here still resolves once the simulation exists under
+  // the id createStateFromDraft mints.
+  const [provisionalSimulationId] = useState(() => createId("draft_sim"));
+  const profileImageSimulationId = simulationId ?? provisionalSimulationId;
   const [activeTab, setActiveTab] = useState<BuilderTab>("overview");
   const [selectedModuleId, setSelectedModuleId] = useState(() => initialDraft?.modules[0]?.id ?? "draft_main");
   const [draggedModuleId, setDraggedModuleId] = useState<string | undefined>();
@@ -9799,6 +10662,34 @@ function CreateSimulationPage({
     imageGenerationCadenceOptions.find((option) => option.value === draft.imageProfile.generationCadence) ??
     imageGenerationCadenceOptions[1];
   const draftImageScenePresets = draft.imageScenePresets ?? [];
+  const draftBackendRouting = resolveImageBackendRouting(draft.imageProfile);
+  const draftRoutingModeLabel =
+    imageBackendRoutingModeOptions.find((option) => option.value === draftBackendRouting.mode)?.label ?? imageBackendRoutingModeOptions[0].label;
+  const draftPhotorealPreset = PHOTOREAL_WORKFLOW_PRESETS[draft.photoreal.workflowPreset] ?? PHOTOREAL_WORKFLOW_PRESETS.qwen_image_2_1_turbo;
+  const draftReferencePreset =
+    PHOTOREAL_WORKFLOW_PRESETS[draft.photoreal.referenceWorkflowPreset] ?? PHOTOREAL_WORKFLOW_PRESETS.qwen_image_2_1_turbo;
+  // Every preset that can draw this simulation's cuts, so the licence shown is the licence of what gets rendered:
+  // with face lock on, each cut of a character with a 실사 profile renders on the face-lock preset — by default the
+  // non-commercial Qwen-Image 2.1 Turbo, whatever the generation preset says. Same rule as resolvePhotorealPresetForCut.
+  const draftRenderingPresets = [
+    { preset: draftPhotorealPreset, role: "생성용" },
+    ...(draft.photoreal.faceReferenceEnabled &&
+    draftReferencePreset.supportsReferences &&
+    draftReferencePreset.maxReferences > 0 &&
+    draftReferencePreset.id !== draftPhotorealPreset.id
+      ? [{ preset: draftReferencePreset, role: "얼굴 고정 컷" }]
+      : [])
+  ];
+  const draftScreeningState = useMemo(
+    () => createDraftScreeningState({ imageProfile: draft.imageProfile, novelAi: draft.novelAi, photoreal: draft.photoreal }),
+    [draft.imageProfile, draft.novelAi, draft.photoreal]
+  );
+  const draftImageBackends = listActiveImageBackends(draft);
+  // The tab's one-word status: which renderers this simulation will actually draw with, NovelAI by its model.
+  const draftImageBackendMetric =
+    draftImageBackends.length === 0
+      ? "mock"
+      : draftImageBackends.map((backend) => (backend === "novelai" ? draft.novelAi.modelPreset : imageBackendLabels.photoreal)).join(" + ");
 
   const updateDraft = useCallback((patch: Partial<SimulationDraft>) => {
     setDraft((current) => ({
@@ -9846,6 +10737,16 @@ function CreateSimulationPage({
     }));
   }, []);
 
+  const updatePhotoreal = useCallback((patch: Partial<PhotorealApiSettings>) => {
+    setDraft((current) => ({
+      ...current,
+      photoreal: {
+        ...current.photoreal,
+        ...patch
+      }
+    }));
+  }, []);
+
   const updateDraftCharacter = useCallback((characterId: string, patch: Partial<SimulationCharacterDraft>) => {
     setDraft((current) => {
       const characters = current.characters.map((character) =>
@@ -9871,6 +10772,30 @@ function CreateSimulationPage({
       };
     });
   }, []);
+
+  // Functional rather than a patch of `profileImages` read at render time: a NovelAI pick and a photoreal pick can be
+  // persisting at once, and whichever finished second would otherwise put back the map without the first one.
+  const setDraftCharacterProfileImage = useCallback(
+    (characterId: string, backend: ImageBackendId, image: CharacterProfileImage | undefined) => {
+      setDraft((current) => ({
+        ...current,
+        characters: current.characters.map((character) =>
+          character.id === characterId
+            ? { ...character, profileImages: withCharacterProfileImage(character.profileImages, backend, image) }
+            : character
+        )
+      }));
+    },
+    []
+  );
+
+  const profileStudio = useCharacterProfileStudio({
+    draft,
+    simulationId: profileImageSimulationId,
+    onTestGenerate: onTestGenerateCharacterImage,
+    onPersist: onPersistProfileImage,
+    onProfileImageChange: setDraftCharacterProfileImage
+  });
 
   const updateNeuralMap = useCallback((patch: Partial<NeuralMapSettings>) => {
     setDraft((current) => ({
@@ -10330,7 +11255,7 @@ function CreateSimulationPage({
         <BuilderTabButton active={activeTab === "prompts"} icon={<Layers size={18} />} label="프롬프트 트리" metric={`${draft.modules.length}개`} onClick={() => setActiveTab("prompts")} panelKey="prompts" />
         <BuilderTabButton active={activeTab === "characters"} icon={<ImageIcon size={18} />} label="캐릭터/이미지" metric={draft.imageProfile.triggerMode} onClick={() => setActiveTab("characters")} panelKey="characters" />
         <BuilderTabButton active={activeTab === "status"} icon={<Network size={18} />} label="관계/상태" metric={draft.relationshipMap.enabled ? "저장" : "꺼짐"} onClick={() => setActiveTab("status")} panelKey="status" />
-        <BuilderTabButton active={activeTab === "api"} icon={<Settings2 size={18} />} label="이미지/연동" metric={draft.novelAi.enabled ? draft.novelAi.modelPreset : "mock"} onClick={() => setActiveTab("api")} panelKey="api" />
+        <BuilderTabButton active={activeTab === "api"} icon={<Settings2 size={18} />} label="이미지/연동" metric={draftImageBackendMetric} onClick={() => setActiveTab("api")} panelKey="api" />
         <BuilderTabButton active={activeTab === "review"} icon={<Check size={18} />} label="검토" metric="생성" onClick={() => setActiveTab("review")} panelKey="review" />
       </div>
 
@@ -10529,6 +11454,21 @@ function CreateSimulationPage({
                     character={selectedCharacter}
                     onCharacterChange={(patch) => updateDraftCharacter(selectedCharacter.id, patch)}
                   />
+                  <CharacterProfileImagePanel
+                    character={selectedCharacter}
+                    draft={draft}
+                    session={profileStudio.sessions[selectedCharacter.id]}
+                    novelAiTokenRegistered={novelAiTokenRegistered}
+                    onSessionChange={(change) => profileStudio.updateSession(selectedCharacter.id, change)}
+                    onCharacterChange={(patch) => updateDraftCharacter(selectedCharacter.id, patch)}
+                    onClearProfileImage={(backend) => setDraftCharacterProfileImage(selectedCharacter.id, backend, undefined)}
+                    onNovelAiChange={updateNovelAi}
+                    onPhotorealChange={updatePhotoreal}
+                    onGenerate={(input) => void profileStudio.start(selectedCharacter.id, input)}
+                    onCancel={() => profileStudio.cancel(selectedCharacter.id)}
+                    onPick={(candidate) => void profileStudio.pick(selectedCharacter.id, candidate)}
+                    onDiscardCandidates={() => profileStudio.discardCandidates(selectedCharacter.id)}
+                  />
                 </>
               ) : null}
               {selectedModule?.kind === "image_prompt_profile" ? (
@@ -10548,9 +11488,13 @@ function CreateSimulationPage({
               <div className="character-card-grid">
                 {draft.characters.map((character) => {
                   const characterModule = draft.modules.find((module) => module.kind === "character_prompt" && module.characterId === character.id);
+                  const profileImage = selectDisplayProfileImage(character.profileImages);
+                  const profileSummary = describeProfileImageBackends(character.profileImages);
                   return (
                     <button
-                      className={`character-card ${selectedCharacter?.id === character.id ? "active" : ""}`}
+                      className={["character-card", selectedCharacter?.id === character.id ? "active" : "", profileImage ? "has-portrait" : ""]
+                        .filter(Boolean)
+                        .join(" ")}
                       key={character.id}
                       type="button"
                       onClick={() => {
@@ -10558,10 +11502,14 @@ function CreateSimulationPage({
                         setActiveTab("prompts");
                       }}
                     >
+                      {profileImage ? <ProfileImageThumb className="character-card-portrait" image={profileImage} /> : null}
                       <strong>{character.name}</strong>
                       <span>{character.role}</span>
                       <p>{character.summary}</p>
-                      <small>{character.visualPrompt ? "이미지 프롬프트 준비됨" : "이미지 프롬프트 없음"}</small>
+                      <small>
+                        {character.visualPrompt ? "이미지 프롬프트 준비됨" : "이미지 프롬프트 없음"}
+                        {profileSummary ? ` · 프로필 ${profileSummary}` : ""}
+                      </small>
                     </button>
                   );
                 })}
@@ -10580,11 +11528,13 @@ function CreateSimulationPage({
               <div className="compact-list">
                 {draft.characters.map((character) => {
                   const characterModule = draft.modules.find((module) => module.kind === "character_prompt" && module.characterId === character.id);
+                  const profileImage = selectDisplayProfileImage(character.profileImages);
                   return (
-                    <button className="compact-row as-button" key={character.id} type="button" onClick={() => {
+                    <button className={`compact-row as-button${profileImage ? " has-portrait" : ""}`} key={character.id} type="button" onClick={() => {
                       setSelectedModuleId(characterModule?.id ?? "draft_main");
                       setActiveTab("prompts");
                     }}>
+                      {profileImage ? <ProfileImageThumb className="compact-row-portrait" image={profileImage} /> : null}
                       <span>{character.role}</span>
                       <strong>{character.name}</strong>
                       <small>{character.visualPrompt || "이미지 프롬프트 미설정"}</small>
@@ -10961,6 +11911,122 @@ function CreateSimulationPage({
               </div>
             </section>
 
+            <section className="builder-panel span-2">
+              <SectionTitle icon={<ImageIcon size={17} />} title="실사 이미지 (ComfyUI)" />
+              <div className="readonly-field">
+                <span>실행자 ComfyUI</span>
+                <strong>실사 컷은 시뮬레이션을 실행하는 사람의 PC에서 ComfyUI로 생성됩니다.</strong>
+                <small>여기서는 라우팅과 프리셋, 스타일만 정합니다. ComfyUI 주소 · 크기 · GPU 교대는 실행 화면의 설정 탭에서 조정합니다.</small>
+              </div>
+              <ImageBackendRoutingCard
+                routing={draftBackendRouting}
+                novelAiEnabled={draft.novelAi.enabled}
+                photorealEnabled={draft.photoreal.enabled}
+                onChange={(backendRouting) => updateImageProfile({ backendRouting })}
+              />
+              <div className="settings-section">
+                <SectionTitle icon={<Settings2 size={16} />} title="실사 렌더러" />
+                <div className="two-fields">
+                  <label className="checkline">
+                    <input checked={draft.photoreal.enabled} type="checkbox" onChange={(event) => updatePhotoreal({ enabled: event.target.checked })} />
+                    실사 이미지 사용
+                  </label>
+                  <label className="checkline">
+                    <input
+                      checked={draft.photoreal.faceReferenceEnabled}
+                      type="checkbox"
+                      onChange={(event) => updatePhotoreal({ faceReferenceEnabled: event.target.checked })}
+                    />
+                    캐릭터 실사 프로필로 얼굴 고정
+                  </label>
+                </div>
+                <div className="two-fields">
+                  <label>
+                    생성용 워크플로
+                    <select
+                      value={draft.photoreal.workflowPreset}
+                      onChange={(event) => updatePhotoreal({ workflowPreset: event.target.value as PhotorealWorkflowPresetId })}
+                    >
+                      {photorealWorkflowPresetOrder.map((presetId) => (
+                        <option key={presetId} value={presetId}>
+                          {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    얼굴 고정용 워크플로
+                    <select
+                      value={draft.photoreal.referenceWorkflowPreset}
+                      onChange={(event) => updatePhotoreal({ referenceWorkflowPreset: event.target.value as PhotorealWorkflowPresetId })}
+                    >
+                      {photorealWorkflowPresetOrder
+                        .filter(
+                          (presetId) =>
+                            PHOTOREAL_WORKFLOW_PRESETS[presetId].supportsReferences || presetId === draft.photoreal.referenceWorkflowPreset
+                        )
+                        .map((presetId) => (
+                          <option key={presetId} value={presetId}>
+                            {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                </div>
+                {draftRenderingPresets.map(({ preset, role }) => (
+                  <div className="photoreal-preset-note" key={preset.id}>
+                    <PhotorealLicenseTag preset={preset} />
+                    <p className="runtime-hint">
+                      {draftRenderingPresets.length > 1 ? <strong>{role} · {preset.label}</strong> : null}
+                      {draftRenderingPresets.length > 1 ? " — " : null}
+                      {preset.description} 라이선스: {preset.license}.
+                    </p>
+                  </div>
+                ))}
+              </div>
+              <div className="settings-section">
+                <SectionTitle icon={<Sparkles size={16} />} title="실사 스타일" />
+                <label>
+                  스타일 프리셋
+                  <select
+                    value={draft.photoreal.stylePreset}
+                    onChange={(event) => updatePhotoreal({ stylePreset: event.target.value as PhotorealStylePresetId })}
+                  >
+                    {photorealStylePresetOrder.map((stylePreset) => (
+                      <option key={stylePreset} value={stylePreset}>
+                        {PHOTOREAL_STYLE_PRESETS[stylePreset].label}
+                      </option>
+                    ))}
+                    <option value="custom">사용자 지정</option>
+                  </select>
+                </label>
+                <p className="runtime-hint">
+                  {draft.photoreal.stylePreset === "custom"
+                    ? "아래 스타일 문장이 전부입니다. 첫 문장이 프롬프트 맨 앞에 오고, 나머지는 끝에 붙습니다."
+                    : PHOTOREAL_STYLE_PRESETS[draft.photoreal.stylePreset].description}
+                </p>
+                <label>
+                  {draft.photoreal.stylePreset === "custom" ? "스타일 (영어)" : "스타일 추가 (영어, 선택)"}
+                  <textarea
+                    rows={3}
+                    value={draft.photoreal.stylePrompt}
+                    aria-describedby="builder-photoreal-style-screen"
+                    onChange={(event) => updatePhotoreal({ stylePrompt: event.target.value })}
+                  />
+                </label>
+                <PhotorealTextScreenNote
+                  id="builder-photoreal-style-screen"
+                  scope="style"
+                  state={draftScreeningState}
+                  text={draft.photoreal.stylePrompt}
+                />
+                <label>
+                  네거티브 추가 (영어, 선택)
+                  <textarea rows={2} value={draft.photoreal.negativePrompt} onChange={(event) => updatePhotoreal({ negativePrompt: event.target.value })} />
+                </label>
+              </div>
+            </section>
+
             <section className="builder-panel">
               <SectionTitle icon={<Database size={17} />} title="NeuralMap" />
               <label className="checkline">
@@ -10989,6 +12055,8 @@ function CreateSimulationPage({
                 <Capability label="프롬프트 모듈" value={`${draft.modules.length}개`} />
                 <Capability label="관계/상태창" value={draft.relationshipMap.enabled ? "memory_events 저장" : "비활성"} />
                 <Capability label="NovelAI" value={draft.novelAi.enabled ? `${draft.novelAi.modelPreset} ${draft.novelAi.requestMode}` : "mock"} />
+                <Capability label="실사" value={draft.photoreal.enabled ? draftPhotorealPreset.label : "꺼짐"} />
+                <Capability label="이미지 라우팅" value={draftRoutingModeLabel} />
                 <Capability label="NeuralMap" value={draft.neuralMap.enabled ? draft.neuralMap.baseUrl : "로컬 대체"} />
                 <Capability label="이미지 밀도" value={activeImageGenerationCadence.label} />
                 <Capability label="장면 키워드" value={`${countEnabledImageScenePresetNodes(draftImageScenePresets)}개`} />
@@ -11009,6 +12077,7 @@ function CreateSimulationPage({
               <Metric label="스텝" value={draft.imageProfile.steps.toString()} />
               <Metric label="CFG" value={draft.imageProfile.promptGuidance.toString()} />
               <Metric label="샘플러" value={draft.novelAi.sampler} />
+              <Metric label="라우팅" value={draftRoutingModeLabel} />
             </aside>
           </div>
         ) : null}
@@ -11027,6 +12096,9 @@ function createInitialSimulationDraft(runtimeSource?: AppState): SimulationDraft
   const visualPrompt = preset.visualPrompt;
   const runtimeLlm = runtimeSource?.llm ?? seedState.llm;
   const runtimeNovelAi = runtimeSource?.novelAi ?? seedState.novelAi;
+  // Inherited like the LLM and NovelAI settings: the ComfyUI address, presets and GPU handoff describe this
+  // machine's setup, which a new simulation should not make the user enter again.
+  const runtimePhotoreal = runtimeSource?.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS;
 
   return {
     promptMode: preset.promptMode,
@@ -11164,7 +12236,8 @@ function createInitialSimulationDraft(runtimeSource?: AppState): SimulationDraft
       temperature: preset.temperature,
       maxTokens: preset.maxTokens
     },
-    novelAi: toShareableNovelAiSettings(runtimeNovelAi)
+    novelAi: toShareableNovelAiSettings(runtimeNovelAi),
+    photoreal: toShareablePhotorealSettings(runtimePhotoreal)
   };
 }
 
@@ -11475,6 +12548,1133 @@ function CharacterVisualMappingPanel({
   );
 }
 
+// --- Character profile images (creation screen) -----------------------------------------------------------------
+
+/** One profile test for a draft character, as the builder asks the App to run it. */
+interface CharacterProfileTestRequest {
+  draft: SimulationDraft;
+  draftCharacterId: string;
+  backend: ImageBackendId;
+  prompt: string;
+  negativePrompt: string;
+  variant: CharacterProfileTestVariant;
+  count: number;
+  signal: AbortSignal;
+  /**
+   * Once planned: how many candidates will run. They run on the requested backend or not at all — a request the
+   * safety floor would move to the other renderer is refused (thrown) before this is called.
+   */
+  onPlanned?: (plan: { total: number }) => void;
+  /** The test has left the renderer's queue and is generating. */
+  onStart?: () => void;
+  onImage?: (asset: ImageAsset) => void;
+  onSettled?: (settled: number, total: number) => void;
+}
+
+interface CharacterProfileTestResult {
+  assets: ImageAsset[];
+  errors: string[];
+  backend: ImageBackendId;
+}
+
+interface CharacterProfileImagePersistRequest {
+  /** The object-store directory: the edited simulation's id, or the builder's provisional id while creating. */
+  simulationId: string;
+  draft: SimulationDraft;
+  draftCharacterId: string;
+  /** The renderer that drew the candidate, which is also the profile slot it fills. */
+  backend: ImageBackendId;
+  asset: ImageAsset;
+  prompt: string;
+  negativePrompt: string;
+}
+
+/** A test image held by the builder. Its data URL lives here only: never in the draft, App state or storage. */
+type ProfileStudioCandidate = {
+  id: string;
+  asset: ImageAsset;
+  backend: ImageBackendId;
+  prompt: string;
+  negativePrompt: string;
+  runId: string;
+  persisting?: boolean;
+  /** The profile record this candidate became, so the grid can mark it for as long as it is the profile. */
+  profileAssetId?: string;
+  error?: string;
+};
+
+type ProfileStudioRun = {
+  id: string;
+  variant: CharacterProfileTestVariant;
+  /** Where the candidates render. Never moved: a request the safety floor rules out there is refused instead. */
+  requestedBackend: ImageBackendId;
+  total: number;
+  settled: number;
+  phase: "planning" | "queued" | "generating";
+};
+
+type ProfileStudioSession = {
+  backend?: ImageBackendId;
+  /** Test prompts as typed, per backend. A missing entry follows the character's own fields. */
+  prompts: Partial<Record<ImageBackendId, string>>;
+  count: number;
+  run?: ProfileStudioRun;
+  candidates: ProfileStudioCandidate[];
+  /** The latest face check: the photoreal profile drawn in a different pose. */
+  checks: ProfileStudioCandidate[];
+  errors: string[];
+  /**
+   * A test that was refused before anything was queued: the planner throws when the photoreal safety floor (or a
+   * missing profile) rules the request out, rather than quietly running it on NovelAI. Shown apart from `errors`
+   * because nothing ran and nothing failed — the request itself has to change.
+   */
+  refusal?: ProfileStudioRefusal;
+  notice?: string;
+};
+
+type ProfileStudioRefusal = {
+  message: string;
+  variant: CharacterProfileTestVariant;
+  backend: ImageBackendId;
+};
+
+type ProfileStudioGenerateInput = {
+  backend: ImageBackendId;
+  prompt: string;
+  negativePrompt: string;
+  variant: CharacterProfileTestVariant;
+  count: number;
+};
+
+type ProfileTestBlocker = {
+  message: string;
+  /** A one-click fix on the draft, when the fix is a single setting. */
+  action?: "enable_photoreal" | "photoreal_proxy";
+};
+
+const EMPTY_PROFILE_STUDIO_SESSION: ProfileStudioSession = { prompts: {}, count: 2, candidates: [], checks: [], errors: [] };
+/** A candidate is a few MB of PNG held in memory, so the grid keeps the latest dozen. */
+const MAX_PROFILE_STUDIO_CANDIDATES = 12;
+/** Two images rather than one, so a face that holds on one seed and drifts on the next shows up. */
+const PROFILE_REFERENCE_CHECK_COUNT = 2;
+const PROFILE_TEST_CANCELED_NOTICE = "테스트 생성을 취소했습니다.";
+// "예:" like the builder's other placeholders: a full English sentence in placeholder grey reads as text already typed.
+const PHOTOREAL_APPEARANCE_PLACEHOLDER =
+  "예: a Korean woman in her late twenties with shoulder-length wavy brown hair, light natural makeup, cream knit cardigan";
+/** The photoreal prompt builder drops Hangul (its text encoders are prompted in English), so Korean text never arrives. */
+const HANGUL_TEXT_PATTERN = /[가-힣]/u;
+/** How long typing has to pause before a photo-side text is screened (PhotorealTextScreenNote). */
+const PHOTOREAL_TEXT_SCREEN_DELAY_MS = 400;
+
+/**
+ * The builder's profile tests, one session per draft character, held by the page rather than by the panel. A
+ * NovelAI candidate costs Anlas, so switching to another character or tab must not throw it away, and a test keeps
+ * running while its panel is hidden. Leaving the builder ends all of it: the sessions are component state and
+ * nothing else, and unmounting aborts whatever is still running or waiting.
+ */
+function useCharacterProfileStudio({
+  draft,
+  simulationId,
+  onTestGenerate,
+  onPersist,
+  onProfileImageChange
+}: {
+  draft: SimulationDraft;
+  simulationId: string;
+  onTestGenerate: (request: CharacterProfileTestRequest) => Promise<CharacterProfileTestResult>;
+  onPersist: (request: CharacterProfileImagePersistRequest) => Promise<CharacterProfileImage>;
+  onProfileImageChange: (characterId: string, backend: ImageBackendId, image: CharacterProfileImage | undefined) => void;
+}) {
+  const [sessions, setSessions] = useState<Record<string, ProfileStudioSession>>({});
+  const controllersRef = useRef(new Map<string, AbortController>());
+
+  useEffect(() => {
+    const controllers = controllersRef.current;
+    return () => {
+      controllers.forEach((controller) => controller.abort());
+      controllers.clear();
+    };
+  }, []);
+
+  // A character deleted from the draft takes its running test and its candidates with it.
+  useEffect(() => {
+    const liveIds = new Set(draft.characters.map((character) => character.id));
+    controllersRef.current.forEach((controller, characterId) => {
+      if (!liveIds.has(characterId)) {
+        controller.abort();
+      }
+    });
+    setSessions((current) => {
+      const staleIds = Object.keys(current).filter((characterId) => !liveIds.has(characterId));
+      if (staleIds.length === 0) {
+        return current;
+      }
+      const next = { ...current };
+      staleIds.forEach((characterId) => delete next[characterId]);
+      return next;
+    });
+  }, [draft.characters]);
+
+  const updateSession = useCallback((characterId: string, change: (session: ProfileStudioSession) => ProfileStudioSession) => {
+    setSessions((current) => ({ ...current, [characterId]: change(current[characterId] ?? EMPTY_PROFILE_STUDIO_SESSION) }));
+  }, []);
+
+  // For results that land after an await: a session that is gone (its character was deleted) stays gone.
+  const patchSession = useCallback((characterId: string, change: (session: ProfileStudioSession) => ProfileStudioSession) => {
+    setSessions((current) => {
+      const session = current[characterId];
+      return session ? { ...current, [characterId]: change(session) } : current;
+    });
+  }, []);
+
+  const start = useCallback(
+    async (characterId: string, input: ProfileStudioGenerateInput) => {
+      if (controllersRef.current.has(characterId)) {
+        return;
+      }
+      const controller = new AbortController();
+      controllersRef.current.set(characterId, controller);
+      const runId = createId("profile_run");
+      const patchRun = (change: (run: ProfileStudioRun) => ProfileStudioRun) =>
+        patchSession(characterId, (session) => (session.run?.id === runId ? { ...session, run: change(session.run) } : session));
+      updateSession(characterId, (session) => ({
+        ...session,
+        run: { id: runId, variant: input.variant, requestedBackend: input.backend, total: input.count, settled: 0, phase: "planning" },
+        errors: [],
+        refusal: undefined,
+        notice: undefined,
+        checks: input.variant === "reference_check" ? [] : session.checks
+      }));
+
+      let errors: string[] = [];
+      let refusal: ProfileStudioRefusal | undefined;
+      // Whether the request got past planning. A throw before that is the planner refusing the request (nothing was
+      // queued or spent); a throw after it is a run that went wrong.
+      let planned = false;
+      try {
+        const result = await onTestGenerate({
+          ...input,
+          draft,
+          draftCharacterId: characterId,
+          signal: controller.signal,
+          onPlanned: ({ total }) => {
+            planned = true;
+            patchRun((run) => ({ ...run, total, phase: "queued" }));
+          },
+          onStart: () => patchRun((run) => ({ ...run, phase: "generating" })),
+          onImage: (asset) =>
+            patchSession(characterId, (session) =>
+              addProfileStudioImage(session, input.variant, {
+                id: asset.id,
+                asset,
+                backend: asset.backend ?? input.backend,
+                prompt: input.prompt,
+                negativePrompt: input.negativePrompt,
+                runId
+              })
+            ),
+          onSettled: (settled, total) => patchRun((run) => ({ ...run, settled, total }))
+        });
+        errors = result.errors;
+      } catch (error) {
+        if (controller.signal.aborted || isAbortError(error)) {
+          errors = [];
+        } else if (!planned) {
+          refusal = {
+            message: readErrorMessage(error, "이 요청으로는 테스트를 시작하지 않았습니다. 프롬프트를 바꿔 다시 시도하세요."),
+            variant: input.variant,
+            backend: input.backend
+          };
+        } else {
+          errors = [readErrorMessage(error, "알 수 없는 문제로 테스트 생성을 끝내지 못했습니다.")];
+        }
+      } finally {
+        if (controllersRef.current.get(characterId) === controller) {
+          controllersRef.current.delete(characterId);
+        }
+      }
+      const canceled = controller.signal.aborted;
+      patchSession(characterId, (session) => ({
+        ...session,
+        run: session.run?.id === runId ? undefined : session.run,
+        errors,
+        refusal,
+        notice: canceled ? PROFILE_TEST_CANCELED_NOTICE : undefined
+      }));
+    },
+    [draft, onTestGenerate, patchSession, updateSession]
+  );
+
+  const cancel = useCallback((characterId: string) => {
+    controllersRef.current.get(characterId)?.abort();
+  }, []);
+
+  const pick = useCallback(
+    async (characterId: string, candidate: ProfileStudioCandidate) => {
+      const patchCandidate = (patch: Partial<ProfileStudioCandidate>) =>
+        patchSession(characterId, (session) => ({
+          ...session,
+          candidates: session.candidates.map((entry) => (entry.id === candidate.id ? { ...entry, ...patch } : entry))
+        }));
+      patchCandidate({ persisting: true, error: undefined });
+      try {
+        const record = await onPersist({
+          simulationId,
+          draft,
+          draftCharacterId: characterId,
+          backend: candidate.backend,
+          asset: candidate.asset,
+          prompt: candidate.prompt,
+          negativePrompt: candidate.negativePrompt
+        });
+        onProfileImageChange(characterId, candidate.backend, record);
+        patchCandidate({ persisting: false, profileAssetId: record.assetId });
+      } catch (error) {
+        // The candidate stays in the grid, so the pick can be retried once the server is back.
+        patchCandidate({ persisting: false, error: readErrorMessage(error, "프로필 이미지 저장 실패") });
+      }
+    },
+    [draft, onPersist, onProfileImageChange, patchSession, simulationId]
+  );
+
+  const discardCandidates = useCallback(
+    (characterId: string) => {
+      // A pick still being stored keeps its candidate, or its result would have nowhere to report.
+      patchSession(characterId, (session) => ({ ...session, candidates: session.candidates.filter((entry) => entry.persisting), checks: [] }));
+    },
+    [patchSession]
+  );
+
+  return { sessions, updateSession, start, cancel, pick, discardCandidates };
+}
+
+/** Newest test first, each test's candidates in the order they arrived; a face check replaces the previous one. */
+function addProfileStudioImage(
+  session: ProfileStudioSession,
+  variant: CharacterProfileTestVariant,
+  candidate: ProfileStudioCandidate
+): ProfileStudioSession {
+  if (variant === "reference_check") {
+    return session.checks.some((entry) => entry.id === candidate.id) ? session : { ...session, checks: [...session.checks, candidate] };
+  }
+  if (session.candidates.some((entry) => entry.id === candidate.id)) {
+    return session;
+  }
+  const thisRun = session.candidates.filter((entry) => entry.runId === candidate.runId);
+  const earlier = session.candidates.filter((entry) => entry.runId !== candidate.runId);
+  return { ...session, candidates: [...thisRun, candidate, ...earlier].slice(0, MAX_PROFILE_STUDIO_CANDIDATES) };
+}
+
+/** Why a test cannot run on `backend` right now, judged from the draft (and, for NovelAI, whether a token exists). */
+function describeProfileTestBlocker(backend: ImageBackendId, draft: SimulationDraft, novelAiTokenRegistered: boolean): ProfileTestBlocker | undefined {
+  if (backend === "novelai") {
+    if (!draft.novelAi.enabled) {
+      return { message: "NovelAI 연동이 꺼져 있습니다. 이미지/연동 탭에서 'NovelAI 이미지 API 사용'을 켜면 테스트할 수 있습니다." };
+    }
+    if (draft.novelAi.requestMode === "mock") {
+      return { message: "NovelAI 요청 방식이 mock이라 실제 이미지를 만들지 않습니다. 이미지/연동 탭에서 proxy 또는 direct로 바꾸세요." };
+    }
+    if (!novelAiTokenRegistered) {
+      return { message: "NovelAI 토큰을 등록하면 테스트할 수 있습니다. 상단 '개인 설정'에서 등록하세요." };
+    }
+    return undefined;
+  }
+  if (!draft.photoreal.enabled) {
+    return { message: "실사 이미지(ComfyUI) 연동이 꺼져 있습니다.", action: "enable_photoreal" };
+  }
+  if (draft.photoreal.requestMode === "mock") {
+    return { message: "실사 요청 방식이 mock이라 실제 이미지를 만들지 않습니다.", action: "photoreal_proxy" };
+  }
+  return undefined;
+}
+
+function describeProfileStudioRun(run: ProfileStudioRun): string {
+  const backendLabel = imageBackendLabels[run.requestedBackend];
+  const subject = run.variant === "reference_check" ? "얼굴 고정 테스트" : "후보";
+  if (run.phase === "planning") {
+    return `${backendLabel} ${subject} 준비 중…`;
+  }
+  if (run.phase === "queued") {
+    // Not only earlier images: a photoreal test also waits for the local GPU while a local LLM turn holds it.
+    return `${backendLabel} 앞선 작업이 끝나기를 기다리는 중…`;
+  }
+  return `${backendLabel} ${subject} 생성 중 · ${run.settled}/${run.total}`;
+}
+
+/**
+ * `profileImages` with one backend's slot set or cleared. An emptied map becomes undefined rather than {}: the key
+ * itself stays on the draft character, which updateStateFromDraft reads as "cleared in the editor".
+ */
+function withCharacterProfileImage(
+  images: CharacterProfileImages | undefined,
+  backend: ImageBackendId,
+  image: CharacterProfileImage | undefined
+): CharacterProfileImages | undefined {
+  const next: CharacterProfileImages = { ...images };
+  if (image) {
+    next[backend] = image;
+  } else {
+    delete next[backend];
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+/** The profile shown for a character wherever one face stands for them: photoreal first, then NovelAI. */
+function selectDisplayProfileImage(images: CharacterProfileImages | undefined): CharacterProfileImage | undefined {
+  return [images?.photoreal, images?.novelai].find((image): image is CharacterProfileImage => Boolean(image?.objectKey));
+}
+
+function describeProfileImageBackends(images: CharacterProfileImages | undefined): string | undefined {
+  const labels = (["photoreal", "novelai"] as const).filter((backend) => images?.[backend]?.objectKey).map((backend) => imageBackendLabels[backend]);
+  return labels.length > 0 ? labels.join(" · ") : undefined;
+}
+
+function describeProfileImageMeta(image: CharacterProfileImage): string {
+  // The preset's name without its parenthesised gloss: this is one short line under a thumbnail.
+  const model =
+    image.backend === "photoreal"
+      ? image.workflowPreset
+        ? PHOTOREAL_WORKFLOW_PRESETS[image.workflowPreset]?.label.replace(/\s*\([^)]*\)\s*$/u, "")
+        : undefined
+      : image.modelPreset;
+  return [image.width && image.height ? `${image.width}×${image.height}` : undefined, model, image.seed !== undefined ? `seed ${image.seed}` : undefined]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function joinPromptParts(parts: Array<string | undefined>): string {
+  return parts
+    .map((part) => part?.trim() ?? "")
+    .filter(Boolean)
+    .join(", ");
+}
+
+function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError";
+}
+
+function readErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message.trim() ? error.message : fallback;
+}
+
+/**
+ * Stores a picked candidate as a character's profile image and returns the record the builder puts on the draft.
+ *
+ * The bytes go to the object store under the builder's simulation id with an object id minted for this pick, which
+ * is also the record's assetId, so an id never names two images. A NovelAI pick additionally stores the image
+ * letterboxed onto a Precise Reference canvas, the copy every NovelAI cut would send. Both come from decoding the
+ * candidate itself, which also yields the pixel size the record must carry: the photoreal reference is head-cropped
+ * from the stored width and height. Every failure comes back as one Korean message with "실패" in it; the builder
+ * keeps the candidate so the pick can be retried.
+ */
+async function persistCharacterProfileImage(request: CharacterProfileImagePersistRequest): Promise<CharacterProfileImage> {
+  try {
+    return await storeCharacterProfileImage(request);
+  } catch (error) {
+    throw new Error(`프로필 이미지 저장 실패: ${readErrorMessage(error, "알 수 없는 문제로 저장하지 못했습니다.")}`);
+  }
+}
+
+async function storeCharacterProfileImage(request: CharacterProfileImagePersistRequest): Promise<CharacterProfileImage> {
+  // The server writes `<simulationId>/<assetId>.<ext>` and silently skips a segment outside [A-Za-z0-9._-].
+  if (!isSafeObjectPathSegment(request.simulationId)) {
+    throw new Error("시뮬레이션 id를 저장 경로로 쓸 수 없습니다.");
+  }
+  const dataUrl = request.asset.dataUrl;
+  if (!dataUrl) {
+    throw new Error("후보 이미지의 데이터를 찾지 못했습니다. 후보를 다시 생성하세요.");
+  }
+  const decoded = await decodeProfileCandidate(dataUrl, request.backend);
+  const assetId = createId("profile");
+  const referenceAssetId = `${assetId}_reference`;
+  const character = request.draft.characters.find((candidate) => candidate.id === request.draftCharacterId);
+  const objects = [
+    createProfileObjectAsset(request, assetId, dataUrl, `${character?.name ?? "캐릭터"} 프로필`),
+    ...(decoded.referenceDataUrl
+      ? [createProfileObjectAsset(request, referenceAssetId, decoded.referenceDataUrl, `${character?.name ?? "캐릭터"} 프로필 레퍼런스`)]
+      : [])
+  ];
+
+  let persisted: unknown;
+  try {
+    persisted = await createDynamicChatApiClient().persistImageAssets(request.simulationId, objects);
+  } catch (error) {
+    throw new Error(describeApiServerFailure(error));
+  }
+  // The server answers with the metadata it was sent when it did not write a file, so the key is the only proof.
+  const stored = Array.isArray(persisted) ? (persisted as ImageAsset[]) : [];
+  const objectKey = stored.find((asset) => asset.id === assetId)?.objectKey;
+  const referenceObjectKey = decoded.referenceDataUrl ? stored.find((asset) => asset.id === referenceAssetId)?.objectKey : undefined;
+  if (!objectKey || (decoded.referenceDataUrl && !referenceObjectKey)) {
+    throw new Error("API 서버가 이미지 파일을 쓰지 않았습니다.");
+  }
+  return createProfileImageRecord(request.asset, {
+    backend: request.backend,
+    objectKey,
+    referenceObjectKey,
+    prompt: request.prompt,
+    negativePrompt: request.negativePrompt,
+    assetId,
+    width: decoded.width,
+    height: decoded.height
+  });
+}
+
+/**
+ * Decodes a candidate once for what a pick needs from its pixels: the true size and, for NovelAI, the letterboxed
+ * Precise Reference canvas (NovelAI accepts only three fixed canvas sizes, so the copy is made here, once).
+ */
+async function decodeProfileCandidate(
+  dataUrl: string,
+  backend: ImageBackendId
+): Promise<{ width: number; height: number; referenceDataUrl?: string }> {
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(dataUrlToBlob(dataUrl));
+  } catch {
+    throw new Error("후보 이미지를 읽지 못했습니다. 후보를 다시 생성하세요.");
+  }
+  try {
+    const { width, height } = bitmap;
+    if (backend !== "novelai") {
+      return { width, height };
+    }
+    const canvas = await letterboxForNovelAiReference(bitmap, width, height);
+    return { width, height, referenceDataUrl: `data:image/png;base64,${bytesToBase64(new Uint8Array(await canvas.arrayBuffer()))}` };
+  } finally {
+    bitmap.close();
+  }
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const match = /^data:([^;,]+);base64,(.*)$/su.exec(dataUrl);
+  if (!match) {
+    throw new Error("후보 이미지 형식을 읽지 못했습니다.");
+  }
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: match[1] });
+}
+
+/** Only what the object store writes and echoes. Provider metadata stays behind: it can be large and is not kept. */
+function createProfileObjectAsset(request: CharacterProfileImagePersistRequest, id: string, dataUrl: string, title: string): ImageAsset {
+  return {
+    id,
+    simulationId: request.simulationId,
+    title,
+    source: "generated",
+    prompt: request.prompt,
+    negativePrompt: request.negativePrompt,
+    safetyLevel: request.asset.safetyLevel,
+    characterIds: [request.draftCharacterId],
+    tags: [],
+    createdAt: new Date().toISOString(),
+    palette: request.asset.palette,
+    dataUrl,
+    mimeType: dataUrl.slice(5, dataUrl.indexOf(";")),
+    backend: request.backend
+  };
+}
+
+function describeApiServerFailure(error: unknown): string {
+  const status = /request failed: (\d{3})/u.exec(error instanceof Error ? error.message : "")?.[1];
+  if (status) {
+    return `API 서버가 요청을 거부했습니다 (HTTP ${status}).`;
+  }
+  let baseUrl = DEFAULT_DYNAMICCHAT_API_BASE_URL;
+  try {
+    baseUrl = getConfiguredDynamicChatApiBaseUrl();
+  } catch {
+    // Storage-blocked contexts throw on localStorage; the default base is what the client used then too.
+  }
+  return `DynamicChat API 서버에 연결할 수 없습니다 (${baseUrl}). 프로필 이미지는 API 서버에 저장되므로, 서버를 실행한 뒤 다시 지정하세요.`;
+}
+
+/** The same allow-list the server applies to each segment it is about to create. */
+function isSafeObjectPathSegment(value: string): boolean {
+  return value !== "." && value !== ".." && /^[A-Za-z0-9._-]+$/u.test(value);
+}
+
+/**
+ * The creation screen's profile-image studio for one character. The creator generates candidates on NovelAI or the
+ * photoreal backend and picks one per backend as the character's profile image, which from then on is also that
+ * backend's face reference. Candidates exist only in this builder session; a pick is stored as an object-store
+ * reference on the draft character, nothing more. There is deliberately no upload: a face reference can only be an
+ * image DynamicChat generated, so a real person's photo cannot become one.
+ */
+function CharacterProfileImagePanel({
+  character,
+  draft,
+  session = EMPTY_PROFILE_STUDIO_SESSION,
+  novelAiTokenRegistered,
+  onSessionChange,
+  onCharacterChange,
+  onClearProfileImage,
+  onNovelAiChange,
+  onPhotorealChange,
+  onGenerate,
+  onCancel,
+  onPick,
+  onDiscardCandidates
+}: {
+  character: SimulationCharacterDraft;
+  draft: SimulationDraft;
+  session?: ProfileStudioSession;
+  novelAiTokenRegistered: boolean;
+  onSessionChange: (change: (session: ProfileStudioSession) => ProfileStudioSession) => void;
+  onCharacterChange: (patch: Partial<SimulationCharacterDraft>) => void;
+  onClearProfileImage: (backend: ImageBackendId) => void;
+  onNovelAiChange: (patch: Partial<NovelAiApiSettings>) => void;
+  onPhotorealChange: (patch: Partial<PhotorealApiSettings>) => void;
+  onGenerate: (input: ProfileStudioGenerateInput) => void;
+  onCancel: () => void;
+  onPick: (candidate: ProfileStudioCandidate) => void;
+  onDiscardCandidates: () => void;
+}) {
+  const backend: ImageBackendId = session.backend ?? (draft.photoreal.enabled ? "photoreal" : "novelai");
+  const followedPrompt =
+    backend === "novelai" ? joinPromptParts([character.visualPrompt, character.defaultOutfitPrompt]) : character.photorealPrompt ?? "";
+  const typedPrompt = session.prompts[backend];
+  const prompt = typedPrompt ?? followedPrompt;
+  const negativePrompt = (backend === "novelai" ? character.negativeVisualPrompt : character.photorealNegativePrompt) ?? "";
+  const run = session.run;
+  const novelAiProfile = character.profileImages?.novelai;
+  const photorealProfile = character.profileImages?.photoreal;
+  const blocker = describeProfileTestBlocker(backend, draft, novelAiTokenRegistered);
+  const photorealBlocker = describeProfileTestBlocker("photoreal", draft, novelAiTokenRegistered);
+  const disabledReason = blocker?.message ?? (prompt.trim() ? undefined : "테스트할 외형을 프롬프트에 적어 주세요.");
+  const pickingBackends = new Set(session.candidates.filter((candidate) => candidate.persisting).map((candidate) => candidate.backend));
+  const referenceSupported = novelAiCharacterReferencePresets.has(draft.novelAi.modelPreset);
+  const routingMode = resolveImageBackendRouting(draft.imageProfile).mode;
+  const checkPrompt = character.photorealPrompt?.trim() || photorealProfile?.prompt || "";
+  const reasonId = `profile-studio-reason-${character.id}`;
+  const appearanceScreenId = `profile-studio-appearance-screen-${character.id}`;
+  const screeningState = useMemo(
+    () => createDraftScreeningState({ imageProfile: draft.imageProfile, novelAi: draft.novelAi, photoreal: draft.photoreal }),
+    [draft.imageProfile, draft.novelAi, draft.photoreal]
+  );
+
+  // An edit makes the last refusal stale: it was about the request as it stood.
+  const setPrompt = (value: string) =>
+    onSessionChange((current) => ({ ...current, prompts: { ...current.prompts, [backend]: value }, refusal: undefined }));
+  const followCharacterPrompt = () =>
+    onSessionChange((current) => {
+      const prompts = { ...current.prompts };
+      delete prompts[backend];
+      return { ...current, prompts, refusal: undefined };
+    });
+  const renderBlockerAction = (target: ProfileTestBlocker | undefined) =>
+    target?.action === "enable_photoreal" ? (
+      <button className="icon-text-button" type="button" onClick={() => onPhotorealChange({ enabled: true })}>
+        <Check size={14} />
+        실사 이미지 켜기
+      </button>
+    ) : target?.action === "photoreal_proxy" ? (
+      <button className="icon-text-button" type="button" onClick={() => onPhotorealChange({ requestMode: "proxy" })}>
+        <Check size={14} />
+        proxy로 바꾸기
+      </button>
+    ) : null;
+
+  return (
+    <div className="module-detail-panel profile-studio">
+      <SectionTitle icon={<UserRound size={17} />} title="캐릭터 프로필 이미지" />
+      <p className="runtime-hint">
+        후보를 생성해 백엔드마다 하나를 프로필로 지정하면, 그 이미지가 이 캐릭터의 얼굴 기준이 됩니다. 실존 인물의 사진이 얼굴 참조로
+        쓰이지 않도록, 프로필은 여기서 생성한 이미지에서만 고를 수 있습니다.
+      </p>
+
+      <div className="profile-studio-slots">
+        <ProfileImageSlot backend="novelai" characterName={character.name} image={novelAiProfile} onClear={() => onClearProfileImage("novelai")}>
+          {!novelAiProfile ? (
+            <p className="runtime-hint">
+              NovelAI 프로필은 캐릭터 레퍼런스(Precise Reference · V4.5 · 이미지당 +5 Anlas)를 켰을 때 얼굴 참조로 쓰입니다.
+            </p>
+          ) : !draft.novelAi.enabled ? (
+            <p className="runtime-hint">NovelAI 연동이 꺼져 있어 지금은 얼굴 참조로 쓰이지 않습니다.</p>
+          ) : draft.novelAi.characterReferenceEnabled !== true ? (
+            <>
+              <p className="runtime-hint">
+                캐릭터 레퍼런스(Precise Reference)가 꺼져 있어 NovelAI 컷에는 얼굴 참조로 쓰이지 않습니다. 켜면 V4.5 모델에서 이미지당 +5
+                Anlas가 듭니다.
+              </p>
+              <button className="icon-text-button" type="button" onClick={() => onNovelAiChange({ characterReferenceEnabled: true })}>
+                <Check size={14} />
+                캐릭터 레퍼런스 켜기
+              </button>
+            </>
+          ) : referenceSupported ? (
+            <p className="runtime-hint">캐릭터 레퍼런스가 켜져 있어 NovelAI 컷마다 얼굴 참조로 쓰입니다 (이미지당 +5 Anlas).</p>
+          ) : (
+            <p className="settings-note warning">
+              현재 모델 {draft.novelAi.modelPreset}은(는) Precise Reference를 지원하지 않아 얼굴 참조로 쓰이지 않습니다. 이미지/연동 탭에서
+              NAID4.5F 또는 NAID4.5C를 고르세요.
+            </p>
+          )}
+        </ProfileImageSlot>
+
+        <ProfileImageSlot backend="photoreal" characterName={character.name} image={photorealProfile} onClear={() => onClearProfileImage("photoreal")}>
+          {!photorealProfile ? (
+            <p className="runtime-hint">실사 프로필은 '얼굴 고정'이 켜져 있으면 실사 컷마다 얼굴 참조로 자동 사용됩니다 (이 PC에서 생성 · 무료).</p>
+          ) : !draft.photoreal.enabled ? (
+            <p className="runtime-hint">실사 이미지(ComfyUI) 연동이 꺼져 있어 지금은 얼굴 참조로 쓰이지 않습니다.</p>
+          ) : draft.photoreal.faceReferenceEnabled ? (
+            <p className="runtime-hint">'얼굴 고정'이 켜져 있어 이 캐릭터가 나오는 실사 컷마다 얼굴 참조로 쓰입니다 (이 PC에서 생성 · 무료).</p>
+          ) : (
+            <>
+              <p className="runtime-hint">'얼굴 고정'이 꺼져 있어 실사 컷에는 얼굴 참조로 쓰이지 않습니다.</p>
+              <button className="icon-text-button" type="button" onClick={() => onPhotorealChange({ faceReferenceEnabled: true })}>
+                <Check size={14} />
+                얼굴 고정 켜기
+              </button>
+            </>
+          )}
+          {photorealProfile && !character.photorealPrompt?.trim() && /\b(?:a|an|the)\b/iu.test(photorealProfile.prompt) && !HANGUL_TEXT_PATTERN.test(photorealProfile.prompt) ? (
+            <>
+              <p className="runtime-hint">
+                실사 외형이 비어 있어 실사 컷은 외형 태그를 옮겨 씁니다. 이 프로필을 만든 문장을 실사 외형으로 쓰면 얼굴 참조와 외형 설명이
+                맞춰집니다.
+              </p>
+              <button className="icon-text-button" type="button" onClick={() => onCharacterChange({ photorealPrompt: photorealProfile.prompt })}>
+                프로필 문장을 실사 외형으로
+              </button>
+            </>
+          ) : null}
+          {photorealProfile ? (
+            <button
+              className="icon-text-button"
+              type="button"
+              disabled={Boolean(run) || Boolean(photorealBlocker) || !checkPrompt.trim()}
+              title={photorealBlocker?.message ?? "프로필 얼굴로 다른 자세를 그려, 얼굴이 유지되는지 확인합니다."}
+              onClick={() =>
+                onGenerate({
+                  backend: "photoreal",
+                  prompt: checkPrompt,
+                  negativePrompt: character.photorealNegativePrompt ?? "",
+                  variant: "reference_check",
+                  count: PROFILE_REFERENCE_CHECK_COUNT
+                })
+              }
+            >
+              <ScanFace size={14} />
+              얼굴 고정 테스트
+            </button>
+          ) : null}
+          {session.refusal?.variant === "reference_check" && !run ? (
+            <ProfileStudioRefusalNote refusal={session.refusal} />
+          ) : null}
+        </ProfileImageSlot>
+      </div>
+
+      {run?.variant === "reference_check" || session.checks.length > 0 ? (
+        <div className="profile-studio-block">
+          <div className="profile-studio-block-head">
+            <strong>얼굴 고정 테스트</strong>
+          </div>
+          <p className="runtime-hint">프로필과 다른 자세로 그린 결과입니다. 같은 사람으로 보이면 얼굴 참조가 잘 작동하고 있습니다.</p>
+          {run?.variant === "reference_check" ? <ProfileStudioProgress run={run} onCancel={onCancel} /> : null}
+          {session.checks.length > 0 ? (
+            <div className="profile-studio-candidates">
+              {session.checks.map((candidate, index) => (
+                <ProfileStudioCandidateCard candidate={candidate} key={candidate.id} label={`얼굴 고정 테스트 ${index + 1}`} />
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="profile-studio-block">
+        <label>
+          <GuidedFieldLabel
+            badge="모든 실사 컷"
+            guide="실사 컷에서 이 캐릭터의 생김새를 설명하는 영어 문장입니다. NovelAI 외형 태그 대신 쓰이고, 의상 · 자세 · 배경은 장면마다 따로 정해집니다. 비워 두면 외형 태그를 옮겨 씁니다."
+            title="실사 외형"
+          />
+          <textarea
+            rows={3}
+            placeholder={PHOTOREAL_APPEARANCE_PLACEHOLDER}
+            value={character.photorealPrompt ?? ""}
+            aria-describedby={appearanceScreenId}
+            onChange={(event) => onCharacterChange({ photorealPrompt: event.target.value })}
+          />
+        </label>
+        {/* Keyed by character: the note reads the text once typing settles, and a switch to another character must
+            not show the previous one's verdict for that pause. */}
+        <PhotorealTextScreenNote
+          id={appearanceScreenId}
+          key={character.id}
+          scope="appearance"
+          state={screeningState}
+          text={character.photorealPrompt}
+        />
+        <label>
+          <GuidedFieldLabel guide="실사 컷에서 이 캐릭터에게 피할 요소입니다. 영어로, 쉼표로 구분해 적습니다." title="실사 네거티브" />
+          <input
+            placeholder="예: glasses, heavy makeup"
+            value={character.photorealNegativePrompt ?? ""}
+            onChange={(event) => onCharacterChange({ photorealNegativePrompt: event.target.value })}
+          />
+        </label>
+        {HANGUL_TEXT_PATTERN.test(character.photorealPrompt ?? "") ? (
+          <p className="settings-note warning">실사 외형은 영어로 적어 주세요. 한국어 문장은 실사 프롬프트에 들어가지 않고, 대신 외형 태그가 쓰입니다.</p>
+        ) : null}
+      </div>
+
+      <div className="profile-studio-block">
+        <div className="profile-studio-block-head">
+          <strong>테스트 생성</strong>
+        </div>
+        <div className="runtime-preset-grid profile-studio-backends" role="group" aria-label="테스트 생성 백엔드">
+          {(["novelai", "photoreal"] as const).map((option) => (
+            <button
+              key={option}
+              className={backend === option ? "active" : ""}
+              type="button"
+              aria-pressed={backend === option}
+              onClick={() => onSessionChange((current) => ({ ...current, backend: option, refusal: undefined }))}
+            >
+              <strong>{imageBackendLabels[option]}</strong>
+              <span>{option === "novelai" ? "태그 · 애니메이션 화풍" : "영어 문장 · ComfyUI"}</span>
+            </button>
+          ))}
+        </div>
+        <label>
+          <GuidedFieldLabel
+            guide={
+              backend === "novelai"
+                ? "후보의 외형 전부입니다. 저장된 외형 · 의상 태그는 따로 덧붙지 않습니다. 처음에는 위 Positive prompt와 기본 의상 태그로 채워집니다."
+                : "후보의 외형 전부입니다. 영어 문장은 외형 설명으로, 태그 목록은 태그로 쓰입니다. 처음에는 위 '실사 외형'으로 채워집니다."
+            }
+            title={backend === "novelai" ? "테스트 프롬프트 (NovelAI 태그)" : "테스트 프롬프트 (영어)"}
+          />
+          <textarea
+            rows={3}
+            placeholder={backend === "novelai" ? "예: 1girl, long black hair, brown eyes, white blouse" : PHOTOREAL_APPEARANCE_PLACEHOLDER}
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+          />
+        </label>
+        {typedPrompt !== undefined && typedPrompt !== followedPrompt ? (
+          <div className="profile-studio-actions">
+            <button className="icon-text-button" type="button" onClick={followCharacterPrompt}>
+              <RotateCcw size={14} />
+              {backend === "novelai" ? "캐릭터 태그로 되돌리기" : "실사 외형으로 되돌리기"}
+            </button>
+            {backend === "photoreal" && typedPrompt.trim() ? (
+              <button
+                className="icon-text-button"
+                type="button"
+                onClick={() => {
+                  onCharacterChange({ photorealPrompt: typedPrompt.trim() });
+                  followCharacterPrompt();
+                }}
+              >
+                <Save size={14} />
+                실사 외형에 저장
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {backend === "photoreal" && HANGUL_TEXT_PATTERN.test(prompt) ? (
+          <p className="settings-note warning">실사 프롬프트는 영어로 적어 주세요. 한국어는 실사 프롬프트에 들어가지 않습니다.</p>
+        ) : null}
+        <p className="runtime-hint">
+          {backend === "novelai" ? "네거티브로 위 'Negative prompt' 칸을 함께 보냅니다." : "네거티브로 '실사 네거티브' 칸을 함께 보냅니다."}{" "}
+          {backend === "novelai"
+            ? "NovelAI 테스트는 후보마다 일반 생성과 같은 Anlas를 씁니다."
+            : "실사 테스트는 이 PC의 ComfyUI에서 생성되어 비용이 들지 않습니다. 첫 생성은 모델을 불러오느라 더 걸립니다."}
+        </p>
+        {/* Same availability rule as decideImageBackend: 'NAI만' keeps story cuts off 실사 only while NovelAI is on. With
+            NovelAI off and 실사 on, every cut the safety floor does not lock falls back to 실사 — the seed's local-only
+            setup — so saying "실사가 쓰이지 않습니다" there was the opposite of what happens. */}
+        {backend === "photoreal" && routingMode === "novelai" && draft.novelAi.enabled ? (
+          <p className="runtime-hint">
+            지금 이미지 라우팅이 'NAI만'이라 이야기 컷에는 실사가 쓰이지 않습니다. 이미지/연동 탭의 '실사 라우팅'에서 바꿀 수 있습니다.
+          </p>
+        ) : backend === "photoreal" && routingMode === "novelai" && draft.photoreal.enabled ? (
+          <p className="runtime-hint">
+            이미지 라우팅은 'NAI만'이지만 NovelAI가 꺼져 있어, 안전 정책상 NovelAI로 고정된 컷을 뺀 이야기 컷은 실사로 생성됩니다.
+          </p>
+        ) : null}
+        <div className="profile-studio-actions">
+          <label className="profile-studio-count">
+            후보 수
+            <select disabled={Boolean(run)} value={session.count} onChange={(event) => onSessionChange((current) => ({ ...current, count: Number(event.target.value) }))}>
+              {[1, 2, 3, 4].map((count) => (
+                <option key={count} value={count}>
+                  {count}장
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="send-button"
+            type="button"
+            disabled={Boolean(run) || Boolean(disabledReason)}
+            aria-describedby={disabledReason ? reasonId : undefined}
+            onClick={() => onGenerate({ backend, prompt, negativePrompt, variant: "portrait", count: session.count })}
+          >
+            <Sparkles size={16} />
+            테스트 생성
+          </button>
+        </div>
+        {disabledReason && !run ? (
+          <div className="profile-studio-blocker">
+            <p className="settings-note" id={reasonId}>
+              {disabledReason}
+            </p>
+            {renderBlockerAction(blocker)}
+          </div>
+        ) : null}
+        {run && run.variant === "portrait" ? <ProfileStudioProgress run={run} onCancel={onCancel} /> : null}
+        {session.notice ? (
+          <p className="runtime-hint" role="status">
+            {session.notice}
+          </p>
+        ) : null}
+        {session.refusal && session.refusal.variant !== "reference_check" && !run ? (
+          <ProfileStudioRefusalNote refusal={session.refusal} />
+        ) : null}
+        {session.errors.length > 0 ? (
+          <div className="settings-note warning profile-studio-errors" role="alert">
+            <strong>테스트 생성 실패</strong>
+            <ul>
+              {session.errors.map((message) => (
+                <li key={message}>{message}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+
+      {session.candidates.length > 0 ? (
+        <div className="profile-studio-block">
+          <div className="profile-studio-block-head">
+            <strong>후보 {session.candidates.length}장</strong>
+            <button className="icon-text-button" type="button" disabled={Boolean(run)} onClick={onDiscardCandidates}>
+              <Trash2 size={14} />
+              후보 비우기
+            </button>
+          </div>
+          <p className="runtime-hint">후보는 이 제작 화면에만 있고 저장되지 않습니다. 프로필로 지정한 이미지만 저장됩니다.</p>
+          <div className="profile-studio-candidates">
+            {session.candidates.map((candidate, index) => (
+              <ProfileStudioCandidateCard
+                candidate={candidate}
+                isProfile={Boolean(candidate.profileAssetId) && character.profileImages?.[candidate.backend]?.assetId === candidate.profileAssetId}
+                key={candidate.id}
+                label={`후보 ${index + 1}`}
+                pickDisabled={candidate.persisting === true || pickingBackends.has(candidate.backend)}
+                onPick={() => onPick(candidate)}
+              />
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** One backend's current profile image, with what it is used for underneath. */
+function ProfileImageSlot({
+  backend,
+  characterName,
+  image,
+  children,
+  onClear
+}: {
+  backend: ImageBackendId;
+  characterName: string;
+  image?: CharacterProfileImage;
+  children?: ReactNode;
+  onClear: () => void;
+}) {
+  const label = `${imageBackendLabels[backend]} 프로필`;
+  return (
+    <section className={`profile-studio-slot${image ? "" : " empty"}`} aria-label={label}>
+      <div className="profile-studio-block-head">
+        <strong>{label}</strong>
+        {image ? (
+          <button className="icon-text-button" type="button" aria-label={`${label} 해제`} onClick={onClear}>
+            <X size={14} />
+            해제
+          </button>
+        ) : (
+          <span>미지정</span>
+        )}
+      </div>
+      <div className="profile-studio-slot-body">
+        <ProfileImageThumb alt={image ? `${characterName} ${label} 이미지` : ""} className="profile-studio-slot-thumb" image={image} />
+        <div className="profile-studio-slot-notes">
+          {image ? <small>{describeProfileImageMeta(image)}</small> : null}
+          {children}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * A test the planner refused before anything ran — the photoreal safety floor, most often. Worded as "not started"
+ * rather than as a failure: nothing was sent and nothing was spent, and what has to change is the request.
+ */
+function ProfileStudioRefusalNote({ refusal }: { refusal: ProfileStudioRefusal }) {
+  const subject = refusal.variant === "reference_check" ? "얼굴 고정 테스트" : `${imageBackendLabels[refusal.backend]} 테스트`;
+  return (
+    <div className="settings-note warning profile-studio-errors profile-studio-refusal" role="alert">
+      <strong>{subject}를 시작하지 않았습니다</strong>
+      <p>{refusal.message}</p>
+    </div>
+  );
+}
+
+/**
+ * What the photoreal safety floor will do with free text a creator types for the photo side, worded for a note under
+ * the field, or undefined when the text passes. The planner reads the same text on every cut — a character's 실사
+ * 외형 with each cut that character is in, the style text with every cut — through the same screen, and a text the
+ * floor refuses sends those cuts to NovelAI instead (or leaves them unrendered while NovelAI is off). Nothing is
+ * blocked or rewritten here: the note only says, while the creator can still reword it, what routing will do anyway.
+ */
+function describePhotorealTextLock(state: AppState, text: string | undefined, scope: "appearance" | "style"): string | undefined {
+  const screen = screenPhotorealText(state, text);
+  if (!screen) {
+    return undefined;
+  }
+  const { classification } = screen;
+  // Letters no lexicon can read (kana, Chinese, Cyrillic look-alikes) lock a cut as surely as an explicit word, but
+  // the way out is different: the same description in English.
+  const unreadableOnly =
+    classification.unverifiable === true &&
+    classification.category !== "explicit" &&
+    !classification.minorCoded &&
+    !(classification.schoolCoded && classification.suggestive);
+  const subject = scope === "appearance" ? "이 실사 외형" : "이 스타일 문장";
+  const consequence = scope === "appearance" ? "이 캐릭터가 나오는 컷은 실사 대신 NovelAI로 생성됩니다." : "실사로 갈 컷이 모두 NovelAI로 넘어갑니다.";
+  return [
+    unreadableOnly
+      ? `${subject}에는 확인할 수 없는 문자(영문 외 문자)가 있어, ${consequence} 영어로 적어 주세요.`
+      : `${subject}은 실사 안전 기준(미성년·노출·성적 표현)에 걸려, ${consequence}`,
+    state.novelAi.enabled ? undefined : "지금은 NovelAI가 꺼져 있어 그 컷은 생성되지 않습니다."
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/**
+ * Enough of an AppState for screenPhotorealText to judge builder text: the router reads the draft's routing and which
+ * renderers it turns on, and nothing else. A full createDraftPreviewState would rebuild the whole simulation on every
+ * keystroke to answer a question about one sentence.
+ */
+function createDraftScreeningState(draft: Pick<SimulationDraft, "imageProfile" | "novelAi" | "photoreal">): AppState {
+  return { ...seedState, imageProfile: draft.imageProfile, novelAi: draft.novelAi, photoreal: draft.photoreal };
+}
+
+/**
+ * The safety floor's verdict on a photo-side text field, shown under that field (describePhotorealTextLock). Read
+ * once typing pauses, so it does not flicker in and out mid-word. The region is always mounted and polite: a screen
+ * reader hears the note when it appears or changes, and the field points at it, without an interruption per key.
+ */
+function PhotorealTextScreenNote({
+  id,
+  state,
+  text,
+  scope
+}: {
+  id: string;
+  state: AppState;
+  text: string | undefined;
+  scope: "appearance" | "style";
+}) {
+  const [settledText] = useSettledValue(text ?? "", PHOTOREAL_TEXT_SCREEN_DELAY_MS);
+  const message = describePhotorealTextLock(state, settledText, scope);
+  return (
+    <div className="photoreal-text-screen" id={id} role="status" aria-live="polite">
+      {message ? <p className="settings-note warning">{message}</p> : null}
+    </div>
+  );
+}
+
+function ProfileStudioProgress({ run, onCancel }: { run: ProfileStudioRun; onCancel: () => void }) {
+  return (
+    <div className="profile-studio-progress">
+      <span role="status" aria-live="polite">
+        {describeProfileStudioRun(run)}
+      </span>
+      <button className="icon-text-button" type="button" onClick={onCancel}>
+        <Square size={13} />
+        취소
+      </button>
+    </div>
+  );
+}
+
+function ProfileStudioCandidateCard({
+  candidate,
+  label,
+  isProfile = false,
+  pickDisabled = false,
+  onPick
+}: {
+  candidate: ProfileStudioCandidate;
+  label: string;
+  isProfile?: boolean;
+  pickDisabled?: boolean;
+  /** Absent for face-check images: they test the profile, they are not candidates for it. */
+  onPick?: () => void;
+}) {
+  const seed = readProviderPayloadNumber(candidate.asset.providerMetadata ?? {}, "seed");
+  return (
+    <figure className={`profile-studio-candidate${isProfile ? " is-profile" : ""}`}>
+      <div className="profile-studio-candidate-image">
+        <img alt={label} src={candidate.asset.dataUrl} />
+        <span className="image-backend-badge">{imageBackendBadgeLabels[candidate.backend]}</span>
+      </div>
+      <figcaption>
+        <small>{seed !== undefined ? `${label} · seed ${seed}` : label}</small>
+        {onPick ? (
+          isProfile ? (
+            <span className="profile-studio-picked">
+              <Check size={13} />
+              프로필로 지정됨
+            </span>
+          ) : (
+            <button className="icon-text-button" type="button" disabled={pickDisabled} onClick={onPick}>
+              {candidate.persisting ? "저장 중…" : `${imageBackendLabels[candidate.backend]} 프로필로 지정`}
+            </button>
+          )
+        ) : null}
+        {candidate.error ? (
+          <p className="settings-note warning" role="alert">
+            {candidate.error}
+          </p>
+        ) : null}
+      </figcaption>
+    </figure>
+  );
+}
+
+/** A stored profile image from the object store; a neutral glyph when there is none or it will not load. */
+function ProfileImageThumb({ image, alt = "", className }: { image?: CharacterProfileImage; alt?: string; className?: string }) {
+  const src = image?.objectKey ? createObjectStoreImageSrc(image.objectKey) : undefined;
+  const [failedSrc, setFailedSrc] = useState<string>();
+  const classes = ["profile-thumb", className].filter(Boolean).join(" ");
+  if (!src || failedSrc === src) {
+    return (
+      <span className={`${classes} empty`} aria-hidden="true">
+        <UserRound size={18} />
+      </span>
+    );
+  }
+  return (
+    <span className={classes}>
+      <img alt={alt} loading="lazy" src={src} onError={() => setFailedSrc(src)} />
+    </span>
+  );
+}
+
 function ImageStyleProfilePanel({
   module,
   onModuleChange
@@ -11620,6 +13820,126 @@ function ModuleEditor({
   );
 }
 
+/** One sentence saying where the next cuts will actually go, availability included. */
+function describeImageBackendRoutingSummary(
+  routing: ImageBackendRouting,
+  availability: { novelAiEnabled: boolean; photorealEnabled: boolean }
+): string {
+  const tickedLabels = routing.photorealCategories
+    .filter((category) => category !== "explicit")
+    .map((category) => getImageSceneCategoryLabel(category))
+    .filter((label): label is string => Boolean(label));
+  const base =
+    routing.mode === "novelai"
+      ? "모든 컷을 NovelAI로 생성합니다."
+      : routing.mode === "photoreal"
+        ? "모든 컷을 실사로 생성하고, 성적 장면과 미성년으로 보일 수 있는 장면만 NovelAI로 생성합니다."
+        : tickedLabels.length === 0
+          ? "실사로 보낼 장면을 고르지 않아 모든 컷을 NovelAI로 생성합니다."
+          : `${tickedLabels.join(", ")} 장면은 실사로, 나머지는 NovelAI로 생성합니다. 성적 장면은 항상 NovelAI입니다.`;
+  const routesToPhotoreal = routing.mode === "photoreal" || (routing.mode === "mixed" && tickedLabels.length > 0);
+  if (routesToPhotoreal && !availability.photorealEnabled) {
+    return `${base} ${availability.novelAiEnabled ? "지금은 실사(ComfyUI) 연동이 꺼져 있어 NovelAI로 대신 생성합니다." : "실사(ComfyUI) 연동을 켜야 생성됩니다."}`;
+  }
+  if (!availability.novelAiEnabled && availability.photorealEnabled && routing.mode !== "photoreal") {
+    return `${base} 지금은 NovelAI가 꺼져 있어, 안전 정책상 NovelAI로 고정된 컷을 뺀 나머지를 실사로 대신 생성합니다.`;
+  }
+  return base;
+}
+
+/**
+ * Per-cut renderer routing: [NAI만 | 장면별 혼합 | 전부 실사] and the scene categories that go photoreal in mixed
+ * mode (multi-select). One component for all three places it appears — settings, the image panel, the builder —
+ * so the summary and the explicit row's lock cannot drift apart between them.
+ *
+ * The explicit row is rendered disabled and always unchecked. It is in the list so the creator can SEE that
+ * sexual cuts stay on NovelAI, not because it is a choice: resolveImageBackendRouting strips the category and
+ * decideImageBackend locks such cuts whatever the routing says.
+ */
+function ImageBackendRoutingCard({
+  routing,
+  novelAiEnabled,
+  photorealEnabled,
+  compact = false,
+  onChange
+}: {
+  routing: ImageBackendRouting;
+  novelAiEnabled: boolean;
+  photorealEnabled: boolean;
+  /** The image panel's variant: the category list only while it matters (mixed), without descriptions. */
+  compact?: boolean;
+  onChange: (next: ImageBackendRouting, message: string) => void;
+}) {
+  const activeMode =
+    imageBackendRoutingModeOptions.find((option) => option.value === routing.mode) ?? imageBackendRoutingModeOptions[0];
+  const ticked = new Set(routing.photorealCategories);
+  const showCategories = !compact || routing.mode === "mixed";
+  const toggleCategory = (category: ImageSceneCategory, checked: boolean) => {
+    const wanted = new Set(routing.photorealCategories);
+    if (checked) {
+      wanted.add(category);
+    } else {
+      wanted.delete(category);
+    }
+    wanted.delete("explicit");
+    const label = getImageSceneCategoryLabel(category) ?? category;
+    onChange(
+      // Canonical order, so the stored list (and the summary that reads it) does not depend on click order.
+      { ...routing, photorealCategories: IMAGE_SCENE_CATEGORY_OPTIONS.map((option) => option.id).filter((id) => wanted.has(id)) },
+      checked ? `'${label}' 장면을 실사로 보냅니다.` : `'${label}' 장면을 NovelAI로 보냅니다.`
+    );
+  };
+
+  return (
+    <article className={`runtime-parameter-card backend-routing-card${compact ? " compact" : ""}`}>
+      <div className="runtime-card-subhead">
+        <strong>실사 라우팅</strong>
+        <span>{activeMode.label}</span>
+      </div>
+      <div className="runtime-preset-grid backend-routing-modes" role="group" aria-label="이미지 백엔드 라우팅 모드">
+        {imageBackendRoutingModeOptions.map((option) => (
+          <button
+            key={option.value}
+            className={routing.mode === option.value ? "active" : ""}
+            type="button"
+            aria-pressed={routing.mode === option.value}
+            onClick={() => onChange({ ...routing, mode: option.value }, `이미지 라우팅을 '${option.label}' 모드로 바꿨습니다.`)}
+          >
+            <strong>{option.label}</strong>
+            <span>{option.detail}</span>
+          </button>
+        ))}
+      </div>
+      {showCategories ? (
+        <fieldset className="backend-routing-categories">
+          <legend>
+            실사로 보낼 장면
+            {routing.mode !== "mixed" ? <small> · 장면별 혼합 모드에서 적용</small> : null}
+          </legend>
+          {IMAGE_SCENE_CATEGORY_OPTIONS.map((option) => {
+            const locked = option.locked === true;
+            return (
+              <label className={`backend-routing-category${locked ? " locked" : ""}`} key={option.id}>
+                <input
+                  type="checkbox"
+                  checked={!locked && ticked.has(option.id)}
+                  disabled={locked}
+                  onChange={(event) => toggleCategory(option.id, event.target.checked)}
+                />
+                <span>
+                  <strong>{option.label}</strong>
+                  {!compact || locked ? <small>{option.description}</small> : null}
+                </span>
+              </label>
+            );
+          })}
+        </fieldset>
+      ) : null}
+      <p className="settings-note backend-routing-summary">{describeImageBackendRoutingSummary(routing, { novelAiEnabled, photorealEnabled })}</p>
+    </article>
+  );
+}
+
 function ImagePromptBlock({ label, value, muted = false }: { label: string; value: string; muted?: boolean }) {
   const displayValue = value.trim() || (muted ? "없음" : "프롬프트 없음");
 
@@ -11651,7 +13971,8 @@ function ImagePanel({
   onCancelJob: (jobId: string) => void;
   onDeleteAsset: (assetId: string) => void;
   onImageProfileChange: (patch: Partial<ImageGenerationProfile>) => void;
-  onRegenerateJob: (job: ImageGenerationJob) => void;
+  /** `backend` is set only by "다른 백엔드로 재생성"; a plain regeneration keeps the cut's own renderer. */
+  onRegenerateJob: (job: ImageGenerationJob, backend?: ImageBackendId) => void;
   onRunJob: (job: ImageGenerationJob) => void;
   onFeedback: (assetId: string, rating: ImageFeedbackRating) => void;
 }) {
@@ -11695,7 +14016,47 @@ function ImagePanel({
   const promptScale = inspectedJob
     ? readProviderPayloadNumber(inspectedJob.providerPayload, "scale") ?? readProviderPayloadNumber(inspectedJob.providerPayload, "promptGuidance")
     : undefined;
-  const novelAiV4CaptionDebug = inspectedJob ? readNovelAiV4CaptionDebug(inspectedJob.providerPayload) : undefined;
+  const inspectedBackend = inspectedJob ? readImageJobBackend(inspectedJob) : undefined;
+  const isPhotorealJob = inspectedBackend === "photoreal";
+  // The NAI caption block describes a NovelAI request; on a photoreal cut it would be a request that never existed.
+  const novelAiV4CaptionDebug = inspectedJob && !isPhotorealJob ? readNovelAiV4CaptionDebug(inspectedJob.providerPayload) : undefined;
+  const inspectedRouting = inspectedJob?.routing;
+  const inspectedCategoryLabel = getImageSceneCategoryLabel(inspectedRouting?.category);
+  const inspectedPresetId = inspectedJob ? readProviderPayloadText(inspectedJob.providerPayload, "presetId") : undefined;
+  const inspectedPreset =
+    inspectedPresetId && Object.prototype.hasOwnProperty.call(PHOTOREAL_WORKFLOW_PRESETS, inspectedPresetId)
+      ? PHOTOREAL_WORKFLOW_PRESETS[inspectedPresetId as PhotorealWorkflowPresetId]
+      : undefined;
+  // A photoreal cut's numbers come from its own payload, else its preset and the photoreal size resolver — never the
+  // NovelAI profile's sampler/steps/size, which describe a different model entirely.
+  const photorealFallbackSize = isPhotorealJob ? resolvePhotorealOutputSize(state) : undefined;
+  const displayWidth = promptWidth ?? photorealFallbackSize?.width ?? state.imageProfile.width;
+  const displayHeight = promptHeight ?? photorealFallbackSize?.height ?? state.imageProfile.height;
+  // A fixed-schedule preset (Qwen-Image 2.1 Turbo) samples its own step count whatever the job recorded: showing the
+  // 스텝 override there would describe a render that never happened.
+  const fixedPhotorealSteps = isPhotorealJob ? readFixedPhotorealSteps(inspectedPresetId) : undefined;
+  const displaySteps = promptSteps ?? (isPhotorealJob ? inspectedPreset?.defaults.steps : state.imageProfile.steps);
+  const displayStepsLabel =
+    fixedPhotorealSteps !== undefined
+      ? `${fixedPhotorealSteps} (Turbo 고정)`
+      : displaySteps !== undefined
+        ? displaySteps.toString()
+        : "기본값";
+  const displayCfg =
+    (isPhotorealJob ? readProviderPayloadNumber(inspectedJob?.providerPayload ?? {}, "cfg") : promptScale) ??
+    (isPhotorealJob ? inspectedPreset?.defaults.cfg : state.imageProfile.promptGuidance);
+  // A Turbo preset samples at its fixed CFG whatever the job recorded (a job planned before the pin may say 4).
+  const fixedPhotorealCfg = isPhotorealJob ? inspectedPreset?.fixedCfg : undefined;
+  const displayCfgLabel =
+    fixedPhotorealCfg !== undefined ? `${fixedPhotorealCfg} (Turbo 고정)` : displayCfg !== undefined ? displayCfg.toString() : "기본값";
+  const photorealSourceTags = inspectedJob && isPhotorealJob ? readProviderPayloadText(inspectedJob.providerPayload, "novelAiPrompt") : undefined;
+  const photorealReferenceNames = inspectedJob && isPhotorealJob ? readPhotorealReferenceCharacterNames(state, inspectedJob.providerPayload) : [];
+  const otherBackend: ImageBackendId | undefined = inspectedBackend ? (inspectedBackend === "photoreal" ? "novelai" : "photoreal") : undefined;
+  // Regenerating on a renderer that is switched off cannot produce a picture: the request goes out confirmed and
+  // fails at once, and turning the renderer on later does not bring it back. So the button waits for the renderer
+  // instead of the copy promising that the cut will.
+  const otherBackendOff =
+    otherBackend === "photoreal" ? state.photoreal?.enabled !== true : otherBackend === "novelai" ? !state.novelAi.enabled : false;
   const isInspectingLatestJob = Boolean(inspectedJob && latestJob && inspectedJob.id === latestJob.id);
   const activeCadenceOption =
     imageGenerationCadenceOptions.find((option) => option.value === state.imageProfile.generationCadence) ??
@@ -11757,6 +14118,14 @@ function ImagePanel({
         </div>
       </article>
 
+      <ImageBackendRoutingCard
+        compact
+        routing={resolveImageBackendRouting(state.imageProfile)}
+        novelAiEnabled={state.novelAi.enabled}
+        photorealEnabled={state.photoreal?.enabled === true}
+        onChange={(backendRouting) => onImageProfileChange({ backendRouting })}
+      />
+
       {inspectedJob ? (
         <article className="image-job-detail">
           <div className="image-job-detail-header">
@@ -11784,10 +14153,19 @@ function ImagePanel({
           </div>
           <p>{inspectedJob.reason}</p>
           {inspectedCue?.scene ? <small>장면: {inspectedCue.scene}</small> : null}
+          {inspectedBackend ? (
+            <div className="image-job-routing">
+              <span className="image-job-routing-backend">{imageBackendLabels[inspectedBackend]}</span>
+              {inspectedCategoryLabel ? <span>{inspectedCategoryLabel}</span> : null}
+              {inspectedRouting?.locked ? <span>안전 정책 고정</span> : null}
+              {inspectedRouting?.fallback ? <span>대체 백엔드</span> : null}
+              {inspectedRouting?.reason ? <p>{inspectedRouting.reason}</p> : null}
+            </div>
+          ) : null}
           <div className="image-job-metrics">
-            <Metric label="해상도" value={promptWidth && promptHeight ? `${promptWidth}x${promptHeight}` : `${state.imageProfile.width}x${state.imageProfile.height}`} />
-            <Metric label="스텝" value={(promptSteps ?? state.imageProfile.steps).toString()} />
-            <Metric label="CFG" value={(promptScale ?? state.imageProfile.promptGuidance).toString()} />
+            <Metric label="해상도" value={`${displayWidth}x${displayHeight}`} />
+            <Metric label="스텝" value={displayStepsLabel} />
+            <Metric label="CFG" value={displayCfgLabel} />
             <Metric label="시드" value={promptSeed?.toString() ?? "자동"} />
           </div>
           {inspectedJob.error ? (
@@ -11799,14 +14177,49 @@ function ImagePanel({
           {inspectedCue?.frame ? (
             <p className="image-job-frame">구도: {describeImageCueFrame(inspectedCue.frame)}</p>
           ) : null}
-          <ImagePromptBlock label="프롬프트" value={inspectedJob.prompt} />
+          <ImagePromptBlock label={isPhotorealJob ? "실사 프롬프트" : "프롬프트"} value={inspectedJob.prompt} />
           <ImagePromptBlock label="Negative" value={inspectedJob.negativePrompt} muted />
+          {photorealSourceTags ? <ImagePromptBlock label="원본 태그 (NAI 구성)" value={photorealSourceTags} muted /> : null}
           {novelAiV4CaptionDebug ? <ImagePromptBlock label="NAI v4 captions" value={novelAiV4CaptionDebug} muted /> : null}
-          <div className="image-job-spec">
-            <span>{promptModel ?? state.imageProfile.model}</span>
-            <span>{promptSampler ?? state.novelAi.sampler}</span>
-            <span>{promptSchedule ?? state.novelAi.noiseSchedule}</span>
-          </div>
+          {isPhotorealJob ? (
+            <div className="image-job-spec">
+              <span>{inspectedPreset?.label ?? inspectedPresetId ?? "실사 프리셋"}</span>
+              {promptModel ? <span>{promptModel}</span> : null}
+              {photorealReferenceNames.length > 0 ? <span>얼굴 참조: {photorealReferenceNames.join(", ")}</span> : <span>얼굴 참조 없음</span>}
+            </div>
+          ) : (
+            <div className="image-job-spec">
+              <span>{promptModel ?? state.imageProfile.model}</span>
+              <span>{promptSampler ?? state.novelAi.sampler}</span>
+              <span>{promptSchedule ?? state.novelAi.noiseSchedule}</span>
+            </div>
+          )}
+          {otherBackend && ["queued", "completed", "failed", "canceled"].includes(inspectedJob.status) ? (
+            <div className="image-job-switch-backend">
+              <button
+                className="icon-text-button"
+                type="button"
+                disabled={inspectedRouting?.locked === true || otherBackendOff}
+                aria-describedby={inspectedRouting?.locked || otherBackendOff ? `image-job-switch-note-${inspectedJob.id}` : undefined}
+                onClick={() => onRegenerateJob(inspectedJob, otherBackend)}
+                title={inspectedRouting?.locked ? inspectedRouting.reason : undefined}
+              >
+                <RefreshCcw size={15} />
+                다른 백엔드로 재생성 ({imageBackendLabels[otherBackend]})
+              </button>
+              {inspectedRouting?.locked ? (
+                <small id={`image-job-switch-note-${inspectedJob.id}`}>{inspectedRouting.reason || "안전 정책상 이 컷은 NovelAI로 고정되어 있습니다."}</small>
+              ) : otherBackendOff && otherBackend === "photoreal" ? (
+                <small id={`image-job-switch-note-${inspectedJob.id}`}>
+                  실사 이미지(ComfyUI) 연동이 꺼져 있습니다. 설정 탭에서 켜면 이 컷을 실사로 다시 생성할 수 있습니다.
+                </small>
+              ) : otherBackendOff ? (
+                <small id={`image-job-switch-note-${inspectedJob.id}`}>
+                  NovelAI 연동이 꺼져 있습니다. 개인 설정에서 켜면 이 컷을 NovelAI로 다시 생성할 수 있습니다.
+                </small>
+              ) : null}
+            </div>
+          ) : null}
           {jobEvidence.length > 0 ? (
             <div className="image-evidence-list">
               <strong>근거 메모리</strong>
@@ -11876,7 +14289,9 @@ function ImagePanel({
               </span>
             </button>
             <div className="job-actions">
-              <strong>{getImageJobStatusLabel(job.status)}</strong>
+              <strong>
+                {imageBackendBadgeLabels[readImageJobBackend(job)]} · {getImageJobStatusLabel(job.status)}
+              </strong>
               {canUserRunQueuedImageJob(job) ? (
                 <button className="icon-button" type="button" onClick={() => onRunJob(job)} aria-label="이미지 작업 실행">
                   <Play size={15} />
@@ -11924,6 +14339,7 @@ function ImageAssetTile({
       <button className="image-asset-select" type="button" onClick={onSelect} aria-label={`${asset.title} 보기`}>
         <span className="image-asset-thumb">
           <AssetImage src={createImageAssetSrc(asset)} alt={asset.title} />
+          <ImageBackendBadge asset={asset} />
         </span>
         <span className="image-asset-meta">
           <strong>{asset.title}</strong>
@@ -13096,11 +15512,48 @@ function resolveRelationshipLooseNodeId(
 }
 
 function findRelationshipImageAsset(state: AppState, characterId: string): ImageAsset | undefined {
+  // A picked profile image is the face the creator chose for this character, so it outranks whatever cut happened
+  // to include them last (which may be a back view, a crowd shot, or another character's close-up).
+  const profileAsset = createProfileImagePortraitAsset(state, characterId);
+  if (profileAsset) {
+    return profileAsset;
+  }
   const candidates = state.imageAssets
     .slice()
     .reverse()
     .filter((asset) => asset.characterIds.includes(characterId));
   return candidates.find((asset) => asset.dataUrl && (asset.representative || asset.source === "generated")) ?? candidates[0];
+}
+
+const PROFILE_PORTRAIT_PALETTE: [string, string, string] = ["#274b63", "#e8edea", "#d0a34a"];
+
+/**
+ * The character's profile image as a display-only asset for the portrait. Photoreal first, then NovelAI. It is
+ * built here, never stored: a profile is simulation-scoped and must not join the run's imageAssets, where reuse
+ * and stored-asset picking would start treating it as a scene image.
+ */
+function createProfileImagePortraitAsset(state: AppState, characterId: string): ImageAsset | undefined {
+  const visualProfile = state.visualProfiles.find((profile) => profile.characterId === characterId);
+  const profileImage = selectDisplayProfileImage(visualProfile?.profileImages);
+  if (!visualProfile || !profileImage?.objectKey) {
+    return undefined;
+  }
+  return {
+    id: profileImage.assetId,
+    simulationId: state.simulation.id,
+    title: `${visualProfile.displayName} 프로필`,
+    source: "stored",
+    prompt: profileImage.prompt,
+    negativePrompt: profileImage.negativePrompt ?? "",
+    safetyLevel: visualProfile.defaultSafetyLevel,
+    characterIds: [characterId],
+    tags: [],
+    createdAt: profileImage.selectedAt,
+    palette: PROFILE_PORTRAIT_PALETTE,
+    mimeType: profileImage.mimeType,
+    objectKey: profileImage.objectKey,
+    backend: profileImage.backend
+  };
 }
 
 function latestRelationshipRecordsByKey<T>(items: T[], keyOf: (item: T) => string): T[] {
@@ -14954,7 +17407,10 @@ function SettingsPanel({
   onNotify,
   onOpenPersonalSettings,
   onStateChange,
-  onResetDemo
+  onResetDemo,
+  jumpRequest,
+  onJumpHandled,
+  onRunLocalLlmTask
 }: {
   state: AppState;
   onImageProfileChange: (patch: Partial<ImageGenerationProfile>) => void;
@@ -14965,8 +17421,33 @@ function SettingsPanel({
   onOpenPersonalSettings: () => void;
   onStateChange: Dispatch<SetStateAction<AppState>>;
   onResetDemo: () => void;
+  /** A section to bring into view and focus (e.g. from '실사 설정 열기'); cleared through onJumpHandled once shown. */
+  jumpRequest?: SettingsJumpRequest;
+  onJumpHandled?: () => void;
+  /** The shared local-GPU lock for LLM calls made here; without it the call runs directly. */
+  onRunLocalLlmTask?: LocalLlmTaskRunner;
 }) {
   const [isRuntimeVerifying, setIsRuntimeVerifying] = useState(false);
+  const photorealSectionRef = useRef<HTMLDivElement>(null);
+  // Runs where the panel is on screen only: the rail and the mobile drawer can both hold a settings panel, and the
+  // hidden one must leave the request to the visible one. A frame later, so a drawer that has just opened has
+  // already moved focus to its first control, and this focus is the one that stays.
+  useEffect(() => {
+    if (jumpRequest?.section !== "photoreal") {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const target = photorealSectionRef.current;
+      if (!target || target.getClientRects().length === 0) {
+        return;
+      }
+      const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+      target.scrollIntoView({ block: "start", behavior: reduceMotion ? "auto" : "smooth" });
+      target.focus({ preventScroll: true });
+      onJumpHandled?.();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [jumpRequest, onJumpHandled]);
   const [runtimeCheck, setRuntimeCheck] = useState("");
   const [vibeEncodeStatus, setVibeEncodeStatus] = useState<Record<string, { state: "encoding" | "error"; message?: string }>>({});
   const [dynamicChatApiBaseUrl, setDynamicChatApiBaseUrl] = useState(() => getConfiguredDynamicChatApiBaseUrl());
@@ -14994,6 +17475,15 @@ function SettingsPanel({
   const llmStatusLabel = state.llm.provider === "mock" ? "mock" : llmHasSecret ? "키 등록됨" : "키 필요";
   const novelAiStatusLabel = !state.novelAi.enabled ? "비활성" : state.novelAi.requestMode === "mock" ? "mock" : novelAiHasSecret ? "토큰 등록됨" : "토큰 필요";
   const activeContentRatingOption = contentRatingOptions.find((option) => option.value === state.simulation.contentRating) ?? contentRatingOptions[0];
+  const imageBackendRouting = resolveImageBackendRouting(state.imageProfile);
+  const photorealSettings = state.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS;
+  const photorealMetricLabel = !photorealSettings.enabled
+    ? "꺼짐"
+    : photorealSettings.requestMode === "mock"
+      ? "mock"
+      : imageBackendRoutingModeOptions.find((option) => option.value === imageBackendRouting.mode)?.label ?? "켜짐";
+  const novelAiSupportsCharacterReference = novelAiCharacterReferencePresets.has(state.novelAi.modelPreset);
+  const novelAiIsV5 = state.novelAi.modelPreset.startsWith("NAID5");
   const notifyApplied = useCallback((message: string) => onNotify?.(message), [onNotify]);
   // Models discovered from a running local server, merged into the preset list. Keeps the keyless local
   // path usable without asking the user to type an exact model id from memory.
@@ -15046,6 +17536,23 @@ function SettingsPanel({
     (updater: SetStateAction<AppState>, message: string) => {
       onStateChange(updater);
       notifyApplied(message);
+    },
+    [notifyApplied, onStateChange]
+  );
+  // Photoreal settings have no secret and no vault, so they are written straight into the simulation state, like
+  // NeuralMap's. hydrateState normalizes them on the way in (see the number inputs in PhotorealRuntimeSettings).
+  const applyPhotorealChange = useCallback(
+    (patch: Partial<PhotorealApiSettings>, message?: string) => {
+      onStateChange((current) => ({
+        ...current,
+        photoreal: {
+          ...(current.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS),
+          ...patch
+        }
+      }));
+      if (message) {
+        notifyApplied(message);
+      }
     },
     [notifyApplied, onStateChange]
   );
@@ -15189,17 +17696,24 @@ function SettingsPanel({
         .filter((module) => module.enabled && module.tokenPolicy !== "disabled")
         .sort((a, b) => b.priority - a.priority)
         .slice(0, 6);
-      const [assistantResult, novelAiResult] = await Promise.all([
-        generateAssistantText({
-          state,
-          userText: "실제 API 연결 검증용입니다. 현재 시뮬레이션을 한 문장으로만 이어가세요.",
-          modules: relevantModules,
-          evidence: state.contextPacks.at(-1)?.evidence ?? [],
-          fallback: "Mock 대체 응답입니다."
-        }),
+      // A real LLM call, so it takes the local-GPU lock like a turn: run straight, a local Ollama would load beside
+      // a photoreal model still resident from the last cut and spill.
+      const runLlm: LocalLlmTaskRunner = onRunLocalLlmTask ?? ((_taskState, task) => task());
+      const [assistantResult, novelAiResult, photorealResult] = await Promise.all([
+        runLlm(state, () =>
+          generateAssistantText({
+            state,
+            userText: "실제 API 연결 검증용입니다. 현재 시뮬레이션을 한 문장으로만 이어가세요.",
+            modules: relevantModules,
+            evidence: state.contextPacks.at(-1)?.evidence ?? [],
+            fallback: "Mock 대체 응답입니다."
+          })
+        ),
         state.novelAi.enabled
           ? validateNovelAiApi(state.novelAi)
-          : Promise.resolve({ ok: true, message: "NovelAI 비활성화 상태입니다. 저장 이미지 모드로 진행됩니다." })
+          : Promise.resolve({ ok: true, message: "NovelAI 비활성화 상태입니다. 저장 이미지 모드로 진행됩니다." }),
+        // A status probe only — it renders nothing and loads no model, so it is safe to run beside the LLM call.
+        photorealSettings.enabled && photorealSettings.requestMode !== "mock" ? probeComfyUi(state) : Promise.resolve(undefined)
       ]);
       const llmStatus =
         assistantResult.source === "llm"
@@ -15210,8 +17724,11 @@ function SettingsPanel({
       setRuntimeCheck(
         [
           `LLM: ${llmStatus}${assistantResult.error ? ` (${assistantResult.error})` : ""}`,
-          `NovelAI: ${novelAiResult.ok ? "사용 가능" : "확인 실패"} - ${novelAiResult.message}`
-        ].join(" / ")
+          `NovelAI: ${novelAiResult.ok ? "사용 가능" : "확인 실패"} - ${novelAiResult.message}`,
+          photorealResult ? `실사: ${photorealResult.ok ? "사용 가능" : "확인 실패"} - ${photorealResult.message}` : undefined
+        ]
+          .filter((line): line is string => Boolean(line))
+          .join(" / ")
       );
     } catch (error) {
       setRuntimeCheck(error instanceof Error ? error.message : "실제 시뮬레이션 검증 중 알 수 없는 오류가 발생했습니다.");
@@ -15235,6 +17752,7 @@ function SettingsPanel({
           <Metric label="등급" value={activeContentRatingOption.label} />
           <Metric label="Prompt" value={`${state.modules.filter((module) => module.enabled).length}개`} />
           <Metric label="Image" value={activeImageGenerationCadence.label} />
+          <Metric label="실사" value={photorealMetricLabel} />
         </div>
       </div>
 
@@ -15341,6 +17859,12 @@ function SettingsPanel({
           </div>
         </label>
       </div>
+      <ImageBackendRoutingCard
+        routing={imageBackendRouting}
+        novelAiEnabled={state.novelAi.enabled}
+        photorealEnabled={photorealSettings.enabled}
+        onChange={(backendRouting, message) => applyImageProfileChange({ backendRouting }, message)}
+      />
       <div className="runtime-parameter-card image-prompt-settings-card">
         <div className="runtime-card-subhead">
           <strong>프롬프트 레이어</strong>
@@ -15911,6 +18435,11 @@ function SettingsPanel({
           Vibe Transfer 사용
         </label>
         <p className="settings-note">참조 이미지를 첨부하면 NovelAI 이미지 생성 요청에 함께 전송됩니다. 이미지마다 reference strength와 information extracted를 조절할 수 있습니다.{requiresVibeEncoding ? " v4/v4.5 모델은 생성 전에 각 이미지를 한 번 인코딩해야 하며(1회 2 Anlas), 모델이나 information extracted를 바꾸면 다시 인코딩하세요." : ""}</p>
+        {/* V5 refuses vibe arrays outright, so the client leaves them out of every V5 request. Said here rather
+            than discovered as "the vibe did nothing". */}
+        <p className={`settings-note${novelAiIsV5 && state.novelAi.vibeTransferEnabled ? " warning" : " muted"}`}>
+          V5 프리셋(NAID5F · NAID5C · NAID5)은 Vibe Transfer를 지원하지 않아, 그 모델로 생성할 때는 참조 이미지를 보내지 않고 건너뜁니다.
+        </p>
         <label className="vibe-transfer-import icon-text-button full">
           <ImagePlus size={16} />
           참조 이미지 추가
@@ -16013,6 +18542,84 @@ function SettingsPanel({
 
       <div className="runtime-parameter-card">
         <div className="runtime-card-subhead">
+          <strong>캐릭터 레퍼런스 (Precise Reference)</strong>
+          <span>{state.novelAi.characterReferenceEnabled ? "on" : "off"}</span>
+        </div>
+        <label className="checkline">
+          <input
+            checked={state.novelAi.characterReferenceEnabled === true}
+            type="checkbox"
+            onChange={(event) =>
+              applyNovelAiChange(
+                { characterReferenceEnabled: event.target.checked },
+                event.target.checked ? "NovelAI 캐릭터 레퍼런스가 활성화되었습니다." : "NovelAI 캐릭터 레퍼런스가 비활성화되었습니다."
+              )
+            }
+          />
+          캐릭터 NovelAI 프로필 이미지로 얼굴 고정
+        </label>
+        {/* Opt-in because it is the one NovelAI feature that costs Anlas per image even on Opus. */}
+        <p className="settings-note">
+          이미지당 +5 Anlas (Opus 포함) · V4.5 전용. 캐릭터에 NovelAI 프로필 이미지가 있어야 적용되며, 레퍼런스가 붙는 컷에서는 Vibe Transfer가 빠집니다.
+        </p>
+        {state.novelAi.characterReferenceEnabled && !novelAiSupportsCharacterReference ? (
+          <p className="settings-note warning">
+            현재 모델 {state.novelAi.modelPreset}은(는) Precise Reference를 지원하지 않아 레퍼런스 없이 생성됩니다. NAID4.5F 또는 NAID4.5C를 고르세요.
+          </p>
+        ) : null}
+        <label>
+          레퍼런스 강도{" "}
+          <span className="inline-value">
+            {(state.novelAi.characterReferenceStrength ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_STRENGTH).toFixed(2)}
+          </span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            disabled={state.novelAi.characterReferenceEnabled !== true}
+            value={state.novelAi.characterReferenceStrength ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_STRENGTH}
+            onChange={(event) => onNovelAiChange({ characterReferenceStrength: Number(event.target.value) })}
+            onMouseUp={() => notifyApplied("캐릭터 레퍼런스 강도가 적용되었습니다.")}
+            onTouchEnd={() => notifyApplied("캐릭터 레퍼런스 강도가 적용되었습니다.")}
+          />
+        </label>
+        <label>
+          충실도{" "}
+          <span className="inline-value">
+            {(state.novelAi.characterReferenceFidelity ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_FIDELITY).toFixed(2)}
+          </span>
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            disabled={state.novelAi.characterReferenceEnabled !== true}
+            value={state.novelAi.characterReferenceFidelity ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_FIDELITY}
+            onChange={(event) => onNovelAiChange({ characterReferenceFidelity: Number(event.target.value) })}
+            onMouseUp={() => notifyApplied("캐릭터 레퍼런스 충실도가 적용되었습니다.")}
+            onTouchEnd={() => notifyApplied("캐릭터 레퍼런스 충실도가 적용되었습니다.")}
+          />
+        </label>
+        <p className="runtime-hint">레퍼런스의 자세나 표정이 모든 컷에 따라붙으면 강도를 낮추세요.</p>
+        <label className="checkline">
+          <input
+            checked={state.novelAi.characterReferenceStyleAware === true}
+            disabled={state.novelAi.characterReferenceEnabled !== true}
+            type="checkbox"
+            onChange={(event) =>
+              applyNovelAiChange(
+                { characterReferenceStyleAware: event.target.checked },
+                event.target.checked ? "레퍼런스의 화풍까지 따릅니다." : "레퍼런스에서 캐릭터만 가져옵니다."
+              )
+            }
+          />
+          화풍까지 따르기 (style aware)
+        </label>
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
           <strong>자동 생성</strong>
           <span>{state.novelAi.automationTermination}</span>
         </div>
@@ -16051,6 +18658,14 @@ function SettingsPanel({
         <KeyRound size={16} />
         개인 설정에서 NovelAI 토큰 관리
       </button>
+
+      <SectionTitle
+        icon={<ImageIcon size={17} />}
+        title="실사 이미지 (ComfyUI)"
+        className="settings-jump-target"
+        headingRef={photorealSectionRef}
+      />
+      <PhotorealRuntimeSettings state={state} onChange={applyPhotorealChange} onNotify={notifyApplied} onStateChange={onStateChange} />
 
       <SectionTitle icon={<Play size={17} />} title="실제 시뮬레이션 검증" />
       <button className="send-button wide-action" type="button" onClick={verifyRuntimeTurn} disabled={isRuntimeVerifying}>
@@ -16127,6 +18742,868 @@ function SettingsPanel({
   );
 }
 
+/** How long the custom-workflow text has to rest before it is validated (see PhotorealRuntimeSettings). */
+const CUSTOM_WORKFLOW_VALIDATION_DELAY_MS = 600;
+
+/**
+ * `value` once it has stopped changing for `delayMs`, plus a function that takes the current value at once (for a
+ * blur, when the person is done typing).
+ */
+function useSettledValue<T>(value: T, delayMs: number): [T, () => void] {
+  const [settled, setSettled] = useState(value);
+  const latestRef = useRef(value);
+  latestRef.current = value;
+  useEffect(() => {
+    if (Object.is(settled, value)) {
+      return;
+    }
+    const timer = window.setTimeout(() => setSettled(value), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [delayMs, settled, value]);
+  const settleNow = useCallback(() => setSettled(latestRef.current), []);
+  return [settled, settleNow];
+}
+
+/**
+ * A failed ComfyUI connection check as a notice. Every failure carries "실패", which is what makes the toast a sticky
+ * error (showRuntimeNotice); the relay's HTTP-error path already words it this way, the rest named only the cause.
+ */
+function formatComfyUiProbeFailure(message: string): string {
+  const reason = message.trim();
+  if (/^ComfyUI 연결 확인 실패/u.test(reason)) {
+    return reason;
+  }
+  return `ComfyUI 연결 확인 실패: ${reason || "응답을 해석하지 못했습니다."}`;
+}
+
+/**
+ * A number field that keeps the user's draft while they type and commits on blur or Enter (Escape discards).
+ *
+ * App runs hydrateState on every state write, and normalizePhotorealSettings clamps numbers as it goes — sizes snap
+ * onto 256..2048 in steps of 16, the timeout onto 30..900 — so a field bound straight to state turned the "1" of
+ * "1024" into 256 at the first keystroke. While focused the draft belongs to the user; once focus leaves, the field
+ * shows the STORED value again, so a snapped or rejected entry is visibly corrected instead of quietly kept.
+ */
+function CommittedNumberInput({
+  value,
+  emptyValue,
+  min,
+  max,
+  step,
+  integer = false,
+  placeholder,
+  disabled,
+  ariaLabel,
+  ariaDescribedBy,
+  onBelowMin,
+  onCommit
+}: {
+  value: number | undefined;
+  /** What an emptied field commits, and the stored value shown as an empty field (so the placeholder explains it). */
+  emptyValue?: number;
+  min: number;
+  max: number;
+  step?: number;
+  integer?: boolean;
+  placeholder?: string;
+  disabled?: boolean;
+  ariaLabel?: string;
+  ariaDescribedBy?: string;
+  /**
+   * When set, a value below `min` is refused instead of raised to `min`: the field goes back to the stored value and
+   * this is told what was typed, so the panel can say why. For a bound that is a rule rather than a range end — a
+   * photoreal CFG of 0.5 is not "1", it is a value that is not allowed.
+   */
+  onBelowMin?: (typed: number) => void;
+  onCommit: (value: number | undefined) => void;
+}) {
+  const [draft, setDraft] = useState(() => formatCommittedNumber(value, emptyValue));
+  const [editing, setEditing] = useState(false);
+  const discardRef = useRef(false);
+
+  useEffect(() => {
+    if (!editing) {
+      setDraft(formatCommittedNumber(value, emptyValue));
+    }
+  }, [editing, emptyValue, value]);
+
+  const commit = () => {
+    setEditing(false);
+    if (discardRef.current) {
+      discardRef.current = false;
+      return;
+    }
+    const text = draft.trim();
+    if (!text) {
+      if (value !== emptyValue) {
+        onCommit(emptyValue);
+      }
+      return;
+    }
+    const parsed = Number(text);
+    if (!Number.isFinite(parsed)) {
+      return;
+    }
+    if (onBelowMin && parsed < min) {
+      onBelowMin(parsed);
+      return;
+    }
+    const bounded = Math.min(max, Math.max(min, integer ? Math.round(parsed) : parsed));
+    if (bounded !== value) {
+      onCommit(bounded);
+    }
+  };
+
+  return (
+    <input
+      type="number"
+      inputMode={integer ? "numeric" : "decimal"}
+      min={min}
+      max={max}
+      step={step}
+      value={draft}
+      placeholder={placeholder}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      aria-describedby={ariaDescribedBy}
+      onFocus={() => setEditing(true)}
+      onChange={(event) => {
+        setEditing(true);
+        setDraft(event.target.value);
+      }}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          event.currentTarget.blur();
+        } else if (event.key === "Escape") {
+          discardRef.current = true;
+          event.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+function formatCommittedNumber(value: number | undefined, emptyValue: number | undefined): string {
+  return value === undefined || value === emptyValue ? "" : String(value);
+}
+
+type PhotorealModelFileField = "diffusionModel" | "textEncoder" | "vae";
+
+const PHOTOREAL_MODEL_FILE_SLOTS: Array<{ field: PhotorealModelFileField; folder: PhotorealPresetDownload["folder"]; label: string }> = [
+  { field: "diffusionModel", folder: "diffusion_models", label: "확산 모델" },
+  { field: "textEncoder", folder: "text_encoders", label: "텍스트 인코더" },
+  { field: "vae", folder: "vae", label: "VAE" }
+];
+
+interface PhotorealFileCheck {
+  field: PhotorealModelFileField;
+  folder: PhotorealPresetDownload["folder"];
+  label: string;
+  file: string;
+  /** `elsewhere`: ComfyUI has a file of that name in a subfolder — the loader needs that exact path instead. */
+  status: "installed" | "elsewhere" | "missing" | "unknown";
+  foundAs?: string;
+  download?: PhotorealPresetDownload;
+}
+
+/**
+ * The model files a preset will ask ComfyUI to load, checked against what the probe found. The loaders accept a
+ * file only under the exact name ComfyUI lists, so a file sitting in a subfolder is reported with the path to use
+ * rather than as installed.
+ */
+function checkPhotorealPresetFiles(
+  settings: PhotorealApiSettings,
+  presetId: PhotorealWorkflowPresetId,
+  probe: ComfyUiProbeResult
+): PhotorealFileCheck[] {
+  // A custom workflow names its own files inside the graph; there is nothing generic to check.
+  if (presetId === "custom") {
+    return [];
+  }
+  const preset = PHOTOREAL_WORKFLOW_PRESETS[presetId];
+  const files = resolvePhotorealModelFiles(settings, presetId);
+  const baseName = (value: string) => value.trim().replace(/\\/gu, "/").split("/").pop() ?? value;
+  return PHOTOREAL_MODEL_FILE_SLOTS.map(({ field, folder, label }) => {
+    const file = files[field];
+    const download = preset.downloads.find((entry) => entry.folder === folder && entry.file === baseName(file));
+    const listed = probe.models?.[folder];
+    if (!listed) {
+      return { field, folder, label, file, status: "unknown", download };
+    }
+    if (listed.some((entry) => entry.trim() === file.trim())) {
+      return { field, folder, label, file, status: "installed" };
+    }
+    const elsewhere = listed.find((entry) => baseName(entry) === baseName(file));
+    return elsewhere
+      ? { field, folder, label, file, status: "elsewhere", foundAs: elsewhere }
+      : { field, folder, label, file, status: "missing", download };
+  });
+}
+
+/**
+ * Whether a preset's pictures may be used commercially — the one preset fact that changes what a creator may do
+ * with the output (the Qwen-Image 2.1 family is research-licence only). A custom workflow carries the licence of
+ * whatever model it loads, so it gets a "check it" tag rather than a verdict.
+ */
+function PhotorealLicenseTag({ preset }: { preset: (typeof PHOTOREAL_WORKFLOW_PRESETS)[PhotorealWorkflowPresetId] }) {
+  const label = preset.id === "custom" ? "라이선스 확인 필요" : preset.commercialUse ? "상업 이용 가능" : "비상업 라이선스";
+  return <span className={`photoreal-license-tag${preset.commercialUse && preset.id !== "custom" ? "" : " noncommercial"}`}>{label}</span>;
+}
+
+function formatVramGb(megabytes: number): string {
+  return `${(megabytes / 1024).toFixed(1)}GB`;
+}
+
+interface PhotorealProbeSnapshot {
+  simulationId: string;
+  baseUrl: string;
+  result: ComfyUiProbeResult;
+  checkedAt: string;
+}
+
+/**
+ * The 실사 이미지 (ComfyUI) runtime section: connection + probe, workflow presets, numbers, style, face reference,
+ * GPU handoff and the custom workflow. Settings live on the simulation (state.photoreal); hydrateState normalizes
+ * them on every write, which is why every numeric field here is a CommittedNumberInput.
+ */
+function PhotorealRuntimeSettings({
+  state,
+  onChange,
+  onNotify,
+  onStateChange
+}: {
+  state: AppState;
+  onChange: (patch: Partial<PhotorealApiSettings>, message?: string) => void;
+  onNotify: (message: string) => void;
+  onStateChange: Dispatch<SetStateAction<AppState>>;
+}) {
+  const photoreal = state.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS;
+  const [probe, setProbe] = useState<PhotorealProbeSnapshot>();
+  const [isProbing, setIsProbing] = useState(false);
+  const generationPreset = PHOTOREAL_WORKFLOW_PRESETS[photoreal.workflowPreset] ?? PHOTOREAL_WORKFLOW_PRESETS.qwen_image_2_1_turbo;
+  const referencePreset = PHOTOREAL_WORKFLOW_PRESETS[photoreal.referenceWorkflowPreset] ?? PHOTOREAL_WORKFLOW_PRESETS.qwen_image_2_1_turbo;
+  // Only presets that can take a face reference belong in the face-lock select. A stored id outside that set (an
+  // older state) is still listed, marked, so the select shows what is actually stored instead of a silent first row.
+  const referencePresetOptions = photorealWorkflowPresetOrder.filter(
+    (presetId) => PHOTOREAL_WORKFLOW_PRESETS[presetId].supportsReferences || presetId === photoreal.referenceWorkflowPreset
+  );
+  const usesCustomWorkflow = photoreal.workflowPreset === "custom" || photoreal.referenceWorkflowPreset === "custom";
+  // The same template checks the cut will run (structure, and the safety floor over the template's own words), minus
+  // the actual cut; errors are Korean. Run on the text as it stands after a typing pause (or on leaving the field),
+  // not per keystroke: the parse error moves with every character ("position 12", "position 30", …), and a live
+  // region repeating it would talk over the person typing.
+  const [settledCustomWorkflow, settleCustomWorkflow] = useSettledValue(photoreal.customWorkflow, CUSTOM_WORKFLOW_VALIDATION_DELAY_MS);
+  const customWorkflowErrors = useMemo(() => validatePhotorealCustomWorkflow(state, settledCustomWorkflow), [state, settledCustomWorkflow]);
+  const customWorkflowStatusId = `photoreal-workflow-status-${state.simulation.id}`;
+  // From useId rather than the simulation id: the rail and the mobile drawer can both hold this panel at once.
+  const styleScreenId = useId();
+  const cfgStatusId = useId();
+  // Why the last CFG typed was not applied. Set when the field commits (blur / Enter), never per keystroke, cleared by
+  // the next value that is applied, and shown only for the simulation it was typed in (the panel can switch).
+  const [cfgRefusalNote, setCfgRefusalNote] = useState<{ simulationId: string; message: string }>();
+  const cfgRefusal = cfgRefusalNote?.simulationId === state.simulation.id ? cfgRefusalNote.message : undefined;
+  const effectiveSize = resolvePhotorealOutputSize(state);
+  const activeStyle = photoreal.stylePreset === "custom" ? undefined : PHOTOREAL_STYLE_PRESETS[photoreal.stylePreset];
+  const gpuHandoffActive = shouldCoordinateLocalGpu(state);
+  const statusLabel = !photoreal.enabled
+    ? "비활성"
+    : photoreal.requestMode === "mock"
+      ? "mock"
+      : isProbing
+        ? "확인 중"
+        : photoreal.registrationStatus === "registered"
+          ? "연결됨"
+          : "서버 필요";
+  // A probe describes one ComfyUI address for one simulation; after a switch of either it would describe the wrong one.
+  const visibleProbe =
+    probe && probe.simulationId === state.simulation.id && probe.baseUrl === photoreal.baseUrl.trim() ? probe : undefined;
+  const probedPresetIds = Array.from(new Set([photoreal.workflowPreset, photoreal.referenceWorkflowPreset]));
+  const fileChecks = visibleProbe
+    ? probedPresetIds.map((presetId) => ({ presetId, checks: checkPhotorealPresetFiles(photoreal, presetId, visibleProbe.result) }))
+    : [];
+
+  const runProbe = async () => {
+    // Settings are per simulation and the probe result is written back into them, so it carries the same ownership
+    // guard as any other post-await write: a switch of simulation or progress run mid-probe drops the result. The
+    // in-flight state stays in this component (isProbing) rather than in the settings: a "verifying" written there
+    // would be stranded in a simulation the user left before the answer came back.
+    const owner = readRunOwner(state);
+    const target = { simulationId: state.simulation.id, baseUrl: photoreal.baseUrl.trim() };
+    setIsProbing(true);
+    try {
+      // Never throws: an unreachable relay or ComfyUI comes back as ok:false with a Korean message.
+      const result = await probeComfyUi(state);
+      const checkedAt = new Date().toISOString();
+      setProbe({ ...target, result, checkedAt });
+      onStateChange((current) =>
+        ownsActiveRun(current, owner)
+          ? {
+              ...current,
+              photoreal: {
+                ...(current.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS),
+                registrationStatus: result.ok ? "registered" : "failed",
+                verifiedAt: result.ok ? checkedAt : current.photoreal?.verifiedAt,
+                verificationMessage: result.message
+              }
+            }
+          : current
+      );
+      // The toast takes its tone from its words (showRuntimeNotice: 실패 → a sticky error). Most probe failures name
+      // the cause without that word ("…HTTP 404로 응답했습니다", "…끝나지 않았습니다"), so they showed as a green check that
+      // faded away while the panel above said the check had failed.
+      onNotify(result.ok ? result.message : formatComfyUiProbeFailure(result.message));
+    } finally {
+      setIsProbing(false);
+    }
+  };
+
+  const setModelFile = (presetId: PhotorealWorkflowPresetId, field: PhotorealModelFileField, value: string) => {
+    onChange({
+      modelFiles: {
+        ...photoreal.modelFiles,
+        [presetId]: { ...photoreal.modelFiles[presetId], [field]: value }
+      }
+    });
+  };
+
+  return (
+    <>
+      <div className="runtime-model-card">
+        <div className="runtime-model-heading">
+          <div>
+            <span>실사 렌더러</span>
+            <strong>{generationPreset.label}</strong>
+          </div>
+          <StatusPill icon={<ImageIcon size={15} />} label={statusLabel} tone={statusLabel === "연결됨" ? "good" : "neutral"} />
+        </div>
+        <div className="runtime-summary-grid">
+          <div>
+            <span>ComfyUI</span>
+            <strong>{photoreal.baseUrl.trim() || DEFAULT_PHOTOREAL_SETTINGS.baseUrl}</strong>
+          </div>
+          <div>
+            <span>크기</span>
+            <strong>
+              {effectiveSize.width}x{effectiveSize.height}
+            </strong>
+          </div>
+          <div>
+            <span>스타일</span>
+            <strong>{activeStyle?.label ?? "사용자 지정"}</strong>
+          </div>
+          <div>
+            <span>얼굴 고정</span>
+            <strong>{photoreal.faceReferenceEnabled ? (referencePreset.supportsReferences ? "켜짐" : "미지원 프리셋") : "꺼짐"}</strong>
+          </div>
+        </div>
+        {photoreal.registrationStatus !== "idle" && photoreal.verificationMessage ? (
+          <p className="runtime-hint">
+            마지막 확인: {photoreal.verificationMessage}
+            {photoreal.registrationStatus === "registered" && photoreal.verifiedAt
+              ? ` (${new Date(photoreal.verifiedAt).toLocaleString("ko-KR")})`
+              : ""}
+          </p>
+        ) : null}
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
+          <strong>연결</strong>
+          <span>{photoreal.requestMode}</span>
+        </div>
+        <label className="checkline">
+          <input
+            checked={photoreal.enabled}
+            type="checkbox"
+            onChange={(event) =>
+              onChange(
+                { enabled: event.target.checked },
+                event.target.checked ? "실사 이미지(ComfyUI)가 활성화되었습니다." : "실사 이미지(ComfyUI)가 비활성화되었습니다."
+              )
+            }
+          />
+          실사 이미지 사용
+        </label>
+        <div className="two-fields">
+          <label>
+            요청 방식
+            <select
+              value={photoreal.requestMode}
+              onChange={(event) =>
+                onChange(
+                  { requestMode: event.target.value === "mock" ? "mock" : "proxy" },
+                  `실사 이미지 ${event.target.value} 요청 모드가 적용되었습니다.`
+                )
+              }
+            >
+              <option value="proxy">proxy (API 서버 릴레이)</option>
+              <option value="mock">mock (생성하지 않음)</option>
+            </select>
+          </label>
+          <label>
+            ComfyUI URL
+            <input
+              value={photoreal.baseUrl}
+              placeholder={DEFAULT_PHOTOREAL_SETTINGS.baseUrl}
+              onChange={(event) => onChange({ baseUrl: event.target.value, registrationStatus: "idle", verificationMessage: "" })}
+              onBlur={() => onNotify("ComfyUI URL이 적용되었습니다.")}
+            />
+          </label>
+        </div>
+        <label>
+          릴레이 주소 (선택)
+          <input
+            value={photoreal.proxyUrl}
+            placeholder={getPhotorealRelayBase({ ...state, photoreal: { ...photoreal, proxyUrl: "" } })}
+            onChange={(event) => onChange({ proxyUrl: event.target.value })}
+            onBlur={() => onNotify("실사 릴레이 주소가 적용되었습니다.")}
+          />
+        </label>
+        {/* Why there is a server in the path at all, since "just call ComfyUI" is the obvious question. */}
+        <p className="runtime-hint">
+          ComfyUI는 브라우저의 직접 호출을 받지 않아 DynamicChat API 서버가 대신 요청합니다. 이 PC(127.0.0.1)의 ComfyUI만 허용되며, 다른
+          주소는 서버의 DYNAMICCHAT_COMFYUI_HOSTS에 등록해야 합니다.
+        </p>
+        <button className="icon-text-button full" type="button" onClick={() => void runProbe()} disabled={isProbing}>
+          <RefreshCcw size={15} />
+          {isProbing ? "확인 중…" : "연결 확인"}
+        </button>
+        {visibleProbe ? (
+          <div className={`photoreal-probe${visibleProbe.result.ok ? " ok" : " failed"}`} role="status">
+            <strong>{visibleProbe.result.message}</strong>
+            {visibleProbe.result.ok ? (
+              <dl className="photoreal-probe-facts">
+                {visibleProbe.result.comfyuiVersion ? (
+                  <>
+                    <dt>ComfyUI</dt>
+                    <dd>{visibleProbe.result.comfyuiVersion}</dd>
+                  </>
+                ) : null}
+                {(visibleProbe.result.devices ?? []).map((device, index) => (
+                  <Fragment key={`${device.name}-${index}`}>
+                    <dt>GPU</dt>
+                    <dd>
+                      {device.name || "알 수 없는 장치"} · VRAM {formatVramGb(device.vramTotalMb)} (여유 {formatVramGb(device.vramFreeMb)})
+                    </dd>
+                  </Fragment>
+                ))}
+                {visibleProbe.result.queueRemaining !== undefined ? (
+                  <>
+                    <dt>대기열</dt>
+                    <dd>{visibleProbe.result.queueRemaining}개</dd>
+                  </>
+                ) : null}
+              </dl>
+            ) : null}
+            {visibleProbe.result.ok
+              ? fileChecks.map(({ presetId, checks }) =>
+                  checks.length > 0 ? (
+                    <div className="photoreal-file-check" key={presetId}>
+                      <span>{PHOTOREAL_WORKFLOW_PRESETS[presetId].label}</span>
+                      <ul>
+                        {checks.map((check) => (
+                          <li className={`photoreal-file-row ${check.status}`} key={check.field}>
+                            <span>
+                              {check.status === "installed"
+                                ? "설치됨"
+                                : check.status === "elsewhere"
+                                  ? "경로 다름"
+                                  : check.status === "missing"
+                                    ? "설치 필요"
+                                    : "확인 불가"}
+                            </span>
+                            <code>
+                              {check.folder}/{check.file}
+                            </code>
+                            {check.status === "elsewhere" && check.foundAs ? (
+                              <button type="button" className="icon-text-button subtle" onClick={() => setModelFile(presetId, check.field, check.foundAs ?? check.file)}>
+                                {check.foundAs} 사용
+                              </button>
+                            ) : null}
+                            {check.status === "missing" && check.download ? (
+                              <a href={check.download.url} target="_blank" rel="noreferrer">
+                                다운로드 ({check.download.sizeGb}GB)
+                              </a>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                      {checks.some((check) => check.status === "missing") ? (
+                        <p className="runtime-hint">받은 파일은 ComfyUI의 models/&lt;폴더&gt;/ 아래에 넣고 ComfyUI를 다시 시작하세요.</p>
+                      ) : null}
+                    </div>
+                  ) : null
+                )
+              : null}
+          </div>
+        ) : null}
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
+          <strong>워크플로</strong>
+          <span>{generationPreset.id === referencePreset.id ? "1개" : "2개"}</span>
+        </div>
+        <div className="two-fields">
+          <label>
+            생성용
+            <select
+              value={photoreal.workflowPreset}
+              onChange={(event) => {
+                const presetId = event.target.value as PhotorealWorkflowPresetId;
+                onChange({ workflowPreset: presetId }, `생성용 워크플로를 ${PHOTOREAL_WORKFLOW_PRESETS[presetId].label}(으)로 바꿨습니다.`);
+              }}
+            >
+              {photorealWorkflowPresetOrder.map((presetId) => (
+                <option key={presetId} value={presetId}>
+                  {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            얼굴 고정용
+            <select
+              value={photoreal.referenceWorkflowPreset}
+              onChange={(event) => {
+                const presetId = event.target.value as PhotorealWorkflowPresetId;
+                onChange(
+                  { referenceWorkflowPreset: presetId },
+                  `얼굴 고정용 워크플로를 ${PHOTOREAL_WORKFLOW_PRESETS[presetId].label}(으)로 바꿨습니다.`
+                );
+              }}
+            >
+              {referencePresetOptions.map((presetId) => (
+                <option key={presetId} value={presetId}>
+                  {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
+                  {PHOTOREAL_WORKFLOW_PRESETS[presetId].supportsReferences ? "" : " (얼굴 참조 미지원)"}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {[generationPreset, ...(referencePreset.id !== generationPreset.id ? [referencePreset] : [])].map((preset) => (
+          <div className="photoreal-preset-note" key={preset.id}>
+            <PhotorealLicenseTag preset={preset} />
+            <p className="runtime-hint">
+              <strong>{preset.label}</strong> — {preset.description} 라이선스: {preset.license}. {preset.vramNote}
+            </p>
+          </div>
+        ))}
+        {!referencePreset.supportsReferences ? (
+          <p className="settings-note warning">얼굴 고정용 프리셋이 참조 이미지를 받지 않아, 얼굴 고정 컷도 생성용 프리셋으로 참조 없이 생성됩니다.</p>
+        ) : null}
+        <details className="photoreal-model-files">
+          <summary>모델 파일 이름 (선택)</summary>
+          <p className="runtime-hint">비워 두면 프리셋 기본 파일을 씁니다. ComfyUI가 하위 폴더에서 찾은 파일은 그 경로 그대로 입력하세요.</p>
+          {probedPresetIds
+            .filter((presetId) => presetId !== "custom")
+            .map((presetId) => (
+              <div className="photoreal-model-file-group" key={presetId}>
+                <span>{PHOTOREAL_WORKFLOW_PRESETS[presetId].label}</span>
+                {PHOTOREAL_MODEL_FILE_SLOTS.map((slot) => (
+                  <label key={slot.field}>
+                    {slot.label}
+                    <input
+                      value={photoreal.modelFiles[presetId]?.[slot.field] ?? ""}
+                      placeholder={PHOTOREAL_WORKFLOW_PRESETS[presetId].defaults[slot.field]}
+                      spellCheck={false}
+                      onChange={(event) => setModelFile(presetId, slot.field, event.target.value)}
+                      onBlur={() => onNotify("실사 모델 파일 이름이 적용되었습니다.")}
+                    />
+                  </label>
+                ))}
+              </div>
+            ))}
+        </details>
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
+          <strong>출력과 샘플링</strong>
+          <span>
+            {effectiveSize.width}x{effectiveSize.height}
+          </span>
+        </div>
+        <div className="two-fields">
+          <label>
+            너비
+            <CommittedNumberInput
+              value={photoreal.width}
+              emptyValue={0}
+              min={0}
+              max={2048}
+              step={16}
+              integer
+              placeholder={`자동 (${effectiveSize.width})`}
+              onCommit={(width) => onChange({ width: width ?? 0 }, "실사 이미지 너비가 적용되었습니다.")}
+            />
+          </label>
+          <label>
+            높이
+            <CommittedNumberInput
+              value={photoreal.height}
+              emptyValue={0}
+              min={0}
+              max={2048}
+              step={16}
+              integer
+              placeholder={`자동 (${effectiveSize.height})`}
+              onCommit={(height) => onChange({ height: height ?? 0 }, "실사 이미지 높이가 적용되었습니다.")}
+            />
+          </label>
+        </div>
+        <p className="runtime-hint">
+          비우거나 0이면 자동입니다: NovelAI 해상도({state.imageProfile.width}x{state.imageProfile.height})의 비율을 실사 모델에 맞는 크기로
+          바꿉니다. 직접 넣은 값은 16의 배수로 맞춰집니다.
+        </p>
+        <div className="two-fields">
+          <label>
+            스텝
+            <CommittedNumberInput
+              value={photoreal.steps}
+              emptyValue={0}
+              min={0}
+              max={100}
+              integer
+              placeholder={`기본 ${generationPreset.defaults.steps}`}
+              onCommit={(steps) => onChange({ steps: steps ?? 0 }, "실사 스텝이 적용되었습니다.")}
+            />
+          </label>
+          <label>
+            CFG
+            <CommittedNumberInput
+              value={photoreal.cfg}
+              emptyValue={0}
+              min={PHOTOREAL_MIN_CFG}
+              max={20}
+              step={0.1}
+              placeholder={generationPreset.fixedCfg !== undefined ? `Turbo 고정 ${generationPreset.fixedCfg}` : `기본 ${generationPreset.defaults.cfg}`}
+              ariaDescribedBy={cfgStatusId}
+              onBelowMin={(typed) =>
+                setCfgRefusalNote({
+                  simulationId: state.simulation.id,
+                  message: `CFG ${typed}은(는) 쓸 수 없어 적용하지 않았습니다. 실사 CFG는 ${PHOTOREAL_MIN_CFG} 이상이어야 합니다 — 1보다 작으면 샘플러가 네거티브 쪽으로 그려 네거티브 문구가 그림이 됩니다. 프리셋 기본값을 쓰려면 칸을 비우세요.`
+                })
+              }
+              onCommit={(cfg) => {
+                setCfgRefusalNote(undefined);
+                onChange({ cfg: cfg ?? 0 }, "실사 CFG가 적용되었습니다.");
+              }}
+            />
+          </label>
+        </div>
+        {/* Always mounted, so screen readers have a polite region to watch before its text first changes; the
+            photoreal-text-screen class lifts it out of the card's grid while empty, so it adds no gap. */}
+        <div className="photoreal-text-screen" id={cfgStatusId} role="status" aria-live="polite">
+          {cfgRefusal ? <p className="settings-note warning">{cfgRefusal}</p> : null}
+        </div>
+        {generationPreset.fixedCfg !== undefined || referencePreset.fixedCfg !== undefined ? (
+          <p className="runtime-hint">
+            Turbo 프리셋(Qwen-Image 2.1 Turbo, Z-Image Turbo)은 증류 모델이라 CFG 1로 고정되어 CFG 값을 쓰지 않습니다. CFG 1에서는 네거티브도
+            쓰이지 않습니다. Qwen-Image 2.1 Turbo는 8스텝 일정도 고정이라 스텝 값을 쓰지 않습니다. CFG 값은 다른 프리셋에만 적용됩니다.
+          </p>
+        ) : null}
+        <div className="two-fields">
+          <label className="checkline">
+            <input
+              checked={photoreal.seedFixed}
+              type="checkbox"
+              onChange={(event) =>
+                onChange({ seedFixed: event.target.checked }, event.target.checked ? "실사 시드 고정이 활성화되었습니다." : "실사 시드 고정이 비활성화되었습니다.")
+              }
+            />
+            시드 고정
+          </label>
+          <label>
+            시드
+            <CommittedNumberInput
+              value={photoreal.seed}
+              min={0}
+              max={PHOTOREAL_MAX_SEED}
+              integer
+              placeholder="무작위"
+              disabled={!photoreal.seedFixed}
+              onCommit={(seed) => onChange({ seed }, seed === undefined ? "실사 시드를 비웠습니다." : "실사 시드가 적용되었습니다.")}
+            />
+          </label>
+        </div>
+        <label>
+          대기 시간 (초)
+          <CommittedNumberInput
+            value={photoreal.timeoutSeconds}
+            emptyValue={DEFAULT_PHOTOREAL_SETTINGS.timeoutSeconds}
+            min={30}
+            max={900}
+            integer
+            placeholder={`기본 ${DEFAULT_PHOTOREAL_SETTINGS.timeoutSeconds}`}
+            onCommit={(timeoutSeconds) =>
+              onChange({ timeoutSeconds: timeoutSeconds ?? DEFAULT_PHOTOREAL_SETTINGS.timeoutSeconds }, "실사 대기 시간이 적용되었습니다.")
+            }
+          />
+        </label>
+        <p className="runtime-hint">첫 컷은 모델을 불러오느라 오래 걸립니다(17GB 로드 기준 수십 초). 한 컷이 이 시간을 넘기면 ComfyUI 작업을 중단합니다.</p>
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
+          <strong>스타일</strong>
+          <span>{activeStyle?.label ?? "사용자 지정"}</span>
+        </div>
+        <label>
+          스타일 프리셋
+          <select
+            value={photoreal.stylePreset}
+            onChange={(event) => {
+              const stylePreset = event.target.value as PhotorealStylePresetId;
+              onChange(
+                { stylePreset },
+                `${stylePreset === "custom" ? "사용자 지정" : PHOTOREAL_STYLE_PRESETS[stylePreset].label} 스타일이 적용되었습니다.`
+              );
+            }}
+          >
+            {photorealStylePresetOrder.map((stylePreset) => (
+              <option key={stylePreset} value={stylePreset}>
+                {PHOTOREAL_STYLE_PRESETS[stylePreset].label}
+              </option>
+            ))}
+            <option value="custom">사용자 지정</option>
+          </select>
+        </label>
+        <p className="runtime-hint">
+          {activeStyle?.description ??
+            "아래 스타일 문장이 전부입니다. 첫 문장이 프롬프트 맨 앞(매체 설명)에 오고, 나머지는 끝에 붙습니다."}
+        </p>
+        <label>
+          {photoreal.stylePreset === "custom" ? "스타일 (영어)" : "스타일 추가 (영어, 선택)"}
+          <textarea
+            value={photoreal.stylePrompt}
+            placeholder={photoreal.stylePreset === "custom" ? "A candid smartphone photograph. Soft window light, natural skin texture" : "e.g. warm evening tones, 50mm lens"}
+            aria-describedby={styleScreenId}
+            onChange={(event) => onChange({ stylePrompt: event.target.value })}
+            onBlur={() => onNotify("실사 스타일 문장이 적용되었습니다.")}
+          />
+        </label>
+        {/* Keyed by simulation: the note reads the text once typing settles, and the panel can switch simulations. */}
+        <PhotorealTextScreenNote id={styleScreenId} key={state.simulation.id} scope="style" state={state} text={photoreal.stylePrompt} />
+        <label>
+          네거티브 추가 (영어, 선택)
+          <textarea
+            value={photoreal.negativePrompt}
+            placeholder="e.g. tattoo, heavy makeup"
+            onChange={(event) => onChange({ negativePrompt: event.target.value })}
+            onBlur={() => onNotify("실사 네거티브가 적용되었습니다.")}
+          />
+        </label>
+        <p className="runtime-hint">실사 모델은 영어 문장을 가장 잘 읽습니다. 한글은 프롬프트에서 빠집니다. CFG가 1이면(Turbo 프리셋은 항상 1) 네거티브는 쓰이지 않습니다.</p>
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
+          <strong>얼굴 고정 · GPU</strong>
+          <span>{photoreal.vramHandoff === "auto" ? "교대 자동" : "교대 끔"}</span>
+        </div>
+        <label className="checkline">
+          <input
+            checked={photoreal.faceReferenceEnabled}
+            type="checkbox"
+            onChange={(event) =>
+              onChange(
+                { faceReferenceEnabled: event.target.checked },
+                event.target.checked ? "실사 얼굴 고정이 활성화되었습니다." : "실사 얼굴 고정이 비활성화되었습니다."
+              )
+            }
+          />
+          캐릭터의 실사 프로필 이미지로 얼굴 고정
+        </label>
+        <p className="runtime-hint">
+          프로필 이미지는 제작 화면에서 DynamicChat이 생성한 후보 중에서만 고를 수 있습니다(업로드 없음). 얼굴이 보이지 않는 컷(뒷모습 등)에는 붙지 않습니다.
+        </p>
+        <label>
+          GPU 교대
+          <select
+            value={photoreal.vramHandoff}
+            onChange={(event) =>
+              onChange(
+                { vramHandoff: event.target.value === "off" ? "off" : "auto" },
+                event.target.value === "off" ? "GPU 교대를 껐습니다." : "GPU 교대를 자동으로 바꿨습니다."
+              )
+            }
+          >
+            <option value="auto">자동 (권장)</option>
+            <option value="off">끄기</option>
+          </select>
+        </label>
+        {/* The one-line WHY: without it "turn this off" looks harmless, and the failure it prevents (a spilled model
+            at a fraction of a token per second) looks like the app hanging. */}
+        <p className="runtime-hint">
+          16GB 카드에는 Ollama 모델(qwen3:14b 11.7GB)과 실사 모델(최대 약 15GB)이 함께 올라가지 않고, 넘친 쪽은 초당 0.1토큰 수준으로
+          느려집니다. 자동이면 턴과 실사 이미지가 GPU를 번갈아 쓰도록 서로의 모델을 내립니다.{" "}
+          {gpuHandoffActive ? "지금 이 설정에 적용되고 있습니다." : "LLM이 이 PC의 Ollama이고 ComfyUI도 이 PC에 있을 때만 적용됩니다."}
+        </p>
+      </div>
+
+      <div className="runtime-parameter-card">
+        <div className="runtime-card-subhead">
+          <strong>사용자 워크플로</strong>
+          <span>{usesCustomWorkflow ? "사용 중" : "선택 안 함"}</span>
+        </div>
+        <p className="runtime-hint">
+          프리셋에서 '사용자 워크플로'를 고르면 쓰입니다. ComfyUI 메뉴의 Export (API)로 내보낸 JSON에 아래 자리표시자를 넣으세요(SillyTavern과
+          같은 방식).
+        </p>
+        <div className="photoreal-workflow-field">
+          <textarea
+            className="photoreal-workflow-input"
+            aria-label="사용자 워크플로 JSON"
+            aria-describedby={customWorkflowStatusId}
+            aria-invalid={customWorkflowErrors.length > 0 ? true : undefined}
+            spellCheck={false}
+            value={photoreal.customWorkflow}
+            placeholder={'{"3": {"class_type": "KSampler", "inputs": {"seed": "%seed%", ...}}}'}
+            onChange={(event) => onChange({ customWorkflow: event.target.value })}
+            onBlur={() => {
+              settleCustomWorkflow();
+              onNotify("사용자 워크플로가 적용되었습니다.");
+            }}
+          />
+          {/* Always mounted, so screen readers have a polite region to watch before its text first changes; the
+              textarea points at it, so the verdict can also be heard on demand from the field. */}
+          <div className="photoreal-workflow-status" id={customWorkflowStatusId} role="status" aria-live="polite">
+            {customWorkflowErrors.length > 0 ? (
+              <div className="settings-note warning photoreal-workflow-errors">
+                <strong>워크플로를 쓸 수 없습니다 — 이 워크플로로 갈 실사 컷은 NovelAI로 계획됩니다</strong>
+                <ul>
+                  {customWorkflowErrors.map((error) => (
+                    <li key={error}>{error}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : settledCustomWorkflow.trim() ? (
+              <p className="runtime-hint">워크플로 형식이 올바릅니다.</p>
+            ) : usesCustomWorkflow ? (
+              <p className="settings-note warning">사용자 워크플로를 골랐지만 JSON이 비어 있어 이 워크플로로 갈 실사 컷은 NovelAI로 계획됩니다.</p>
+            ) : null}
+          </div>
+        </div>
+        <details className="photoreal-placeholder-help">
+          <summary>자리표시자 {COMFY_CUSTOM_PLACEHOLDERS.length}개</summary>
+          <ul>
+            {COMFY_CUSTOM_PLACEHOLDERS.map((placeholder) => (
+              <li key={placeholder.name}>
+                <code>%{placeholder.name}%</code>
+                <span>{placeholder.description}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      </div>
+    </>
+  );
+}
+
 function SceneCard({ asset, featured = false }: { asset: ImageAsset; featured?: boolean }) {
   const style = {
     "--tone-a": asset.palette[0],
@@ -16155,9 +19632,12 @@ function createImageAssetSrc(asset?: ImageAsset): string | undefined {
     return asset.dataUrl;
   }
 
-  return asset.objectKey
-    ? `${getConfiguredDynamicChatApiBaseUrl()}/objects/${encodeURIComponent(asset.objectKey)}`
-    : undefined;
+  return asset.objectKey ? createObjectStoreImageSrc(asset.objectKey) : undefined;
+}
+
+/** The API server's object route for a stored image (the whole key is one encoded segment; the route decodes it). */
+function createObjectStoreImageSrc(objectKey: string): string {
+  return `${getConfiguredDynamicChatApiBaseUrl()}/objects/${encodeURIComponent(objectKey)}`;
 }
 
 function AssetImage({
@@ -16314,9 +19794,20 @@ function handleTablistKeyDown(event: React.KeyboardEvent<HTMLElement>): void {
   tabs[nextIndex]?.click();
 }
 
-function SectionTitle({ icon, title }: { icon: React.ReactNode; title: string }) {
+function SectionTitle({
+  icon,
+  title,
+  className,
+  headingRef
+}: {
+  icon: React.ReactNode;
+  title: string;
+  className?: string;
+  /** Makes the title a programmatic focus target (tabIndex -1), for buttons elsewhere that jump to its section. */
+  headingRef?: React.Ref<HTMLDivElement>;
+}) {
   return (
-    <div className="section-title">
+    <div className={className ? `section-title ${className}` : "section-title"} ref={headingRef} tabIndex={headingRef ? -1 : undefined}>
       {icon}
       <strong>{title}</strong>
     </div>

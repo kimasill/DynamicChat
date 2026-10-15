@@ -10541,3 +10541,760 @@ textarea:focus {
     transform: none;
   }
 }
+
+/* --- Photoreal backend: badges, routing, ComfyUI settings ------------------------------------ */
+/*
+ * Everything below follows the pair rule. Surfaces and their inks are both tokens, so night flips them
+ * together; the one literal pair (.image-backend-badge) is dark in both themes on purpose.
+ */
+
+/* Which renderer drew a picture, sitting on the picture. Modelled on .simulation-card-cover span: it rides on
+   artwork whose colour does not follow the theme, so it is a fixed dark translucent chip with white ink in
+   both themes rather than a themed pair that would flip to a pale chip over a dark photo. */
+.image-backend-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  padding: 3px 8px;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 999px;
+  color: #ffffff;
+  background: rgb(17 22 26 / 74%);
+  backdrop-filter: blur(6px);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+.crack-marker-image .image-backend-badge,
+.image-asset-thumb .image-backend-badge {
+  top: 6px;
+  left: 6px;
+  padding: 2px 7px;
+  font-size: 10px;
+}
+
+/* The setup notice can now name two fixes (personal settings for NovelAI, the settings tab of the run for
+   ComfyUI); the buttons keep the single-button sizing from narrative-output.css. */
+.crack-setup-notice-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.crack-inline-image-job .crack-inline-image-job-detail {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.crack-inline-image-job.failed .crack-inline-image-job-detail {
+  color: var(--accent-ink);
+}
+
+/* Inspector: renderer, scene category, and why the router chose it. */
+.image-job-routing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.image-job-routing span {
+  min-height: 22px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.image-job-routing .image-job-routing-backend {
+  border-color: var(--line-strong);
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.image-job-routing p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.image-job-switch-backend {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+}
+
+.image-job-switch-backend small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* Routing card: three modes in one row, then the category checklist. */
+.backend-routing-modes {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+/* At the ops rail's 280px minimum the card is ~230px wide and a third of it ~66px, which no longer holds
+   "NovelAI로" on one line, so wrapping alone still broke it inside the word. Below the width at which every word of
+   the three details fits, the modes stack. Sized from the card itself, because the same card sits in the rail, the
+   scene panel and the wide builder. */
+.backend-routing-card {
+  container-type: inline-size;
+}
+
+@container (max-width: 279px) {
+  .backend-routing-modes {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* The mode details carry the safety caveat ("성적 장면은 NovelAI"), so they wrap rather than end in an ellipsis like
+   the other preset chips: a third of the ops rail (280-360px) fits none of them on one line, and there is no tooltip
+   to recover the cut-off text. keep-all breaks Korean between words, so "장면별 혼합" never splits inside a word. */
+.backend-routing-modes strong,
+.backend-routing-modes span {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.backend-routing-categories {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.backend-routing-categories legend {
+  margin-bottom: 4px;
+  padding: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.backend-routing-categories legend small {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.backend-routing-category {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.backend-routing-category input {
+  width: 16px;
+  height: 16px;
+  min-height: 16px;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: var(--teal);
+}
+
+.backend-routing-category > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.backend-routing-category strong {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.backend-routing-category small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+/* The explicit row is a statement, not a control: dashed, muted, and not clickable. */
+.backend-routing-category.locked {
+  border-style: dashed;
+  cursor: not-allowed;
+}
+
+.backend-routing-category.locked strong {
+  color: var(--muted);
+}
+
+.backend-routing-card.compact .backend-routing-category {
+  padding: 5px 8px;
+}
+
+/* Plain secondary copy inside a settings card. Unlike .settings-note it carries no fill, so a card with several
+   explanations does not turn into a stack of amber boxes in the ops rail. */
+.runtime-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.runtime-hint strong {
+  color: var(--ink-soft);
+}
+
+/* Where '실사 설정 열기' lands. The margin keeps the heading clear of the rail's sticky tab strip, and the heading takes
+   focus without a ring only when a pointer opened it (a keyboard user still gets :focus-visible). */
+.settings-jump-target {
+  scroll-margin-top: 72px;
+}
+
+.settings-jump-target:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ComfyUI connection check. */
+.photoreal-probe {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.photoreal-probe.ok {
+  border-color: rgb(93 191 167 / 38%);
+}
+
+.photoreal-probe.failed {
+  border-color: rgb(178 60 44 / 30%);
+}
+
+.photoreal-probe > strong {
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.photoreal-probe-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 0;
+}
+
+.photoreal-probe-facts dt {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.photoreal-probe-facts dd {
+  margin: 0;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.photoreal-file-check {
+  display: grid;
+  gap: 5px;
+}
+
+.photoreal-file-check > span {
+  color: var(--ink-soft);
+  font-weight: 700;
+}
+
+.photoreal-file-check ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.photoreal-file-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.photoreal-file-row > span {
+  min-width: 56px;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.photoreal-file-row.installed > span {
+  color: var(--teal-dark);
+}
+
+.photoreal-file-row.missing > span,
+.photoreal-file-row.elsewhere > span {
+  color: var(--accent-ink);
+}
+
+.photoreal-file-row a {
+  color: var(--teal-dark);
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.photoreal-file-row .icon-text-button {
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+  white-space: normal;
+}
+
+.photoreal-file-row code,
+.photoreal-placeholder-help code {
+  color: var(--ink-soft);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* Preset licence: the one fact about a preset that decides whether its pictures may be used commercially. */
+.photoreal-preset-note {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+}
+
+.photoreal-license-tag {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-soft);
+  background: var(--chip-mint);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.photoreal-license-tag.noncommercial {
+  border-color: var(--amber-ink);
+  background: var(--wash-amber);
+}
+
+/* Collapsible extras. Block flow with sibling spacing rather than grid: layout support on details varies. */
+.photoreal-model-files > * + *,
+.photoreal-placeholder-help > * + * {
+  margin-top: 8px;
+}
+
+.photoreal-model-files > summary,
+.photoreal-placeholder-help > summary {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.photoreal-model-file-group {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.photoreal-model-file-group > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* JSON is read by structure, so it gets a monospace face and no soft wrapping. */
+.photoreal-workflow-input {
+  min-height: 140px;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre;
+}
+
+/* The workflow text and its verdict are one grid item of the card: the verdict region stays mounted (it is a live
+   region) and is empty for most simulations, so it must not add a card gap of its own. */
+.photoreal-workflow-field {
+  display: grid;
+  min-width: 0;
+}
+
+.photoreal-workflow-status:not(:empty) {
+  margin-top: 8px;
+}
+
+/* The safety-floor note under a photo-side text field (PhotorealTextScreenNote) is a polite live region mounted
+   before it has anything to say. Every form it sits in is a grid with a gap, so while empty it is lifted out of the
+   flow, where it adds no gap under its field; display: none would also drop it from the accessibility tree, and its
+   first message would then go unannounced. */
+.photoreal-text-screen:empty {
+  position: absolute;
+}
+
+.photoreal-workflow-errors ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.photoreal-workflow-errors li {
+  overflow-wrap: anywhere;
+}
+
+.photoreal-placeholder-help ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.photoreal-placeholder-help li {
+  display: grid;
+  grid-template-columns: minmax(104px, auto) minmax(0, 1fr);
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+@media (max-width: 520px) {
+  .backend-routing-modes {
+    grid-template-columns: 1fr;
+  }
+
+  .photoreal-placeholder-help li {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}
+
+/* --- Character profile studio (builder) --------------------------------------------------------- */
+/*
+ * The builder always renders light (the night theme belongs to the run workspace), but these rules still keep the
+ * pair rule: every surface and its ink are role tokens. The one literal pair on a picture is .image-backend-badge,
+ * reused as is.
+ */
+.profile-studio {
+  min-width: 0;
+}
+
+.profile-studio .icon-text-button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+  /* Korean button labels in a narrow profile slot wrap instead of pushing the slot wider. */
+  white-space: normal;
+}
+
+/* Blocked, not busy: .send-button:disabled says "wait" with its cursor, which is wrong for a missing setting. */
+.profile-studio .send-button:disabled,
+.profile-studio .icon-text-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.profile-studio-slots {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.profile-studio-slot {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.profile-studio-slot.empty {
+  border-style: dashed;
+}
+
+.profile-studio-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.profile-studio-block-head strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.profile-studio-block-head > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.profile-studio-slot-body {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.profile-studio-slot-notes {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.profile-studio-slot-notes small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* A stored profile image. Sits on the slot's sunken face, so it takes the card colour to stay visible when empty. */
+.profile-thumb {
+  display: grid;
+  overflow: hidden;
+  place-items: center;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: var(--dc-panel);
+}
+
+.profile-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* Faces sit in the upper part of a portrait, so a square crop keeps them. */
+  object-position: center top;
+}
+
+.profile-studio-slot-thumb {
+  width: 88px;
+  aspect-ratio: 3 / 4;
+  border-radius: 8px;
+}
+
+.profile-studio-block {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.profile-studio-backends {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 0;
+}
+
+.profile-studio-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.profile-studio-count {
+  min-width: 96px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.profile-studio-blocker {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+}
+
+.profile-studio-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink-soft);
+  background: var(--surface-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.profile-studio-errors {
+  display: grid;
+  gap: 4px;
+}
+
+.profile-studio-errors ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.profile-studio-errors li {
+  overflow-wrap: anywhere;
+}
+
+.profile-studio-refusal p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.profile-studio-candidates {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.profile-studio-candidate {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--dc-panel);
+}
+
+.profile-studio-candidate.is-profile {
+  border-color: var(--teal-dark);
+  box-shadow: 0 0 0 1px var(--teal-dark) inset;
+}
+
+/* Contain, not cover: judging a profile means seeing the whole picture, hair and shoulders included. */
+.profile-studio-candidate-image {
+  position: relative;
+  overflow: hidden;
+  aspect-ratio: 3 / 4;
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.profile-studio-candidate-image img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.profile-studio-candidate figcaption {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.profile-studio-candidate figcaption small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* A failed pick's message names the API address, one unbreakable token wider than a 140px card. */
+.profile-studio-candidate .settings-note {
+  justify-self: stretch;
+  padding: 6px 8px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.profile-studio-picked {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--teal-dark);
+  background: var(--chip-mint);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* The picked profile on the builder's character cards and summary rows: the face beside the name. */
+.character-card.has-portrait {
+  grid-template-columns: minmax(0, 1fr) 52px;
+  align-content: start;
+}
+
+.character-card.has-portrait > strong,
+.character-card.has-portrait > span:not(.character-card-portrait) {
+  grid-column: 1;
+}
+
+.character-card.has-portrait > p,
+.character-card.has-portrait > small {
+  grid-column: 1 / -1;
+}
+
+.character-card-portrait {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+}
+
+.compact-row.has-portrait {
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+}
+
+.compact-row.has-portrait > :not(.compact-row-portrait) {
+  grid-column: 2;
+}
+
+.compact-row-portrait {
+  grid-column: 1;
+  grid-row: 1 / span 3;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+}
+
+@media (max-width: 640px) {
+  .profile-studio-slots {
+    grid-template-columns: 1fr;
+  }
+}

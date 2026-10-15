@@ -13,7 +13,11 @@ import {
   saveState as saveLocalState
 } from "../lib/storage";
 import { createScopeHeaders } from "./security";
-import { toShareableLlmSettings, toShareableNovelAiSettings } from "./runtimeApiSettings";
+import {
+  toShareableCharacterProfileImages,
+  toShareableLlmSettings,
+  toShareableNovelAiSettings
+} from "./runtimeApiSettings";
 
 const API_BASE_URL_STORAGE_KEY = "dynamicchat.apiBaseUrl";
 export const DEFAULT_DYNAMICCHAT_API_BASE_URL = "http://127.0.0.1:8788";
@@ -122,6 +126,16 @@ export function getNovelAiGenerateProxyUrl(): string {
 
 export function getNovelAiEncodeVibeProxyUrl(): string {
   return `${readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL}/novelai/encode-vibe`;
+}
+
+/**
+ * Relay base for the local ComfyUI server (`/generate`, `/status`, `/free`, `/interrupt` hang off it). ComfyUI serves
+ * no CORS headers for a web origin, and its upload and queue endpoints should not be driven straight from a page, so
+ * photoreal jobs go through the DynamicChat API server, which checks the workflow and the ComfyUI host first.
+ * `photoreal.proxyUrl` overrides it per simulation.
+ */
+export function getPhotorealRelayBaseUrl(): string {
+  return `${readConfiguredApiBaseUrl() ?? DEFAULT_DYNAMICCHAT_API_BASE_URL}/photoreal/comfyui`;
 }
 
 export function getLlmCliAgentProxyUrl(): string {
@@ -304,6 +318,12 @@ export function createDynamicChatApiClient(baseUrl = readConfiguredApiBaseUrl() 
 }
 
 function readConfiguredApiBaseUrl(): string | undefined {
+  // Node (the evals, the end-to-end harness) has no window and no saved override: use the default base instead of
+  // throwing, so the relay URL helpers and the clients built on them run outside the browser too.
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+
   const value = window.localStorage.getItem(API_BASE_URL_STORAGE_KEY)?.trim();
   return value ? value.replace(/\/$/u, "") : undefined;
 }
@@ -319,8 +339,28 @@ function redactBrowserCachedSecrets(state: AppState): AppState {
   return {
     ...state,
     llm: toShareableLlmSettings(state.llm),
-    novelAi: toShareableNovelAiSettings(state.novelAi)
+    novelAi: toShareableNovelAiSettings(state.novelAi),
+    visualProfiles: stripInlineProfileImages(state.visualProfiles)
   };
+}
+
+// Profile images are object-store references; their bytes never belong in a state body. hydrateState already
+// whitelists them, and this re-applies the same whitelist at the point every cached or server-bound state passes
+// through, so a candidate's data URL set on a profile by a path that skipped hydration still cannot be persisted.
+function stripInlineProfileImages(profiles: AppState["visualProfiles"]): AppState["visualProfiles"] {
+  if (!Array.isArray(profiles)) {
+    return profiles;
+  }
+
+  return profiles.map((profile) => {
+    if (!profile || profile.profileImages === undefined) {
+      return profile;
+    }
+
+    const { profileImages, ...rest } = profile;
+    const shareableProfileImages = toShareableCharacterProfileImages(profileImages);
+    return shareableProfileImages ? { ...rest, profileImages: shareableProfileImages } : rest;
+  });
 }
 
 function createBrowserCacheState(state: AppState, metadataOnly = false): AppState {

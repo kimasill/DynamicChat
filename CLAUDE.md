@@ -26,6 +26,13 @@ pnpm dev:web
 기본 URL: `http://127.0.0.1:8788`  
 데이터 디렉토리: `.dynamicchat-data/` (또는 `DYNAMICCHAT_DATA_DIR` 환경변수)
 
+실사 이미지(ComfyUI)도 같이 띄우려면 portable 설치 폴더를 지정한다. 이미 떠 있는 ComfyUI 가 있으면 그것을 쓴다:
+
+```powershell
+$env:DYNAMICCHAT_COMFYUI_DIR="D:\ComfyUI\app\ComfyUI_windows_portable"
+pnpm dev
+```
+
 ## 핵심 아키텍처
 
 ```
@@ -65,6 +72,8 @@ DynamicChat Web (React/Vite)
 | Memory Curator | `memoryCompiler.ts` | 중요 이벤트 추출 → NeuralMap 적재 |
 | Prompt Retrieval | `simulationEngine.ts` (모듈 선택 로직) | RAG 기반 프롬프트 모듈 선택 |
 | Image Prompt Planner | `imageOrchestrator.ts` | 생성 여부 + NovelAI 프롬프트 작성 |
+| Image Backend Router | `imageSceneClassifier.ts` + `imageBackendRouting.ts` | 컷별 NovelAI / 실사 결정 + 안전 하한 |
+| Photoreal Prompt Writer | `photorealPrompt.ts` + `comfyWorkflows.ts` | 합성된 NAI 계획 → 자연어 사진 프롬프트 → ComfyUI 그래프 |
 | Image Policy Validator | `imageOrchestrator.ts` (policy 검사) | 안전 등급, 사용자 규정 검증 |
 | Continuity Validator | `simulationEngine.ts` (session reset) | 세션 초기화 후 기억 유지 검사 |
 
@@ -76,7 +85,7 @@ DynamicChat Web (React/Vite)
 |---|---|---|
 | `server-api` | API 서버, 라우트, 퍼시스턴스 | `server/dynamicchat-server.mjs`, `server/migrations/` |
 | `simulation-engine` | 턴 루프, 프롬프트 조립, 모듈 선택 | `simulationEngine.ts`, `llmClient.ts`, `memoryCompiler.ts` |
-| `image-pipeline` | 이미지 생성, NovelAI 연동, 정책 검사 | `imageOrchestrator.ts`, `novelAiClient.ts`, `contentRating.ts` |
+| `image-pipeline` | 이미지 생성, NovelAI·실사 연동, 라우팅, 정책 검사 | `imageOrchestrator.ts`, `novelAiClient.ts`, `comfyUiClient.ts`, `photorealPrompt.ts`, `imageBackendRouting.ts`, `contentRating.ts` |
 | `memory-neuralmap` | NeuralMap 연동, 세션 연속성 | `neuralMapClient.ts`, `memoryCompiler.ts` |
 | `frontend` | React UI, API 클라이언트 | `App.tsx`, `dynamicChatApi.ts`, `src/styles.css` |
 | `eval-quality` | 품질 평가 스크립트 | `server/*-eval.mjs` |
@@ -88,7 +97,11 @@ DynamicChat Web (React/Vite)
 - **서버 라우트**: `server/dynamicchat-server.mjs` — 라우트를 추가할 때 `matchRoute()` 배열에 등록.
 - **ID 생성**: `createId()` (`src/lib/id.ts`) 사용. `crypto.randomUUID()` 직접 호출 금지.
 - **환경 변수**: `DYNAMICCHAT_API_PORT`, `DYNAMICCHAT_DATA_DIR`, `DYNAMICCHAT_CORS_ORIGIN`, `DYNAMICCHAT_RATE_LIMIT_WINDOW_MS`, `DYNAMICCHAT_RATE_LIMIT_MAX`, `DYNAMICCHAT_MAX_BODY_BYTES`
-  (요청 본문 상한, 기본 64MiB — 이미지 data URL 이 이 경로로 들어오므로 넉넉하게 잡혀 있다. 초과하면 413)
+  (요청 본문 상한, 기본 64MiB — 이미지 data URL 이 이 경로로 들어오므로 넉넉하게 잡혀 있다. 초과하면 413).
+  실사 릴레이: `DYNAMICCHAT_COMFYUI_URL`(기본 ComfyUI, 기본값 `http://127.0.0.1:8188`), `DYNAMICCHAT_COMFYUI_HOSTS`
+  (루프백 밖 ComfyUI 허용 목록), `DYNAMICCHAT_COMFYUI_EXTRA_NODES`(워크플로 노드 허용 목록 확장, `*`=검사 끔),
+  `DYNAMICCHAT_DENIED_ORIGINS`(보호 라우트에서 거부할 출처, `host:port` 도 됨), `DYNAMICCHAT_ALLOWED_HOSTS`
+  (보호 라우트가 받아들일 루프백 밖 Host — DNS 리바인딩 방어라 기본은 루프백만)
 - **LLM 백엔드**: 프로바이더 프리셋은 `src/services/llmProviders.ts` 한 곳에 있다. UI 메타데이터
   (라벨/base URL/모델 목록)와 런타임 능력(전송 형식, JSON 모드, temperature 상한, 추가 헤더/바디,
   프록시 필요 여부)을 같이 들고 있으므로 백엔드 추가는 배열 항목 하나면 된다.
@@ -97,6 +110,8 @@ DynamicChat Web (React/Vite)
   `requiresProxy: true` 프리셋은 `POST /llm/chat`(서버 릴레이, 호스트 allow-list)을 경유한다.
   allow-list 추가는 `DYNAMICCHAT_LLM_PROXY_HOSTS` 환경변수.
 - **구독 CLI 브릿지**: `POST /llm/cli-agent` 사용 가능 (API 키 불필요).
+- **실사 이미지 백엔드**: 로컬 ComfyUI 를 `POST /photoreal/comfyui/{generate,status,free,interrupt}` 서버 릴레이로
+  쓴다(ComfyUI 는 브라우저 교차 출처 요청을 거부한다). 설계와 실측은 `docs/photoreal-image-pipeline.md`.
 
 ## 품질 평가
 
@@ -106,7 +121,8 @@ pnpm eval:image-prompts   # 이미지 프롬프트 품질 평가 (프레임 일�
 pnpm eval:simulation-runs # 시뮬레이션 실행 품질 평가
 pnpm eval:theme-contrast  # 야간 테마 대비 회귀 검사 (스타일시트 정적 검사, 키/모델 불필요)
 pnpm eval:oss-models      # 오픈 모델 연동 검증 (키 불필요, 모의 업스트림)
-pnpm eval:quality         # 전체 평가
+pnpm eval:photoreal-suite # 실사 백엔드: 라우팅·프롬프트/워크플로·퍼시스턴스·클라이언트·릴레이·파이프라인·안전 코퍼스·프로필 정리·GPU 교대 (GPU/키 불필요)
+pnpm eval:quality         # 전체 평가 (npm run 체인이라 pnpm 없이 `npm run eval:quality` 도 된다)
 ```
 
 ### 전체 사슬 검증 (end-to-end)
@@ -437,6 +453,45 @@ styles.css 는 스킨을 여러 번 덧칠하면서 이전 스킨을 지우지 �
 
 프레임 객체가 없으면 구도 태그에서 추론한다(`inferImageCueFrameFromTags`). 회귀 방지는
 `server/image-prompt-quality-eval.mjs`의 `evaluateFrameConsistency`가 담당한다.
+
+### 실사(photoreal) 백엔드 — 컷마다 NovelAI 와 섞는다
+
+NAI 는 역동적 동작·다양한 상황에, 로컬 실사 모델(ComfyUI 의 Qwen-Image 2.1 Turbo / Z-Image Turbo)은 정적인 인물·
+풍경·사물에 강하다. 그래서 `imageProfile.backendRouting` 이 컷 단위로 고른다: `novelai`(기본, 기존 동작) /
+`mixed`(체크한 장면 범주만 실사, 다중 선택) / `photoreal`(안전 하한 외 전부). 전체 설계·실측은
+`docs/photoreal-image-pipeline.md`.
+
+- **분류는 합성된 계획으로 한다.** `planImageJob` 이 `createImagePromptPlan` 다음에 `classifyImageScene` 을 부른다.
+  작성된 태그만 보면 안 된다 — 연속성 주입이 진행 중인 체위를 얼굴 클로즈업에 다시 넣는다.
+- **안전 하한은 코드다**: explicit · 미성년 코드 · 학교+선정 조합은 어떤 모드·강제 재생성에서도 NovelAI 고정
+  (`routing.locked`). 실사 얼굴 레퍼런스는 생성 후 고른 프로필 이미지뿐이고 업로드 경로는 일부러 없다.
+  NAI 동작은 바꾸지 않았다(기존 eval 이 NAI 에 앱 수준 차단이 없음을 단언한다).
+- **하한은 샘플러에 닿는 모든 글을 읽는다** — NAI 캡션만이 아니다. 실사 외형(`photorealPrompt`), 스타일 글, 제작 화면
+  테스트 문장, 사용자 워크플로 문구를 분류하고, 마지막으로 **완성된 사진 프롬프트와 실제로 조립한 ComfyUI 그래프**를
+  다시 읽는다(계획 끝 + 보내기 직전). 레드팀 세 라운드의 구멍이 전부 "분류기가 보지 않는 글이 사진으로 간다"였다 —
+  새 글을 사진 프롬프트나 그래프에 넣을 때는 반드시 분류 입력에도 넣어라. 같은 이유로: CFG 는 1 이상(1 미만이면
+  네거티브가 그림이 된다), 네거티브는 화질 단어 **허용 목록**, 템플릿의 숫자 자리표시자는 숫자 입력 값으로만, LoadImage 는
+  참조 자리표시자만(클라이언트 + 릴레이), 얼굴 레퍼런스는 `profile_*` 키 + 읽을 수 있는 기록(`photoPrompt`)만. 실사
+  테스트가 하한에 걸리면 NovelAI 로 몰래 돌리지 않고 거절한다(Anlas). 어휘 하한은 완전할 수 없다 — 이것은 앱이 *스스로*
+  만들지 않게 하는 장치이고, 코퍼스(`eval:photoreal-safety`)의 "일상 SFW 335개 0 잠김" 을 깨는 변경은 하지 마라.
+- **신체 정체성 특성(`futanari` 등)은 explicit 이 아니다** — 정체성은 모든 컷에 주입되므로, explicit 으로 보면
+  여성의 삶 시드의 실제 한 턴 16컷이 전부 NAI 로 고정됐다(옷 입은 카페 컷 포함). 대신 실사 프롬프트에서 항상 뺀다.
+- **실사 프롬프트는 결정적으로 만든다**(`photorealPrompt.ts`, LLM 호출 없음). 크롭이 못 보여주는 의상은 빼고
+  (사진 모델은 들은 옷을 보여주려 샷을 넓힌다 — 얼굴 클로즈업에 청바지가 남으면 3/3 시드가 허리 위 샷),
+  카메라 문장을 맨 앞에 두고, 머리가 보이면 "얼굴이 보인다"고 쓴다. 비침 소재 수식어와 섭식장애 체형 단어는 뺀다.
+- **얼굴 레퍼런스는 머리·어깨로 잘라서 넣는다**(`computeReferenceHeadCrop` → `ImageCrop`). 프로필 전체를 넣으면
+  일부 시드가 레퍼런스를 편집 대상으로 보고 프로필의 방·옷을 다시 그렸다. 그래서 프로필 기록에 width/height 가
+  꼭 있어야 한다.
+- **16GB 에서는 GPU 를 교대로 쓴다**(`localGpuCoordinator.ts`, `vramHandoff: "auto"`): 이미지 전 Ollama 언로드,
+  LLM 턴 전 ComfyUI `/free`. 실측 — ComfyUI 가 VRAM 을 쥔 채 LLM 첫 호출 34.6s(12.4 tok/s) vs 교대 후 5.7s(63 tok/s),
+  LLM 이 쥔 채 이미지 10.8s vs 교대 후 3.1s. VRAM 은 기계의 것이라 **이 카드에 모델을 올리는 작업은 시뮬레이션의 실사
+  설정과 무관하게 전부 잠금을 탄다** — 실사를 끈 시뮬레이션의 턴을 잠금 밖에 두자 제작 화면 실사 테스트가 그 턴 옆에서
+  렌더했고(15.8/16.4GB), 그 겹침 중에 ComfyUI 가 CUDA 오류로 죽었다. `/interrupt` 자체는 원인이 아니었다(36회 중 0회).
+- **실사 백엔드의 판단은 `job.backend` / `job.routing` / `asset.backend` 1급 필드에 남긴다** — 저장된 진행은
+  `providerPayload` 를 비운다. 재사용(`findReusableImageAsset`)은 백엔드를 넘지 않는다.
+- 실제 사슬 검증: `E2E_PHOTOREAL=mixed E2E_PHOTOREAL_DISPATCH=all E2E_RELAY_URL=http://127.0.0.1:8788/photoreal/comfyui
+  OSS_EVAL_SEED=womanlife node server/end-to-end-run-eval.mjs` — 실사 컷을 실제로 렌더해 `E2E_IMAGE_DIR` 에 저장한다.
+  실측(qwen3:14b + Qwen-Image 2.1 Turbo, paragraph): 턴당 6~8컷, 컷당 약 4~5초.
 
 ## 시뮬레이션 격리 (run isolation)
 

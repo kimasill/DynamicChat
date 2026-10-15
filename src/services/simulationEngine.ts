@@ -12,6 +12,7 @@ import type {
   ChatMessage,
   ContinuityCheck,
   ContextPack,
+  ImageBackendId,
   ImageCue,
   ImageGenerationCadence,
   MemoryEvent,
@@ -466,15 +467,19 @@ export async function planImageJobForCompletedTurn(
     }
 
     const plannedJob = addImageCuePlannerMetadata(
-      planImageJob(workingState, input.assistantMessage.id, imageCue, contextNodeIds, input.manualImage),
+      planImageJob(workingState, input.assistantMessage.id, imageCue, contextNodeIds, input.manualImage, {
+        cueKind: draft.kind ?? draft.cueType
+      }),
       draft,
       index,
       workingState,
       input.sidecarTrace
     );
+    // Reuse looks only at images from the backend this cut was routed to: a NovelAI drawing must never stand in
+    // for a photoreal cut (or the reverse), however well the tags match.
     const reuseMatch = input.manualImage
       ? undefined
-      : findReusableImageAsset(workingState, plannedJob, { excludeAssetIds: reusedAssetIds });
+      : findReusableImageAsset(workingState, plannedJob, { excludeAssetIds: reusedAssetIds, backend: plannedJob.backend });
     if (reuseMatch) {
       reusedAssetIds.push(reuseMatch.asset.id);
     } else {
@@ -1105,7 +1110,8 @@ function createTurnTrace({
       memoryIngestCount: memoryEvents.length,
       imageJobCount: imageJobs?.length ?? (imageJob ? 1 : 0),
       imageAssetCount: imageAssetIds.length,
-      imageEstimatedCost: readImageCostEstimate(imageJob, imageJobs)
+      imageEstimatedCost: readImageCostEstimate(imageJob, imageJobs),
+      photorealJobCount: countPhotorealJobs(imageJob, imageJobs)
     },
     createdAt: new Date().toISOString()
   };
@@ -1125,8 +1131,15 @@ function readImageCostEstimate(imageJob?: ImageGenerationJobLike, imageJobs: Ima
   return total > 0 ? total : undefined;
 }
 
+/** How many of the turn's cuts went to the photoreal backend; the rest are NovelAI. */
+function countPhotorealJobs(imageJob?: ImageGenerationJobLike, imageJobs: ImageGenerationJobLike[] = []): number {
+  const jobs = imageJobs.length > 0 ? imageJobs : imageJob ? [imageJob] : [];
+  return jobs.filter((job) => (job.backend ?? job.providerPayload.provider) === "photoreal").length;
+}
+
 type ImageGenerationJobLike = {
   providerPayload: Record<string, unknown>;
+  backend?: ImageBackendId;
 };
 
 export async function createResetSessionState(state: AppState): Promise<AppState> {
@@ -2325,6 +2338,9 @@ function planImageCue(
     // from the tags on every cut, so the model's declared viewpoint, angle and visible regions were never
     // applied — and a cut whose base tags omit a shot tag got no frame filtering at all.
     frame: draft.frame,
+    // The beat kind travels with the cue so a regeneration, which re-plans from the stored cue, routes it with
+    // the same signal the first plan had.
+    kind: draft.kind ?? draft.cueType,
     suppressionReason: shouldGenerate
       ? draft.suppressionReason
       : draft.suppressionReason ?? "메인 LLM이 이미지 생성을 생략함",

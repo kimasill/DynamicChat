@@ -207,7 +207,59 @@ export interface SimulationCharacterDraft {
   outfitPrompts: Record<string, string>;
   expressionPrompts: Record<string, string>;
   defaultSafetyLevel: ImageSafetyLevel;
+  /** Mirrors CharacterVisualProfile.photorealPrompt so the creation screen can edit it. */
+  photorealPrompt?: string;
+  photorealNegativePrompt?: string;
+  /** Mirrors CharacterVisualProfile.profileImages; picked from test generations in the creation screen. */
+  profileImages?: CharacterProfileImages;
 }
+
+/**
+ * Which renderer draws a cut. `novelai` is the anime pipeline driven by Danbooru tags; `photoreal` is an
+ * open-weight photo model (Qwen-Image / Z-Image) run by a local ComfyUI server and driven by natural language.
+ */
+export type ImageBackendId = "novelai" | "photoreal";
+
+/**
+ * A character's chosen profile image for one backend. It is both the face shown for the character and the face
+ * REFERENCE that backend uses to keep the character recognisable across cuts (NovelAI: Precise Reference;
+ * photoreal: multi-reference editing). Profile images are only ever picked from images DynamicChat generated —
+ * there is deliberately no upload path, so a real person's photo cannot become a photoreal face reference.
+ *
+ * Not an ImageAsset: assets are per progress run and feed reuse/stored-asset picking, while a profile is
+ * simulation-scoped and must never be attached to a turn as a scene image. The bytes live in the object store.
+ */
+export interface CharacterProfileImage {
+  backend: ImageBackendId;
+  /** Object id of the image (the file name in the object store). Never reused for different bytes. */
+  assetId: Id;
+  /** Object-store key, served at GET /objects/<key>. */
+  objectKey?: string;
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  /**
+   * NovelAI only: the same image letterboxed onto 1024x1536, 1536x1024 or 1472x1472 with opaque black padding,
+   * which is the only shape NovelAI Precise Reference accepts. Prepared once when the profile is picked.
+   */
+  referenceObjectKey?: string;
+  prompt: string;
+  /**
+   * Photoreal only: the photo prompt the image was actually rendered from (style, camera and subject sentences), as
+   * the safety floor screened it. Kept beside `prompt` (what the user typed, which the "adopt as appearance" button
+   * reuses) because a typed prompt in Korean is dropped from the photo prompt and so cannot vouch for the image.
+   */
+  photoPrompt?: string;
+  negativePrompt?: string;
+  seed?: number;
+  /** Photoreal only: the workflow preset that produced it. */
+  workflowPreset?: PhotorealWorkflowPresetId;
+  /** NovelAI only: the model preset that produced it. */
+  modelPreset?: NovelAiModelPreset;
+  selectedAt: string;
+}
+
+export type CharacterProfileImages = Partial<Record<ImageBackendId, CharacterProfileImage>>;
 
 export interface CharacterVisualProfile {
   id: Id;
@@ -221,6 +273,14 @@ export interface CharacterVisualProfile {
   expressionPrompts: Record<string, string>;
   referenceImageAssetIds: Id[];
   defaultSafetyLevel: ImageSafetyLevel;
+  /**
+   * Natural-language appearance for the photoreal model ("a Korean woman in her late twenties with shoulder-length
+   * black hair ..."). Replaces the NovelAI identity tags in photoreal cuts; outfit and pose still come from the cut.
+   */
+  photorealPrompt?: string;
+  photorealNegativePrompt?: string;
+  /** Chosen profile image per backend; also that backend's face reference. */
+  profileImages?: CharacterProfileImages;
 }
 
 export interface ImageScenePresetExampleFile {
@@ -245,11 +305,133 @@ export interface ImageSceneTagPreset extends ImageSceneTagPresetNode {
   simulationId: Id;
 }
 
+/**
+ * The scene category the backend router puts every cut into. Exactly one per cut, decided deterministically by
+ * code from the COMPOSED prompt (after identity/outfit/continuity injection) — never by the LLM, and never from the
+ * authored tags alone, because continuity can inject an ongoing sex position into a cut that was authored as a
+ * plain face close-up.
+ */
+export type ImageSceneCategory =
+  /** Sexual content or nudity. Locked to NovelAI: never rendered photoreal, in any routing mode. */
+  | "explicit"
+  /** Dynamic motion: fighting, running, jumping, falling, sports. */
+  | "action"
+  /** Non-human or supernatural traits: animal ears, wings, horns, tails, magic, monsters. */
+  | "fantasy"
+  /** Non-explicit intimacy between people: kissing, hugging, holding hands, cuddling. */
+  | "romance"
+  /** Two or more people without intimate contact: conversation, daily life together. */
+  | "group"
+  /** One person, face or upper-body crop, static. */
+  | "portrait"
+  /** One person, cowboy / full-body / wide crop, static (outfit shots). */
+  | "full_body"
+  /** No people: landscape, interior, establishing shot. */
+  | "scenery"
+  /** No people, an object or food is the subject. */
+  | "object";
+
+/**
+ * `novelai`: every cut is anime (the pre-photoreal behaviour, and the default for existing simulations).
+ * `mixed`: cuts whose category is in `photorealCategories` render photoreal, the rest NovelAI.
+ * `photoreal`: every cut renders photoreal except the safety-locked categories.
+ */
+export type ImageBackendRoutingMode = "novelai" | "mixed" | "photoreal";
+
+export interface ImageBackendRouting {
+  mode: ImageBackendRoutingMode;
+  /** Categories rendered photoreal in `mixed` mode. `explicit` is ignored even if present. */
+  photorealCategories: ImageSceneCategory[];
+}
+
+/** Why the router sent a cut where it did. Stored first-class on the job so it survives stored-run slimming. */
+export interface ImageBackendDecision {
+  backend: ImageBackendId;
+  category: ImageSceneCategory;
+  mode: ImageBackendRoutingMode;
+  /** Short Korean explanation shown in the inspector. */
+  reason: string;
+  /** The safety floor forced NovelAI (explicit content, or minor-coded subjects). Cannot be overridden. */
+  locked?: boolean;
+  /** The preferred backend was not available, so the other one was used. */
+  fallback?: boolean;
+  /** The tags/fields that decided the category, for the inspector and the evals. */
+  signals: string[];
+}
+
+export type PhotorealWorkflowPresetId =
+  /** Qwen-Image 2.1 Turbo (8 steps): text-to-image AND up to 10 face references in one 7B model. Qwen research licence (non-commercial). */
+  | "qwen_image_2_1_turbo"
+  /** Qwen-Image 2.1 base (25 steps): same model family, slower, slightly higher quality. */
+  | "qwen_image_2_1"
+  /** Z-Image Turbo (8 steps, Apache-2.0): fastest photoreal text-to-image; no reference input. */
+  | "z_image_turbo"
+  /** Qwen-Image-Edit 2511 (Apache-2.0, 20B): licence-safe face-reference editor, 1-3 references. */
+  | "qwen_image_edit_2511"
+  /** A user-supplied API-format ComfyUI workflow with %placeholders%. */
+  | "custom";
+
+export type PhotorealStylePresetId = "daily_look" | "film_portrait" | "cinematic" | "studio_editorial" | "custom";
+
+/** `proxy`: through the DynamicChat API server relay (ComfyUI refuses cross-origin browser calls). `mock`: dry run. */
+export type PhotorealRequestMode = "proxy" | "mock";
+
+export interface PhotorealModelFiles {
+  diffusionModel?: string;
+  textEncoder?: string;
+  vae?: string;
+}
+
+export interface PhotorealApiSettings {
+  enabled: boolean;
+  provider: "comfyui";
+  requestMode: PhotorealRequestMode;
+  /** ComfyUI base URL. The relay only accepts loopback hosts unless DYNAMICCHAT_COMFYUI_HOSTS lists the host. */
+  baseUrl: string;
+  /** Overrides the relay endpoint (like NovelAiApiSettings.proxyUrl). Empty = `${API base}/photoreal/comfyui`. */
+  proxyUrl: string;
+  /** Workflow for cuts with no face reference. */
+  workflowPreset: PhotorealWorkflowPresetId;
+  /** Workflow for cuts whose characters have a photoreal profile image. Falls back to `workflowPreset` when it cannot take references. */
+  referenceWorkflowPreset: PhotorealWorkflowPresetId;
+  /** Model file overrides per preset; an empty field means the preset's default file. */
+  modelFiles: Partial<Record<PhotorealWorkflowPresetId, PhotorealModelFiles>>;
+  /** 0 = preset default. */
+  steps: number;
+  /** 0 = preset default. */
+  cfg: number;
+  /** 0 = derived from imageProfile's aspect ratio at about 1.2 megapixels. */
+  width: number;
+  height: number;
+  seedFixed: boolean;
+  seed?: number;
+  stylePreset: PhotorealStylePresetId;
+  /** Appended to the preset's style text; the whole style when stylePreset is `custom`. */
+  stylePrompt: string;
+  negativePrompt: string;
+  /** Use characters' photoreal profile images as face references. */
+  faceReferenceEnabled: boolean;
+  /**
+   * Hand the GPU back and forth between a local LLM (Ollama) and local ComfyUI. A 16 GB card cannot hold
+   * qwen3:14b (11.7 GB) and a photoreal model (13-15 GB) at once, and a spilled LLM runs at 0.1 tok/s.
+   */
+  vramHandoff: "auto" | "off";
+  /** API-format ComfyUI workflow JSON for the `custom` preset. */
+  customWorkflow: string;
+  /** Per-image wait ceiling in seconds, including the first model load. */
+  timeoutSeconds: number;
+  registrationStatus: ApiRegistrationStatus;
+  verifiedAt?: string;
+  verificationMessage?: string;
+}
+
 export interface ImageGenerationProfile {
   id: Id;
   simulationId: Id;
   enabled: boolean;
   provider: "novelai";
+  /** Per-cut backend routing. Absent on simulations saved before photoreal existed (= NovelAI only). */
+  backendRouting?: ImageBackendRouting;
   model: string;
   width: number;
   height: number;
@@ -491,6 +673,8 @@ export interface TurnTraceMetrics {
   imageJobCount: number;
   imageAssetCount: number;
   imageEstimatedCost?: number;
+  /** How many of this turn's image jobs were routed to the photoreal backend. */
+  photorealJobCount?: number;
 }
 
 export interface TurnTrace {
@@ -543,6 +727,8 @@ export interface ImageCue {
   suppressionReason?: string;
   visualContext?: string;
   frame?: ImageCueFrame;
+  /** The annotation pass's beat kind (scene | action | body_detail | dialogue_face | context | interaction). Free text. */
+  kind?: string;
 }
 
 export interface ImageCueCharacterPrompt {
@@ -575,6 +761,9 @@ export interface ImageAsset {
   reuseTags?: string[];
   representative?: boolean;
   feedback?: ImageAssetFeedback;
+  /** Renderer that drew this image. Absent = NovelAI (every asset made before photoreal existed). */
+  backend?: ImageBackendId;
+  sceneCategory?: ImageSceneCategory;
 }
 
 export interface ImageGenerationJob {
@@ -595,6 +784,10 @@ export interface ImageGenerationJob {
   error?: string;
   policyWarnings?: string[];
   representativeAssetId?: Id;
+  /** Renderer this job runs on. Absent = NovelAI (every job planned before photoreal existed). */
+  backend?: ImageBackendId;
+  /** The router's decision, kept first-class because stored runs drop providerPayload. */
+  routing?: ImageBackendDecision;
 }
 
 export interface NeuralMapSettings {
@@ -696,6 +889,18 @@ export interface NovelAiApiSettings {
   seed?: number;
   vibeTransferEnabled: boolean;
   vibeTransferReferences: NovelAiVibeTransferReference[];
+  /**
+   * NovelAI Precise Reference from the characters' NovelAI profile images. V4.5 models only (NAID4.5F/C); NovelAI
+   * charges 5 Anlas per reference per image even on Opus, so it is opt-in. Cannot be combined with Vibe Transfer in
+   * one request — when a reference is attached the vibes are dropped for that request.
+   */
+  characterReferenceEnabled?: boolean;
+  /** 0-1. Lower it if the reference's pose or expression leaks into every cut. Default 0.85. */
+  characterReferenceStrength?: number;
+  /** 0-1. Sent inverted as director_reference_secondary_strength_values (fidelity 1 → 0). Default 1. */
+  characterReferenceFidelity?: number;
+  /** true → base_caption "character&style" (carries the reference's rendering of the character); false → "character". */
+  characterReferenceStyleAware?: boolean;
 }
 
 export interface AppState {
@@ -731,6 +936,8 @@ export interface AppState {
   // `enabled` is false the image-cue call falls back to the main `llm` config.
   imageTagLlm: LlmApiSettings;
   novelAi: NovelAiApiSettings;
+  /** Photoreal backend (local ComfyUI). Routing lives in imageProfile.backendRouting. */
+  photoreal: PhotorealApiSettings;
   selectedModuleId?: Id;
   selectedContextPackId?: Id;
   updatedAt?: string;

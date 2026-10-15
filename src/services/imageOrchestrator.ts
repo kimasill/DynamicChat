@@ -1,12 +1,20 @@
 import { createId } from "../lib/id";
 import type {
   AppState,
+  CharacterProfileImage,
+  CharacterVisualProfile,
+  Id,
   ImageAsset,
+  ImageBackendDecision,
+  ImageBackendId,
   ImageCue,
   ImageCueCharacterPrompt,
   ImageCueFrame,
   ImageGenerationProfile,
   ImageGenerationJob,
+  ImageSceneCategory,
+  PhotorealApiSettings,
+  PhotorealWorkflowPresetId,
   PromptModule
 } from "../types";
 import {
@@ -18,7 +26,34 @@ import {
   resolveImageCueFrame
 } from "./imageFrame";
 import { generateNovelAiImages } from "./novelAiClient";
+import type { NovelAiCharacterReferenceInput } from "./novelAiClient";
 import { resolveNovelAiModelName } from "./novelAiModels";
+import { classifyImageScene } from "./imageSceneClassifier";
+import type { SceneClassification } from "./imageSceneClassifier";
+import { decideImageBackend, describeImageBackendSetupBlock } from "./imageBackendRouting";
+import {
+  buildPhotorealPrompt,
+  describePhotorealStyleForScreening,
+  resolvePhotorealStyle,
+  sanitizePhotorealNegativePrompt,
+  selectPhotoTextForScreening
+} from "./photorealPrompt";
+import type { PhotorealCharacterInput } from "./photorealPrompt";
+import {
+  PHOTOREAL_WORKFLOW_PRESETS,
+  listCustomWorkflowLiteralTexts,
+  listPhotorealGraphPictureTexts,
+  resolvePhotorealCfg,
+  resolvePhotorealModelFiles,
+  resolvePhotorealOutputSize,
+  resolvePhotorealPresetForCut,
+  validateCustomWorkflowTemplate
+} from "./comfyWorkflows";
+import type { ComfyApiWorkflow, ComfyWorkflowLiteralText, ComfyWorkflowPictureText } from "./comfyWorkflows";
+import { buildPhotorealRequestWorkflow, generatePhotorealImages, isPickedProfileObjectKey } from "./comfyUiClient";
+import type { PhotorealReferenceInput } from "./comfyUiClient";
+import { fetchObjectAsBase64 } from "./imageReferences";
+import { DEFAULT_PHOTOREAL_SETTINGS } from "./runtimeApiSettings";
 import {
   createImageUserRulesForContentRating,
   isAdultContentMode,
@@ -88,6 +123,115 @@ export interface ImageJobProgressResult {
   assets: ImageAsset[];
 }
 
+/** A planned face reference for a photoreal cut, as stored in providerPayload.photorealReferences. */
+interface PlannedPhotorealReference {
+  /** `char_<n>`: the n-th reference slot, which the prompt calls `<image n>`. */
+  name: string;
+  characterId: Id;
+  objectKey: string;
+  width?: number;
+  height?: number;
+}
+
+/** A planned NovelAI Precise Reference, as stored in providerPayload.characterReference. */
+interface PlannedNovelAiCharacterReference {
+  characterId: Id;
+  objectKey: string;
+}
+
+interface PhotorealJobPlan {
+  prompt: string;
+  negativePrompt: string;
+  presetId: PhotorealWorkflowPresetId;
+  /** The planned face references (also in payload.photorealReferences), for building the graph at plan time. */
+  references: PlannedPhotorealReference[];
+  /** Spread into providerPayload in place of the NovelAI model/size/sampler fields. */
+  payload: Record<string, unknown>;
+}
+
+/**
+ * One composed figure of a cut as the photo side sees it: its tags, its registered identity and, when the figure
+ * really is the registered character, that character's visual profile (photoreal appearance, profile images).
+ */
+interface PhotorealFigure {
+  characterPrompt: ImageCueCharacterPrompt;
+  tags: string[];
+  identity: string[];
+  profile?: CharacterVisualProfile;
+}
+
+/** A safety-floor reading of free text: the router's decision on it, and the classification behind it. */
+export interface PhotorealTextScreen {
+  decision: ImageBackendDecision;
+  classification: SceneClassification;
+}
+
+/**
+ * Why a profile image may not be a photoreal face reference: it is not a picked profile image (`not_picked`), its
+ * record says nothing (`no_record`: no prompt; `unreadable_record`: no word the floor can read), or its prompt tripped
+ * the floor (`floor`, with the reading in `screen`).
+ */
+export interface PhotorealReferenceRefusal {
+  kind: "not_picked" | "no_record" | "unreadable_record" | "floor";
+  reason: string;
+  screen?: PhotorealTextScreen;
+}
+
+/**
+ * A custom workflow's own literal text that the safety floor refuses, and where in the template it sits — or no
+ * `literal` when only the template's literals read together trip it (one phrase spread over several nodes).
+ */
+export interface CustomWorkflowRefusal extends PhotorealTextScreen {
+  literal?: ComfyWorkflowLiteralText;
+}
+
+/**
+ * A built graph the safety floor refuses: the reading, and the picture-side text that tripped it — or none, when only
+ * the texts read together did (words split across nodes).
+ */
+export interface PhotorealGraphRefusal extends PhotorealTextScreen {
+  text?: ComfyWorkflowPictureText;
+}
+
+/**
+ * A photoreal request refused as it was about to leave: the floor (or a reference check) no longer passes what the
+ * job was planned with. Its own type so the executor can drop the job's references along with it.
+ */
+class PhotorealDispatchRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PhotorealDispatchRefusal";
+  }
+}
+
+/** One provider request inside executeImageJob, whichever backend serves it. */
+interface JobImageRequest {
+  prompt: string;
+  negativePrompt: string;
+  cue: ImageCue;
+  /** Names the request in the "no images" error, as the NovelAI path always has. */
+  label: string;
+  /** 0-based position among the job's sequential requests; offsets a requested seed so they differ. */
+  requestIndex: number;
+}
+
+interface JobImageRequester {
+  request(input: JobImageRequest): Promise<{ dataUrls: string[]; payload: Record<string, unknown> }>;
+  /** Degradations that did not fail the cut (a Precise Reference that could not be loaded), for policyWarnings. */
+  readonly warnings: string[];
+}
+
+/**
+ * The renderer a job runs on. `job.backend` is authoritative; the payload's provider covers a job written before
+ * the field existed, and anything else is NovelAI because every job predating photoreal was.
+ */
+export function resolveImageJobBackend(job: Pick<ImageGenerationJob, "backend" | "providerPayload">): ImageBackendId {
+  if (job.backend === "photoreal" || job.backend === "novelai") {
+    return job.backend;
+  }
+  return job.providerPayload?.provider === "photoreal" ? "photoreal" : "novelai";
+}
+
 export function shouldGenerateImage(state: AppState, cue: ImageCue, manual = false): boolean {
   if (!state.imageProfile.enabled || !state.simulation.realtimeImageEnabled) {
     return false;
@@ -143,8 +287,12 @@ export function shouldAutoRunImageJob(job: ImageGenerationJob, liveState?: AppSt
   //
   // A confirmation is the user asking to try NOW, so it overrides either form: let it through and let the
   // real provider error speak if it is still blocked. Silence is worse than a specific failure.
+  //
+  // The re-derivation asks about the backend the cut was ROUTED to. Asking about NovelAI for every cut held a
+  // photoreal cut back whenever NovelAI was off — the normal setup for someone who only runs local ComfyUI —
+  // and let it through while ComfyUI was the one switched off.
   const setupBlocked = liveState
-    ? Boolean(describeNovelAiSetupBlock(liveState))
+    ? Boolean(describeImageBackendSetupBlock(liveState, resolveImageJobBackend(job)))
     : Boolean(job.providerPayload.setupBlockedReason);
   const userAskedToRunNow = Boolean(job.providerPayload.confirmedAt);
   return job.status === "queued" && !requiresConfirmation && allowed && (!setupBlocked || userAskedToRunNow);
@@ -173,45 +321,104 @@ export function canUserRunQueuedImageJob(job: ImageGenerationJob): boolean {
  *
  * Only conditions the user can see and fix from the settings screen. The API token deliberately is not
  * checked: in proxy mode the secret lives on the server and the client copy is legitimately empty.
+ *
+ * Kept as its own export for the callers that only ever ask about NovelAI; the text lives in the router so a
+ * photoreal cut and a NovelAI cut are explained by the same function.
  */
 export function describeNovelAiSetupBlock(state: AppState): string | undefined {
-  if (!state.novelAi.enabled) {
-    return "NovelAI 연동이 꺼져 있습니다. 개인 설정에서 켜면 이 컷부터 생성됩니다.";
-  }
-  return undefined;
+  return describeImageBackendSetupBlock(state, "novelai");
 }
 
+/**
+ * Plans one cut: composes the NovelAI prompt (identity, outfit, continuity and frame filtering all happen
+ * there), routes the COMPOSED result to a backend, and — for a photoreal cut — re-renders that same plan as the
+ * photo model's natural-language prompt.
+ *
+ * `options.backend` is a manual "regenerate with this backend" request; the safety floor in decideImageBackend
+ * still beats it. `options.cueKind` is the annotation pass's beat kind (recorded, never decisive).
+ */
 export function planImageJob(
   state: AppState,
   turnId: string,
   cue: ImageCue,
   contextNodeIds: string[],
   manual = false,
-  options: { count?: number } = {}
+  options: { count?: number; backend?: ImageBackendId; cueKind?: string } = {}
 ): ImageGenerationJob {
   const scopedCue = cue;
   const promptPlan = createImagePromptPlan(state, scopedCue);
   const imageUserRules = createImageUserRulesForContentRating(state);
-  const prompt = promptPlan.prompt;
-  const negativePrompt = promptPlan.negativePrompt;
+  const cueFrame = resolveImageCueFrame(scopedCue);
+  const cueKind = readCueKind(options.cueKind) ?? readCueKind(scopedCue.kind);
+  const figures = resolvePhotorealFigures(state, promptPlan);
+  // Routing reads the plan as it will be SENT, never the authored caption: continuity re-injects an ongoing sex
+  // position into a cut the tag model wrote as a plain face close-up, and fantasy traits usually live in the
+  // saved identity rather than in the cut. Classifying the authored tags would route both of those wrongly.
+  //
+  // And it reads everything a photo prompt can carry, not only the tags. A registered figure's photoreal
+  // appearance becomes the subject of the photo prompt, and the style text opens and closes every one of them;
+  // both are free text a creator types, and unread they let "a 15-year-old girl" or "a nude boudoir photograph"
+  // render under an ordinary portrait's routing. They are read even for a cut headed to NovelAI: a forced
+  // regeneration or an availability fallback can still hand it to the photo model.
+  const decided = decideImageBackend(
+    state,
+    classifyImageScene({
+      cueKind,
+      characterTagSets: figures.map((figure) => [figure.characterPrompt.prompt, ...selectPhotoTextForScreening(figure.profile?.photorealPrompt)]),
+      contextTags: [...promptPlan.layers.context, ...promptPlan.layers.userRules],
+      safetyTexts: describePhotorealStyleForScreening(readPhotorealSettings(state)),
+      frame: cueFrame,
+      registeredCharacterCount: scopedCue.characters.length
+    }),
+    { forcedBackend: options.backend }
+  );
+  const draftedPhotoreal = decided.backend === "photoreal" ? createPhotorealJobPlan(state, promptPlan, cueFrame, figures) : undefined;
+  // The last word goes to what is actually sent. A refused photo prompt is re-planned as an ordinary NovelAI cut,
+  // so a locked cut never keeps a photoreal prompt. A custom workflow sends its own literal text with every cut, so
+  // a template the floor refuses sends the cut to NovelAI the same way. And the graph itself is built, as it would
+  // be sent, and read: what the pieces become once a template wraps them is only visible there — and a template that
+  // cannot build this cut at all is found now, rather than as a photoreal cut that fails when it runs.
+  const refusal = draftedPhotoreal
+    ? screenFinishedPhotorealPrompt(state, draftedPhotoreal.prompt, decided, options.backend) ??
+      screenPlannedCustomWorkflow(state, draftedPhotoreal.presetId, decided, options.backend) ??
+      screenPlannedPhotorealGraph(state, draftedPhotoreal, decided, options.backend)
+    : undefined;
+  const routing = refusal ?? decided;
+  const photorealPlan = refusal ? undefined : draftedPhotoreal;
+  const backend = routing.backend;
+  const prompt = photorealPlan?.prompt ?? promptPlan.prompt;
+  const negativePrompt = photorealPlan?.negativePrompt ?? promptPlan.negativePrompt;
   const jobId = createId("imgjob");
   const requestedCount = options.count ?? 1;
   const count = Math.min(8, Math.max(1, Math.round(requestedCount)));
-  const promptVariants = createImagePromptVariants(state, promptPlan, scopedCue, count);
-  const reuseTags = createReusableImageTags(scopedCue, promptPlan, promptVariants);
-  const policy = validateImagePolicy(state, scopedCue, count);
+  const tagPromptVariants = createImagePromptVariants(state, promptPlan, scopedCue, count);
+  // executeImageJob sends the VARIANT prompts when there are several, so a photoreal job's variants must carry the
+  // photo prompt; the tag variants would otherwise reach the photo model as a Danbooru list.
+  const promptVariants = photorealPlan
+    ? tagPromptVariants.map((variant) => ({ ...variant, prompt: photorealPlan.prompt, tags: [] }))
+    : tagPromptVariants;
+  const reuseTags = createReusableImageTags(scopedCue, promptPlan, tagPromptVariants);
+  const policy = validateImagePolicy(state, scopedCue, count, backend);
   const requiresConfirmation = state.imageProfile.triggerMode === "realtime_confirm" && !manual;
-  const resolvedModel = resolveNovelAiModelName(state.novelAi.modelPreset, state.imageProfile.model);
+  const novelAiReference = backend === "novelai" ? planNovelAiCharacterReference(state, promptPlan) : undefined;
+  const backendFields: Record<string, unknown> = photorealPlan
+    ? photorealPlan.payload
+    : {
+        model: resolveNovelAiModelName(state.novelAi.modelPreset, state.imageProfile.model),
+        modelPreset: state.novelAi.modelPreset,
+        width: state.imageProfile.width,
+        height: state.imageProfile.height,
+        steps: state.imageProfile.steps,
+        promptGuidance: state.imageProfile.promptGuidance,
+        // Only the object key: the bytes are read from the store when the job runs, so the plan (which is
+        // persisted for every cut) never carries a reference image.
+        ...(novelAiReference ? { characterReference: novelAiReference } : {})
+      };
   const providerPayload: Record<string, unknown> = {
-    provider: "novelai",
+    provider: backend,
     payloadVersion: "dynamicchat-image-plan-v1",
     mode: "planned",
-    model: resolvedModel,
-    modelPreset: state.novelAi.modelPreset,
-    width: state.imageProfile.width,
-    height: state.imageProfile.height,
-    steps: state.imageProfile.steps,
-    promptGuidance: state.imageProfile.promptGuidance,
+    ...backendFields,
     count,
     contentRating: state.simulation.contentRating,
     adultContentMode: isAdultContentMode(state),
@@ -223,7 +430,9 @@ export function planImageJob(
     userRules: imageUserRules,
     userRulesMode: "composer_instructions",
     userRuleInstructions: promptPlan.userRuleInstructions,
-    promptFormat: "novelai-tags",
+    promptFormat: photorealPlan ? "natural-language" : "novelai-tags",
+    // The composed tag plan is kept for BOTH backends: it is what routing classified, what reuse matching reads,
+    // and — for a photoreal cut — what the inspector shows next to the sentence it became.
     promptLayers: promptPlan.layers,
     characterPrompts: promptPlan.characterPrompts,
     positiveTags: promptPlan.positiveTags,
@@ -254,12 +463,17 @@ export function planImageJob(
       suppressionReason: scopedCue.suppressionReason,
       // Persisted with the job so a regenerated or re-inspected cut reuses the SAME crop instead of
       // re-guessing it, and so the inspector can show what the composition actually was.
-      frame: resolveImageCueFrame(scopedCue)
+      frame: cueFrame,
+      // Kept for the same reason: a regeneration re-plans from this cue and should classify it identically.
+      kind: cueKind
     },
+    sceneCategory: routing.category,
+    routing,
     // Recorded at plan time so the cut can say why it is waiting instead of failing once per turn. Kept at
     // the TOP level of providerPayload because that is where both readers look — the CrackMarkerJob marker,
-    // which displays it, and shouldAutoRunImageJob, which holds back only the unattended dispatch.
-    setupBlockedReason: describeNovelAiSetupBlock(state)
+    // which displays it, and shouldAutoRunImageJob, which holds back only the unattended dispatch. It names the
+    // backend the cut was routed to, so a photoreal cut waits on ComfyUI rather than on NovelAI.
+    setupBlockedReason: describeImageBackendSetupBlock(state, backend)
   };
 
   return {
@@ -278,8 +492,511 @@ export function planImageJob(
     updatedAt: new Date().toISOString(),
     completedAt: policy.allowed ? undefined : new Date().toISOString(),
     error: policy.blockedReason,
-    policyWarnings: policy.warnings
+    policyWarnings: policy.warnings,
+    // First-class rather than payload-only: stored runs drop providerPayload, and the queue, the reuse filter and
+    // the inspector all need to know which renderer a cut belongs to.
+    backend,
+    routing
   };
+}
+
+function readCueKind(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * The photoreal half of a plan: the preset for this cut, its face references, the natural-language prompt and
+ * the payload fields the inspector and the executor read.
+ *
+ * The prompt is a translation of the SAME composed plan NovelAI would have received — identity, outfit,
+ * continuity and frame filtering are already applied — so routing a cut to the photo model never changes what is
+ * in it, only how it is drawn.
+ */
+function createPhotorealJobPlan(
+  state: AppState,
+  promptPlan: ImagePromptPlan,
+  frame: ImageCueFrame | undefined,
+  figures: PhotorealFigure[]
+): PhotorealJobPlan {
+  const settings = readPhotorealSettings(state);
+
+  // A face reference is only worth sending when the face is in the picture. From behind, or in a crop without
+  // the head, there is no face for it to keep — all it could still contribute is the rest of the reference
+  // image (its pose, outfit and room), which is exactly what the cut must not inherit.
+  const headInFrame = !frame || (frame.viewpoint !== "from_behind" && frame.visibleRegions.includes("head"));
+  const candidates: Array<{ figureIndex: number; characterId: Id; objectKey: string; width?: number; height?: number }> = [];
+  const refusedReferences: Array<{ characterId: Id; reason: string }> = [];
+  if (settings.faceReferenceEnabled && headInFrame) {
+    figures.forEach((figure, figureIndex) => {
+      const characterId = figure.characterPrompt.characterId;
+      const image = figure.profile?.profileImages?.photoreal;
+      const objectKey = typeof image?.objectKey === "string" ? image.objectKey.trim() : "";
+      // One reference per person: the same character twice in a cut is one face, not two slots.
+      if (!characterId || !objectKey || candidates.some((candidate) => candidate.characterId === characterId)) {
+        return;
+      }
+      // A profile image is only as safe as the prompt that drew it. One made before the floor read prose (a
+      // "14-year-old girl in a bikini" studio prompt, rendered and then picked) must not become the face of every
+      // later photo cut, so its prompt is read again before the image is used as a reference.
+      const refused = screenPhotorealReferenceImage(state, image);
+      if (refused) {
+        refusedReferences.push({ characterId, reason: refused.reason });
+        return;
+      }
+      // The size lets the graph crop the reference to head and shoulders before encoding (comfyWorkflows).
+      const width = image?.width;
+      const height = image?.height;
+      candidates.push({
+        figureIndex,
+        characterId,
+        objectKey,
+        ...(isPositiveFiniteNumber(width) ? { width } : {}),
+        ...(isPositiveFiniteNumber(height) ? { height } : {})
+      });
+    });
+  }
+  const presetId = resolvePhotorealPresetForCut(settings, candidates.length > 0);
+  const preset = PHOTOREAL_WORKFLOW_PRESETS[presetId];
+  // resolvePhotorealPresetForCut falls back to the text-to-image preset when the reference preset cannot take
+  // references; that preset may still take them (Qwen-Image 2.1 does both), so ask the preset actually chosen.
+  const usable = settings.faceReferenceEnabled && preset.supportsReferences ? candidates.slice(0, preset.maxReferences) : [];
+  const references: PlannedPhotorealReference[] = usable.map((candidate, index) => ({
+    name: `char_${index + 1}`,
+    characterId: candidate.characterId,
+    objectKey: candidate.objectKey,
+    ...(candidate.width ? { width: candidate.width } : {}),
+    ...(candidate.height ? { height: candidate.height } : {})
+  }));
+  const referenceIndexByFigure = new Map(usable.map((candidate, index) => [candidate.figureIndex, index + 1]));
+
+  const characters: PhotorealCharacterInput[] = figures.map((figure, figureIndex) => {
+    const appearance = typeof figure.profile?.photorealPrompt === "string" ? figure.profile.photorealPrompt.trim() : "";
+    return {
+      characterId: figure.characterPrompt.characterId,
+      ...(appearance ? { appearance } : {}),
+      tags: figure.tags,
+      identityTags: figure.identity,
+      referenceIndex: referenceIndexByFigure.get(figureIndex),
+      center: figure.characterPrompt.center
+    };
+  });
+  const characterNegatives = uniqueStrings(
+    figures.map((figure) =>
+      typeof figure.profile?.photorealNegativePrompt === "string" ? figure.profile.photorealNegativePrompt.trim() : ""
+    )
+  );
+  const plan = buildPhotorealPrompt({
+    characters,
+    // Only the cut's own staging: the quality/style/artist layers are NovelAI vocabulary, and the photo look
+    // comes from the style preset instead.
+    contextTags: [...promptPlan.layers.context, ...promptPlan.layers.userRules],
+    frame,
+    // The style already carries photoreal.negativePrompt; only the per-character negatives are added here.
+    style: resolvePhotorealStyle(settings),
+    extraNegative: characterNegatives.join(", "),
+    referenceSyntax: preset.referenceSyntax
+  });
+  const files = resolvePhotorealModelFiles(settings, presetId);
+  const { width, height } = resolvePhotorealOutputSize(state);
+
+  return {
+    prompt: plan.prompt,
+    // Through the one negative rule by name, not only through the builder's merge: the job records the negative the
+    // graph will carry (the builder cleans it again on the way out), so the inspector never shows words that are not
+    // sent. This is the path every photo negative takes — the settings negative, each character's, the studio box.
+    negativePrompt: sanitizePhotorealNegativePrompt(plan.negativePrompt),
+    presetId,
+    references,
+    payload: {
+      presetId,
+      model: files.diffusionModel ? `${preset.label} · ${files.diffusionModel}` : preset.label,
+      modelFiles: files,
+      width,
+      height,
+      // Effective values, as the client will send them: 0 in the settings means the preset's own, and a Turbo
+      // preset's CFG is fixed whatever the setting says.
+      steps: Math.round(positiveNumberOr(settings.steps, preset.defaults.steps)),
+      cfg: resolvePhotorealCfg(settings, presetId),
+      stylePreset: settings.stylePreset,
+      referenceSyntax: preset.referenceSyntax,
+      photorealReferences: references,
+      // Why a profiled character's face was left out, so the inspector does not show a missing reference as a bug.
+      ...(refusedReferences.length > 0 ? { photorealReferenceRefusals: refusedReferences } : {}),
+      // The tag prompt this sentence was made from, so the inspector can show both.
+      novelAiPrompt: promptPlan.prompt,
+      novelAiNegativePrompt: promptPlan.negativePrompt,
+      photorealSections: {
+        subjectSentences: plan.subjectSentences,
+        settingSentence: plan.settingSentence,
+        cameraSentence: plan.cameraSentence,
+        droppedTags: plan.droppedTags,
+        trimmedTags: plan.trimmedTags ?? []
+      }
+    }
+  };
+}
+
+/**
+ * The composed figures of a cut, each with the registered identity and visual profile it actually stands for.
+ * Shared by routing (which reads each figure's photoreal appearance) and the photo prompt (which renders it), so
+ * the two can never disagree about whose appearance a figure carries.
+ */
+function resolvePhotorealFigures(state: AppState, promptPlan: ImagePromptPlan): PhotorealFigure[] {
+  return promptPlan.characterPrompts.map((characterPrompt) => {
+    const tags = promptToTags(characterPrompt.prompt);
+    const identity = resolveRegisteredCharacterTags(state, characterPrompt.characterId).identity;
+    // A figure the composer refused to dress as the registered character (the cross-gender guard) is somebody
+    // else; that character's appearance text and face must not be pinned onto them either.
+    const registered = Boolean(characterPrompt.characterId) && !isUnregisteredFigure(tags, identity);
+    return {
+      characterPrompt,
+      tags,
+      identity: registered ? identity : [],
+      profile: registered ? findVisualProfile(state, characterPrompt.characterId) : undefined
+    };
+  });
+}
+
+/**
+ * The safety floor's verdict on free text a photo prompt would carry — a creator's appearance, the prompt a profile
+ * image was made from, a prompt typed into the profile studio — or undefined when the floor lets it through. Read
+ * as the builder renders it (selectPhotoTextForScreening: prose or a tag list, Korean segments left out), and
+ * decided by the router itself, so the floor keeps exactly one definition.
+ */
+export function screenPhotorealText(state: AppState, text: string | undefined): PhotorealTextScreen | undefined {
+  const segments = selectPhotoTextForScreening(text);
+  if (segments.length === 0) {
+    return undefined;
+  }
+  const screen = readPhotoPromptText(state, segments);
+  return screen.decision.locked ? screen : undefined;
+}
+
+/**
+ * The one reading behind every photo-text gate: the texts as safety texts of an otherwise empty cut, decided by the
+ * router. Callers differ only in WHICH text they hand over — the builder's view of a creator field (Korean segments
+ * out, since the builder drops them), or text that goes to the encoder verbatim (all of it).
+ */
+function readPhotoPromptText(state: AppState, texts: string[], forcedBackend?: ImageBackendId): PhotorealTextScreen {
+  const classification = classifyImageScene({ characterTagSets: [], contextTags: [], safetyTexts: texts, registeredCharacterCount: 0 });
+  return { classification, decision: decideImageBackend(state, classification, { forcedBackend }) };
+}
+
+/**
+ * Whether a profile image may be the photoreal face reference — the face every later photo cut of that character is
+ * drawn with — or why not. The image is vouched for only by what was recorded when it was picked, so:
+ * - its object key must be a picked profile image's (isPickedProfileObjectKey): a benign prompt next to a key that
+ *   names a story cut, or any other file, vouches for an image it never described;
+ * - a record whose prompt is missing or blank is refused: nothing says what the image shows (hydrate turns a missing
+ *   prompt into "", which used to read as "nothing to object to");
+ * - so is a prompt in which the floor finds nothing to read — a zero-width space, a Hangul filler, "—", "🙂", "%%",
+ *   "<image1>", "1girl": the photo text must hold at least one real Latin-script word (hasReadablePhotoWord), or the
+ *   record only LOOKS like it says something;
+ * - the prompt is read like the finished photo prompt, over exactly the text the builder would have carried into
+ *   the photo prompt that drew the image (selectPhotoTextForScreening: every segment but Korean ones, which the
+ *   builder drops). The planner, the profile studio's face check and the executor all ask here.
+ * The record's negative is not read: no graph samples below CFG 1 (PHOTOREAL_MIN_CFG), so a negative only ever
+ * pushes away from what it names, and every negative is cleaned on its way into a graph.
+ */
+export function screenPhotorealReferenceImage(
+  state: AppState,
+  image: Pick<CharacterProfileImage, "prompt" | "photoPrompt" | "objectKey"> | undefined
+): PhotorealReferenceRefusal | undefined {
+  const objectKey = typeof image?.objectKey === "string" ? image.objectKey.trim() : "";
+  if (!isPickedProfileObjectKey(objectKey)) {
+    return { kind: "not_picked", reason: "DynamicChat이 생성해 프로필로 고른 이미지가 아니어서 얼굴 참조로 쓰지 않습니다" };
+  }
+  const prompt = typeof image?.prompt === "string" ? image.prompt : "";
+  const photoPrompt = typeof image?.photoPrompt === "string" ? image.photoPrompt : "";
+  if (!prompt.trim() && !photoPrompt.trim()) {
+    return { kind: "no_record", reason: "프로필 이미지를 만든 프롬프트 기록이 없어 얼굴 참조로 쓰지 않습니다" };
+  }
+  // Both records are read when both exist: the typed one may carry what the rendered one dropped, and the rendered
+  // one is what vouches for a pick typed in Korean (the photo prompt drops Korean, so the typed text reads empty).
+  const segments = [...selectPhotoTextForScreening(prompt), ...selectPhotoTextForScreening(photoPrompt)];
+  if (!segments.some(hasReadablePhotoWord)) {
+    return { kind: "unreadable_record", reason: "프로필 이미지를 만든 프롬프트 기록에 읽을 수 있는 영어 단어가 없어 얼굴 참조로 쓰지 않습니다" };
+  }
+  const screen = readPhotoPromptText(state, segments);
+  return screen.decision.locked
+    ? {
+        kind: "floor",
+        reason: `프로필 이미지를 만든 프롬프트가 실사 안전 기준(${describeFloorTrip(screen.classification)})에 걸려 얼굴 참조로 쓰지 않습니다`,
+        screen
+      }
+    : undefined;
+}
+
+/**
+ * Whether photo text holds one real Latin-script word: three or more letters standing as a word of their own (NFKC
+ * first, so full-width letters count). A token with a digit or a bracket in it is not a word — "1girl", "image1",
+ * "<image1>", "%prompt%" are syntax — and invisible characters, symbols and emoji carry no letters at all.
+ */
+function hasReadablePhotoWord(text: string): boolean {
+  return text
+    .normalize("NFKC")
+    .split(/[\s,;:.!?()"'\u2018\u2019\u201c\u201d\u2013\u2014/]+/u)
+    .some((token) => /^\p{Script=Latin}{3,}$/u.test(token));
+}
+
+/**
+ * The literal text of a custom ComfyUI workflow that the safety floor refuses, one entry per offending input. The
+ * template sends that text with every cut — "A fully naked 14 year old girl. %prompt%" turns every clean cut into
+ * that picture — and the text reaches the encoder as written, so it is read like a finished photo prompt (Korean
+ * included: nothing strips it). Each literal is read whole, placeholders taken out (so a phrase split around
+ * %prompt% still reads as one), and piece by piece; then, when no single literal trips it, all of them together,
+ * since a template can spread one phrase over encoders whose conditionings the sampler combines ("She is a girl" in
+ * one node, "of twelve" in another). The built graph is read the same way at plan time and dispatch
+ * (screenBuiltPhotorealWorkflow); reading it here too lets the settings screen say so.
+ */
+export function screenCustomWorkflowTemplate(
+  state: AppState,
+  workflowJson: string | undefined,
+  forcedBackend?: ImageBackendId
+): CustomWorkflowRefusal[] {
+  if (typeof workflowJson !== "string" || !workflowJson.trim()) {
+    return [];
+  }
+  const literals = listCustomWorkflowLiteralTexts(workflowJson);
+  const refusals = literals.flatMap((literal): CustomWorkflowRefusal[] => {
+    const screen = readPhotoPromptText(state, [literal.text, ...literal.fragments], forcedBackend);
+    return screen.decision.locked ? [{ ...screen, literal }] : [];
+  });
+  if (refusals.length > 0 || literals.length < 2) {
+    return refusals;
+  }
+  const joined = readPhotoPromptText(state, [literals.map((literal) => literal.text).join(" ")], forcedBackend);
+  return joined.decision.locked ? [joined] : [];
+}
+
+/**
+ * Everything wrong with a custom workflow template, in the settings screen's Korean: its structure
+ * (validateCustomWorkflowTemplate) and its own words read by the safety floor. A template with either kind of error
+ * is never used — the planner routes its cuts to NovelAI and the executor refuses to send it.
+ */
+export function validatePhotorealCustomWorkflow(state: AppState, workflowJson: string): string[] {
+  const floorErrors = screenCustomWorkflowTemplate(state, workflowJson).map(
+    (refusal) =>
+      `${describeWorkflowLiteralLocation(refusal.literal)}: 실사 안전 기준(${describeFloorTrip(refusal.classification)})에 걸리는 고정 문구가 있어 이 워크플로는 쓰지 않습니다.`
+  );
+  return [...validateCustomWorkflowTemplate(workflowJson), ...floorErrors];
+}
+
+function describeWorkflowLiteralLocation(literal: ComfyWorkflowLiteralText | undefined): string {
+  return literal ? `노드 "${literal.nodeId}" (${literal.classType || "?"})의 입력 "${literal.input}"` : "여러 노드의 고정 문구를 이어 읽은 문장";
+}
+
+/** Which part of the floor tripped, in a few words, for messages that are not about a scene. */
+function describeFloorTrip(classification: SceneClassification): string {
+  if (classification.category === "explicit") {
+    return "노출·성적 표현";
+  }
+  if (classification.minorCoded) {
+    return "미성년";
+  }
+  if (classification.schoolCoded && classification.suggestive) {
+    return "학생·교복과 노출";
+  }
+  return classification.unverifiable ? "확인할 수 없는 영문 외 문자" : "안전 기준";
+}
+
+/** The planner's half of the custom-workflow rule: a cut on a template the floor refuses becomes a locked NovelAI cut. */
+function screenPlannedCustomWorkflow(
+  state: AppState,
+  presetId: PhotorealWorkflowPresetId,
+  routing: ImageBackendDecision,
+  forcedBackend?: ImageBackendId
+): ImageBackendDecision | undefined {
+  if (presetId !== "custom") {
+    return undefined;
+  }
+  const [refusal] = screenCustomWorkflowTemplate(state, readPhotorealSettings(state).customWorkflow, forcedBackend);
+  if (!refusal) {
+    return undefined;
+  }
+  return {
+    ...refusal.decision,
+    category: routing.category,
+    mode: routing.mode,
+    reason: `사용자 워크플로의 고정 문구가 실사 안전 기준에 걸려 NovelAI로 바꿨습니다 (${describeWorkflowLiteralLocation(refusal.literal)}) · ${refusal.decision.reason}`,
+    signals: uniqueStrings([...routing.signals, ...readFloorSignals(refusal.classification).map((signal) => `workflow:${signal}`)])
+  };
+}
+
+function readFloorSignals(classification: SceneClassification): string[] {
+  return classification.signals.filter((signal) => /^(?:explicit|minor|school|suggestive|unverifiable-script):/u.test(signal));
+}
+
+/**
+ * The last check before a photo prompt leaves the planner: the FINISHED prompt is classified sentence by sentence,
+ * and a prompt the floor refuses turns the cut into a locked NovelAI one. Everything in it was read upstream, so
+ * this only fires when an upstream reading missed something — a phrase the builder assembled from parts that were
+ * harmless apart, a lexicon gap at the tag layer, a new source of text added to the builder later. It exists so
+ * that the floor holds on what is sent, whatever the layers before it did.
+ */
+export function screenFinishedPhotorealPrompt(
+  state: AppState,
+  prompt: string,
+  routing: ImageBackendDecision,
+  forcedBackend?: ImageBackendId
+): ImageBackendDecision | undefined {
+  const { classification: screen, decision } = readPhotoPromptText(state, [prompt], forcedBackend);
+  if (!decision.locked) {
+    return undefined;
+  }
+  return {
+    ...decision,
+    // The cut keeps its own category unless the photo prompt itself turned out explicit.
+    category: screen.category === "explicit" ? "explicit" : routing.category,
+    mode: routing.mode,
+    reason: `완성된 실사 프롬프트가 안전 기준에 걸려 NovelAI로 바꿨습니다 · ${decision.reason}`,
+    signals: uniqueStrings([...routing.signals, ...readFloorSignals(screen).map((signal) => `photo-prompt:${signal}`)])
+  };
+}
+
+/**
+ * The floor's reading of a BUILT graph — every picture-side string as it is sent (listPhotorealGraphPictureTexts),
+ * Korean included since nothing strips it there — or undefined when the floor lets it through. Each string is read on
+ * its own, so a refusal can say where it is, and then all of them together, because a template can spread one phrase
+ * over several nodes whose conditionings the sampler combines. The planner and the dispatch both read the graph here.
+ */
+export function screenBuiltPhotorealWorkflow(
+  state: AppState,
+  workflow: ComfyApiWorkflow,
+  forcedBackend?: ImageBackendId
+): PhotorealGraphRefusal | undefined {
+  const texts = listPhotorealGraphPictureTexts(workflow);
+  for (const text of texts) {
+    const screen = readPhotoPromptText(state, [text.text], forcedBackend);
+    if (screen.decision.locked) {
+      return { ...screen, text };
+    }
+  }
+  if (texts.length < 2) {
+    return undefined;
+  }
+  const joined = readPhotoPromptText(state, [texts.map((text) => text.text).join(" ")], forcedBackend);
+  return joined.decision.locked ? joined : undefined;
+}
+
+function describeGraphTextLocation(refusal: PhotorealGraphRefusal): string {
+  return refusal.text
+    ? `노드 "${refusal.text.nodeId}" (${refusal.text.classType || "?"})의 입력 "${refusal.text.input}"`
+    : "여러 노드의 글을 이어 읽은 문장";
+}
+
+/**
+ * The planner's half of the built-graph rule. The graph is built exactly as the executor will build it (same
+ * preparation, no network) and read; a refusal makes the cut a locked NovelAI one, like every other photo refusal.
+ * A graph that cannot be built at all — a custom template that breaks a structural rule (a %steps% inside a sentence,
+ * a CFG below 1, a file LoadImage) or needs more face references than this cut has — is the same kind of refusal:
+ * a photoreal cut that can only fail when it runs is better planned on NovelAI now, with the reason on it.
+ */
+function screenPlannedPhotorealGraph(
+  state: AppState,
+  plan: PhotorealJobPlan,
+  routing: ImageBackendDecision,
+  forcedBackend?: ImageBackendId
+): ImageBackendDecision | undefined {
+  let workflow: ComfyApiWorkflow;
+  try {
+    workflow = buildPhotorealRequestWorkflow({
+      state,
+      prompt: plan.prompt,
+      negativePrompt: plan.negativePrompt,
+      presetId: plan.presetId,
+      references: plan.references,
+      // Fixed stand-ins: neither reaches any text (numbers may only fill number inputs), and a plan must not mint ids.
+      jobId: "plan_check",
+      seed: 0
+    }).workflow;
+  } catch (error) {
+    const message = (error instanceof Error ? error.message : String(error)).replace(/^실사 이미지 생성 실패:\s*/u, "");
+    return {
+      backend: "novelai",
+      category: routing.category,
+      mode: routing.mode,
+      reason: `실사 워크플로로 이 컷의 그래프를 만들 수 없어 NovelAI로 바꿨습니다 · ${message}`,
+      locked: true,
+      fallback: false,
+      signals: uniqueStrings([...routing.signals, "photo-graph:unbuildable"])
+    };
+  }
+  const refusal = screenBuiltPhotorealWorkflow(state, workflow, forcedBackend);
+  if (!refusal) {
+    return undefined;
+  }
+  return {
+    ...refusal.decision,
+    category: refusal.classification.category === "explicit" ? "explicit" : routing.category,
+    mode: routing.mode,
+    reason: `실사로 보낼 그래프의 글(${describeGraphTextLocation(refusal)})이 안전 기준에 걸려 NovelAI로 바꿨습니다 · ${refusal.decision.reason}`,
+    signals: uniqueStrings([...routing.signals, ...readFloorSignals(refusal.classification).map((signal) => `photo-graph:${signal}`)])
+  };
+}
+
+/**
+ * NovelAI Precise Reference for the cut's primary registered figure, when the user opted in and that character
+ * has a NovelAI profile image. One reference per cut, for the first registered figure in frame (the one the cut
+ * is about): each reference is billed per image, and the request has no way to say which figure a reference
+ * belongs to, so a second face would only compete with the first.
+ */
+function planNovelAiCharacterReference(state: AppState, promptPlan: ImagePromptPlan): PlannedNovelAiCharacterReference | undefined {
+  if (state.novelAi.characterReferenceEnabled !== true) {
+    return undefined;
+  }
+  const primary = promptPlan.characterPrompts.find(
+    (characterPrompt) =>
+      Boolean(characterPrompt.characterId) &&
+      !isUnregisteredFigure(
+        promptToTags(characterPrompt.prompt),
+        resolveRegisteredCharacterTags(state, characterPrompt.characterId).identity
+      )
+  );
+  if (!primary?.characterId) {
+    return undefined;
+  }
+  const referenceObjectKey = findVisualProfile(state, primary.characterId)?.profileImages?.novelai?.referenceObjectKey;
+  const objectKey = typeof referenceObjectKey === "string" ? referenceObjectKey.trim() : "";
+  return objectKey ? { characterId: primary.characterId, objectKey } : undefined;
+}
+
+/**
+ * True when a composed figure carries a character id but is not that character: the composer's cross-gender
+ * guard skipped the saved identity because the authored tags describe the opposite gender (typically a male NPC
+ * the tag model attached to a registered heroine's id). Detected from the composed tags, which then lack the
+ * identity's subject tags that composition otherwise always puts first.
+ */
+function isUnregisteredFigure(composedTags: string[], identity: string[]): boolean {
+  const { subject } = splitSubjectIdentityTags(identity);
+  if (subject.length === 0) {
+    return false;
+  }
+  const composed = new Set(composedTags.map((tag) => stripNovelAiTagWeight(tag)));
+  if (subject.some((tag) => composed.has(stripNovelAiTagWeight(tag)))) {
+    return false;
+  }
+  return (
+    (hasMaleSubjectAssertion(composedTags) && hasFemaleSubjectAssertion(identity)) ||
+    (hasFemaleSubjectAssertion(composedTags) && hasMaleSubjectAssertion(identity))
+  );
+}
+
+function findVisualProfile(state: AppState, characterId: Id | undefined): CharacterVisualProfile | undefined {
+  return characterId ? state.visualProfiles.find((candidate) => candidate.characterId === characterId) : undefined;
+}
+
+/** A state that never went through hydrateState (an old export, a hand-built fixture) plans on the defaults. */
+function readPhotorealSettings(state: AppState): PhotorealApiSettings {
+  return state.photoreal ?? DEFAULT_PHOTOREAL_SETTINGS;
+}
+
+function positiveNumberOr(value: unknown, fallback: number): number {
+  return isPositiveFiniteNumber(value) ? value : fallback;
+}
+
+function isPositiveFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
 function resolveImageGenerationCooldownTurns(profile: ImageGenerationProfile): number {
@@ -386,6 +1103,8 @@ export async function executeImageJob(
   job: ImageGenerationJob,
   options: {
     onProgress?: (progress: ImageJobProgressResult) => void | Promise<void>;
+    /** Cancels the provider request. A cancelled job comes back `canceled`, never `failed`. */
+    signal?: AbortSignal;
   } = {}
 ): Promise<ImageJobExecutionResult> {
   const policy = job.providerPayload.policy as ImagePolicyResult | undefined;
@@ -402,11 +1121,17 @@ export async function executeImageJob(
     };
   }
 
+  const backend = resolveImageJobBackend(job);
   const cue = cueFromJob(job);
   const count = Number(job.providerPayload.count ?? 1);
   const promptVariants = readPromptVariants(job, cue, count);
+  // Every provider request below goes through this one requester, so the three request sites (several variants,
+  // several copies of one prompt, a single image) cannot disagree about which backend serves the job.
+  const requester = createJobImageRequester(state, job, backend, options.signal);
+  const assetOrigin = readAssetOrigin(job, backend);
   let dataUrls: string[] = [];
   let error: string | undefined;
+  let canceled = false;
   let providerPayload: Record<string, unknown> = {
     ...job.providerPayload,
     mode: "provider-result-pending"
@@ -417,15 +1142,14 @@ export async function executeImageJob(
     if (promptVariants.length > 1) {
       const variantResults = [];
       for (const [variantIndex, variant] of promptVariants.entries()) {
-        await waitForSequentialNovelAiSlot(state, variantIndex);
-        const result = await generateNovelAiImages({
-          state,
+        await waitForSequentialImageSlot(state, backend, variantIndex);
+        const result = await requester.request({
           prompt: variant.prompt,
           negativePrompt: job.negativePrompt,
           cue: variant.cue,
-          count: 1
+          label: variant.label,
+          requestIndex: variantIndex
         });
-        assertNovelAiResultHasImages(state, result.dataUrls, variant.label);
         dataUrls.push(...result.dataUrls.slice(0, 1));
         variantResults.push({
           label: variant.label,
@@ -457,7 +1181,8 @@ export async function executeImageJob(
           variant.cue,
           progressiveAssets.length,
           result.dataUrls[0],
-          partialProviderPayload
+          partialProviderPayload,
+          assetOrigin
         );
         progressiveAssets.push(partialAsset);
         await options.onProgress?.({
@@ -467,7 +1192,8 @@ export async function executeImageJob(
             providerPayload: partialProviderPayload,
             assetIds: progressiveAssets.map((asset) => asset.id),
             representativeAssetId: progressiveAssets[0]?.id,
-            updatedAt: new Date().toISOString()
+            updatedAt: new Date().toISOString(),
+            policyWarnings: mergePolicyWarnings(job, requester.warnings)
           },
           asset: partialAsset,
           assets: [...progressiveAssets]
@@ -493,15 +1219,14 @@ export async function executeImageJob(
       const variant = promptVariants[0] ?? { label: "main", prompt: job.prompt, tags: [], cue };
       const variantResults = [];
       for (let requestIndex = 0; requestIndex < count; requestIndex += 1) {
-        await waitForSequentialNovelAiSlot(state, requestIndex);
-        const result = await generateNovelAiImages({
-          state,
+        await waitForSequentialImageSlot(state, backend, requestIndex);
+        const result = await requester.request({
           prompt: variant.prompt,
           negativePrompt: job.negativePrompt,
           cue: variant.cue,
-          count: 1
+          label: `${variant.label}-${requestIndex + 1}`,
+          requestIndex
         });
-        assertNovelAiResultHasImages(state, result.dataUrls, `${variant.label}-${requestIndex + 1}`);
         dataUrls.push(...result.dataUrls.slice(0, 1));
         variantResults.push({
           label: `${variant.label}-${requestIndex + 1}`,
@@ -533,7 +1258,8 @@ export async function executeImageJob(
           variant.cue,
           progressiveAssets.length,
           result.dataUrls[0],
-          partialProviderPayload
+          partialProviderPayload,
+          assetOrigin
         );
         progressiveAssets.push(partialAsset);
         await options.onProgress?.({
@@ -543,7 +1269,8 @@ export async function executeImageJob(
             providerPayload: partialProviderPayload,
             assetIds: progressiveAssets.map((asset) => asset.id),
             representativeAssetId: progressiveAssets[0]?.id,
-            updatedAt: new Date().toISOString()
+            updatedAt: new Date().toISOString(),
+            policyWarnings: mergePolicyWarnings(job, requester.warnings)
           },
           asset: partialAsset,
           assets: [...progressiveAssets]
@@ -566,18 +1293,20 @@ export async function executeImageJob(
         plannedCue: job.providerPayload.cue
       };
     } else {
-      const result = await generateNovelAiImages({
-        state,
+      const result = await requester.request({
         prompt: job.prompt,
         negativePrompt: job.negativePrompt,
         cue,
-        count: 1
+        label: "main",
+        requestIndex: 0
       });
-      assertNovelAiResultHasImages(state, result.dataUrls);
       dataUrls = result.dataUrls;
       providerPayload = {
         ...job.providerPayload,
         ...result.payload,
+        // The provider's result describes the request that was sent; it does not get to re-route the cut. The
+        // photoreal client's payload carries its own `provider`, and a future one could carry anything.
+        ...readPlannedRoutingFields(job),
         dynamicchatJobId: job.id,
         dynamicchatPayloadVersion: "dynamicchat-image-result-v1",
         policy,
@@ -592,7 +1321,35 @@ export async function executeImageJob(
       };
     }
   } catch (caught) {
-    error = caught instanceof Error ? caught.message : "Unknown NovelAI error";
+    // A cancel is the user's decision, not a provider failure: as `failed` it would raise the failure toast for
+    // a cut the user had just stopped on purpose.
+    if (isImageRequestCancellation(caught, options.signal)) {
+      canceled = true;
+    } else {
+      error = caught instanceof Error ? caught.message : describeUnknownImageError(backend);
+    }
+    // A refused cut keeps no face references: whatever runs this job again must re-plan them, not reuse them.
+    if (caught instanceof PhotorealDispatchRefusal) {
+      providerPayload = { ...providerPayload, photorealReferences: [], dispatchRefused: true };
+    }
+  }
+
+  const policyWarnings = mergePolicyWarnings(job, requester.warnings);
+  if (canceled) {
+    const canceledAt = new Date().toISOString();
+    return {
+      job: {
+        ...job,
+        status: "canceled",
+        providerPayload,
+        assetIds: [],
+        completedAt: canceledAt,
+        updatedAt: canceledAt,
+        error: undefined,
+        policyWarnings
+      },
+      assets: []
+    };
   }
 
   const assetCount = Math.max(promptVariants.length > 1 ? promptVariants.length : count, dataUrls.length || 1);
@@ -614,7 +1371,8 @@ export async function executeImageJob(
           variant?.cue ?? cue,
           index,
           dataUrls[index],
-          providerPayload
+          providerPayload,
+          assetOrigin
         );
       });
   const representativeAssetId = assets[0]?.id;
@@ -628,10 +1386,273 @@ export async function executeImageJob(
       representativeAssetId,
       completedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      error
+      error,
+      policyWarnings
     },
     assets
   };
+}
+
+/**
+ * The one place a job's provider requests are made. Photoreal goes to the local ComfyUI relay with the planned
+ * preset and face references; NovelAI goes to NovelAI with its Precise Reference bytes when one was planned.
+ */
+function createJobImageRequester(
+  state: AppState,
+  job: ImageGenerationJob,
+  backend: ImageBackendId,
+  signal?: AbortSignal
+): JobImageRequester {
+  const warnings: string[] = [];
+  const requestedSeed = readRequestedSeed(job);
+
+  if (backend === "photoreal") {
+    const references = readPlannedPhotorealReferences(job);
+    const presetId = readPlannedPhotorealPresetId(job, state, references.length > 0);
+    return {
+      warnings,
+      async request(input) {
+        assertPhotorealDispatchAllowed(state, input.prompt, presetId, references);
+        const result = await generatePhotorealImages({
+          state,
+          prompt: input.prompt,
+          negativePrompt: input.negativePrompt,
+          cue: input.cue,
+          presetId,
+          references,
+          jobId: job.id,
+          seed: requestedSeed === undefined ? undefined : requestedSeed + input.requestIndex,
+          signal,
+          // The very graph that is about to leave, after every substitution — not a rebuild of it.
+          inspectWorkflow: (built) => assertPhotorealGraphAllowed(state, built.workflow)
+        });
+        assertPhotorealResultHasImages(state, result.dataUrls, input.label);
+        return result;
+      }
+    };
+  }
+
+  let characterReference: Promise<NovelAiCharacterReferenceInput | undefined> | undefined;
+  return {
+    warnings,
+    async request(input) {
+      // Read once per job: a multi-image job sends the same reference with every request.
+      characterReference ??= loadNovelAiCharacterReference(state, job, warnings, signal);
+      const reference = await characterReference;
+      const result = await generateNovelAiImages({
+        state: requestedSeed === undefined ? state : withNovelAiSeed(state, requestedSeed + input.requestIndex),
+        prompt: input.prompt,
+        negativePrompt: input.negativePrompt,
+        cue: input.cue,
+        count: 1,
+        signal,
+        ...(reference ? { characterReference: reference } : {})
+      });
+      assertNovelAiResultHasImages(state, result.dataUrls, input.label);
+      return result;
+    }
+  };
+}
+
+/**
+ * The floor's last look at a photoreal request, as it leaves. A job keeps the prompt it was planned with, and a queued
+ * one survives a reload — so a cut planned under an older rule set, or one whose face reference has since lost its
+ * standing, would otherwise go out exactly as planned. Re-read here, against what is live:
+ * - the prompt being sent, as the finished-prompt gate reads it;
+ * - a custom workflow's own text (the template is read when the cut runs, not when it was planned);
+ * - each face reference against the character's CURRENT profile image: still that image, still vouched for;
+ * - and then, as it leaves, the graph all of that was built into (assertPhotorealGraphAllowed, through
+ *   generatePhotorealImages' inspectWorkflow).
+ * A refusal fails the cut. It is never re-sent to NovelAI on its own: that spends Anlas the user did not ask to spend,
+ * and a regeneration re-plans the cut under the current floor anyway.
+ */
+function assertPhotorealDispatchAllowed(
+  state: AppState,
+  prompt: string,
+  presetId: PhotorealWorkflowPresetId,
+  references: PhotorealReferenceInput[]
+): void {
+  const promptScreen = readPhotoPromptText(state, [prompt]);
+  if (promptScreen.decision.locked) {
+    throw new PhotorealDispatchRefusal(
+      `실사 이미지 생성 실패: 이 컷의 실사 프롬프트가 지금의 실사 안전 기준(${describeFloorTrip(promptScreen.classification)})에 걸려 보내지 않았습니다. NovelAI로 저절로 바꾸어 생성하지는 않습니다 — 다시 생성하면 지금 기준으로 다시 계획됩니다.`
+    );
+  }
+  if (presetId === "custom") {
+    const [templateRefusal] = screenCustomWorkflowTemplate(state, readPhotorealSettings(state).customWorkflow);
+    if (templateRefusal) {
+      throw new PhotorealDispatchRefusal(
+        `실사 이미지 생성 실패: 사용자 워크플로(JSON)의 고정 문구가 실사 안전 기준(${describeFloorTrip(templateRefusal.classification)})에 걸려 보내지 않았습니다 (${describeWorkflowLiteralLocation(templateRefusal.literal)}). 설정에서 워크플로를 고치세요.`
+      );
+    }
+  }
+  for (const reference of references) {
+    const reason = describeStaleReference(state, reference);
+    if (reason) {
+      const name = state.characters.find((character) => character.id === reference.characterId)?.name ?? reference.characterId ?? reference.name;
+      throw new PhotorealDispatchRefusal(
+        `실사 이미지 생성 실패: ${name}의 얼굴 참조 이미지를 쓸 수 없어 보내지 않았습니다 (${reason}). 다시 생성하면 지금의 프로필 기준으로 계획됩니다.`
+      );
+    }
+  }
+}
+
+/**
+ * The dispatch half of the built-graph rule (screenBuiltPhotorealWorkflow), run on the graph generatePhotorealImages
+ * is about to send. The pieces were read already; this reads what they became — template literals, the style and the
+ * prompt in one string — and refuses the cut, never re-sending it to NovelAI (see assertPhotorealDispatchAllowed).
+ */
+function assertPhotorealGraphAllowed(state: AppState, workflow: ComfyApiWorkflow): void {
+  const refusal = screenBuiltPhotorealWorkflow(state, workflow);
+  if (refusal) {
+    throw new PhotorealDispatchRefusal(
+      `실사 이미지 생성 실패: 보내려던 실사 그래프의 글(${describeGraphTextLocation(refusal)})이 지금의 실사 안전 기준(${describeFloorTrip(refusal.classification)})에 걸려 보내지 않았습니다. NovelAI로 저절로 바꾸어 생성하지는 않습니다 — 설정의 스타일 문장이나 사용자 워크플로를 확인하세요.`
+    );
+  }
+}
+
+/** Why a planned face reference may no longer be sent, or undefined while the character's live profile still vouches for it. */
+function describeStaleReference(state: AppState, reference: PhotorealReferenceInput): string | undefined {
+  const image = reference.characterId ? findVisualProfile(state, reference.characterId)?.profileImages?.photoreal : undefined;
+  const objectKey = typeof image?.objectKey === "string" ? image.objectKey.trim() : "";
+  if (!objectKey || objectKey !== reference.objectKey) {
+    return "계획한 뒤 캐릭터의 실사 프로필 이미지가 바뀌었거나 해제되었습니다";
+  }
+  return screenPhotorealReferenceImage(state, image)?.reason;
+}
+
+const NOVELAI_REFERENCE_UNAVAILABLE_WARNING =
+  "캐릭터 레퍼런스(Precise Reference) 이미지를 불러오지 못해 이 컷은 레퍼런스 없이 생성했습니다. 캐릭터의 NovelAI 프로필 이미지를 다시 지정해 보세요.";
+// NovelAiApiSettings documents these as the defaults for an unset knob.
+const NOVELAI_REFERENCE_DEFAULT_STRENGTH = 0.85;
+const NOVELAI_REFERENCE_DEFAULT_FIDELITY = 1;
+
+/**
+ * The planned Precise Reference's bytes, or undefined when the cut goes without one. A reference that cannot be
+ * read (deleted object, API server down) degrades to "generate without it" with a warning on the job rather
+ * than failing the cut: the face drifts a little, which is better than no picture.
+ */
+async function loadNovelAiCharacterReference(
+  state: AppState,
+  job: ImageGenerationJob,
+  warnings: string[],
+  signal?: AbortSignal
+): Promise<NovelAiCharacterReferenceInput | undefined> {
+  const planned = readPlannedNovelAiCharacterReference(job);
+  // Re-checked against live settings: the reference costs Anlas, so turning it off must stop it for cuts
+  // that were planned while it was on.
+  if (!planned || state.novelAi.characterReferenceEnabled !== true) {
+    return undefined;
+  }
+  // A dry run never sends the request, so there is nothing to read the reference for.
+  if (!state.novelAi.enabled || state.novelAi.requestMode === "mock") {
+    return undefined;
+  }
+  const imageBase64 = await fetchObjectAsBase64(planned.objectKey, signal);
+  if (!imageBase64) {
+    if (!signal?.aborted) {
+      warnings.push(NOVELAI_REFERENCE_UNAVAILABLE_WARNING);
+    }
+    return undefined;
+  }
+  return {
+    imageBase64,
+    strength: state.novelAi.characterReferenceStrength ?? NOVELAI_REFERENCE_DEFAULT_STRENGTH,
+    fidelity: state.novelAi.characterReferenceFidelity ?? NOVELAI_REFERENCE_DEFAULT_FIDELITY,
+    styleAware: state.novelAi.characterReferenceStyleAware === true
+  };
+}
+
+function readPlannedNovelAiCharacterReference(job: ImageGenerationJob): PlannedNovelAiCharacterReference | undefined {
+  const value = job.providerPayload.characterReference;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const objectKey = typeof record.objectKey === "string" ? record.objectKey.trim() : "";
+  const characterId = typeof record.characterId === "string" ? record.characterId : "";
+  return objectKey && characterId ? { characterId, objectKey } : undefined;
+}
+
+function readPlannedPhotorealReferences(job: ImageGenerationJob): PhotorealReferenceInput[] {
+  const value = job.providerPayload.photorealReferences;
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry): PhotorealReferenceInput[] => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return [];
+    }
+    const record = entry as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    const objectKey = typeof record.objectKey === "string" ? record.objectKey.trim() : "";
+    if (!name || !objectKey) {
+      return [];
+    }
+    return [
+      {
+        name,
+        objectKey,
+        ...(typeof record.characterId === "string" ? { characterId: record.characterId } : {}),
+        ...(isPositiveFiniteNumber(record.width) ? { width: record.width } : {}),
+        ...(isPositiveFiniteNumber(record.height) ? { height: record.height } : {})
+      }
+    ];
+  });
+}
+
+/** The planned preset; a job planned before its preset existed (or edited by hand) re-resolves like the planner. */
+function readPlannedPhotorealPresetId(job: ImageGenerationJob, state: AppState, hasReferences: boolean): PhotorealWorkflowPresetId {
+  const planned = job.providerPayload.presetId;
+  if (typeof planned === "string" && Object.prototype.hasOwnProperty.call(PHOTOREAL_WORKFLOW_PRESETS, planned)) {
+    return planned as PhotorealWorkflowPresetId;
+  }
+  return resolvePhotorealPresetForCut(readPhotorealSettings(state), hasReferences);
+}
+
+/** A seed the planner asked for (the creation screen's candidates each get their own), else none. */
+function readRequestedSeed(job: ImageGenerationJob): number | undefined {
+  const value = job.providerPayload.seed;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
+}
+
+// NovelAI seeds are 32-bit unsigned.
+const NOVELAI_SEED_MODULUS = 4_294_967_295;
+
+/** NovelAI reads its seed from settings, so a requested seed is applied by pinning it for this request only. */
+function withNovelAiSeed(state: AppState, seed: number): AppState {
+  return { ...state, novelAi: { ...state.novelAi, seed: seed % NOVELAI_SEED_MODULUS, seedFixed: true } };
+}
+
+/** Routing fields the provider result must not overwrite when it is merged into the payload. */
+function readPlannedRoutingFields(job: ImageGenerationJob): Record<string, unknown> {
+  const payload = job.providerPayload;
+  return {
+    ...(payload.provider !== undefined ? { provider: payload.provider } : {}),
+    ...(payload.sceneCategory !== undefined ? { sceneCategory: payload.sceneCategory } : {}),
+    ...(payload.routing !== undefined ? { routing: payload.routing } : {})
+  };
+}
+
+function readAssetOrigin(job: ImageGenerationJob, backend: ImageBackendId): { backend: ImageBackendId; sceneCategory?: ImageSceneCategory } {
+  const category = job.routing?.category ?? job.providerPayload.sceneCategory;
+  return typeof category === "string" && category ? { backend, sceneCategory: category as ImageSceneCategory } : { backend };
+}
+
+function mergePolicyWarnings(job: ImageGenerationJob, warnings: string[]): string[] | undefined {
+  return warnings.length > 0 ? uniqueStrings([...(job.policyWarnings ?? []), ...warnings]) : job.policyWarnings;
+}
+
+function isImageRequestCancellation(caught: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) {
+    return true;
+  }
+  // DOMException is not an Error subclass in every runtime, so the name is checked directly.
+  return typeof caught === "object" && caught !== null && (caught as { name?: unknown }).name === "AbortError";
+}
+
+function describeUnknownImageError(backend: ImageBackendId): string {
+  return backend === "photoreal" ? "실사 이미지 생성 실패: 알 수 없는 오류" : "Unknown NovelAI error";
 }
 
 // `state` is threaded in so the empty-result case can name the real cause. NovelAI returns no images for two
@@ -649,6 +1670,29 @@ function assertNovelAiResultHasImages(state: AppState, dataUrls: string[], label
     throw new Error("NovelAI가 mock 모드입니다. 실제 이미지를 생성하려면 요청 모드를 proxy 또는 direct로 바꾸세요.");
   }
   throw new Error(`NovelAI response contained no image files for ${label}.`);
+}
+
+/** The photoreal twin of assertNovelAiResultHasImages: a dry run names the setting, not ComfyUI. */
+function assertPhotorealResultHasImages(state: AppState, dataUrls: string[], label = "main"): void {
+  if (dataUrls.length > 0) {
+    return;
+  }
+  const settings = readPhotorealSettings(state);
+  if (!settings.enabled) {
+    throw new Error("실사 이미지(ComfyUI) 연동이 꺼져 있어 이미지를 생성하지 않았습니다. 설정에서 실사 이미지를 활성화하세요.");
+  }
+  if (settings.requestMode === "mock") {
+    throw new Error("실사 이미지가 mock 모드입니다. 실제 이미지를 생성하려면 요청 모드를 proxy로 바꾸세요.");
+  }
+  throw new Error(`실사 이미지 생성 실패: ComfyUI 응답에 ${label} 이미지가 없습니다.`);
+}
+
+/** NovelAI's anti-burst delay between a job's sequential requests. A local GPU has no rate limit to respect. */
+async function waitForSequentialImageSlot(state: AppState, backend: ImageBackendId, requestIndex: number): Promise<void> {
+  if (backend !== "novelai") {
+    return;
+  }
+  await waitForSequentialNovelAiSlot(state, requestIndex);
 }
 
 async function waitForSequentialNovelAiSlot(state: AppState, requestIndex: number): Promise<void> {
@@ -688,7 +1732,7 @@ export function pickStoredAsset(state: AppState, cue: ImageCue): ImageAsset | un
 export function findReusableImageAsset(
   state: AppState,
   job: ImageGenerationJob,
-  options: { excludeAssetIds?: string[]; threshold?: number } = {}
+  options: { excludeAssetIds?: string[]; threshold?: number; backend?: ImageBackendId } = {}
 ): ImageReuseMatch | undefined {
   if (shouldBypassImageReuse(state, job)) {
     return undefined;
@@ -702,15 +1746,22 @@ export function findReusableImageAsset(
 
   const excludedIds = new Set(options.excludeAssetIds ?? []);
   const threshold = options.threshold ?? 0.82;
+  // A cut is only ever served by an image from its own renderer. The reuse score is tag overlap, and a photo and
+  // an anime drawing of the same tags match perfectly — reusing across backends would drop an anime frame into a
+  // photoreal sequence (or the reverse) that the routing had deliberately kept apart.
+  const backend = options.backend ?? resolveImageJobBackend(job);
+  const targetSize = resolveBackendOutputSize(state, backend);
   const candidates = state.imageAssets
     .filter((asset) =>
       asset.simulationId === state.simulation.id &&
       asset.source === "generated" &&
+      (asset.backend ?? "novelai") === backend &&
       !excludedIds.has(asset.id) &&
       asset.feedback?.rating !== "rejected" &&
       // Only reuse an asset whose rendered size matches the currently configured resolution; otherwise reusing an older
       // asset would silently ignore a changed width/height (e.g. serving a square 1024² image after switching to 832×1216).
-      assetMatchesConfiguredResolution(asset, state)
+      // The size is the backend's own: photoreal renders at its native buckets, not at NovelAI's profile size.
+      assetMatchesConfiguredResolution(asset, targetSize)
     )
     .map((asset) => scoreReusableImageAsset(asset, cue, targetTags))
     .filter((match): match is ImageReuseMatch => match !== undefined && match.score >= threshold)
@@ -728,9 +1779,16 @@ export function findReusableImageAsset(
   return candidates[0];
 }
 
-function assetMatchesConfiguredResolution(asset: ImageAsset, state: AppState): boolean {
-  const targetWidth = Math.round(Number(state.imageProfile.width));
-  const targetHeight = Math.round(Number(state.imageProfile.height));
+/** The size a new cut on `backend` would be rendered at. */
+function resolveBackendOutputSize(state: AppState, backend: ImageBackendId): { width: number; height: number } {
+  return backend === "photoreal"
+    ? resolvePhotorealOutputSize(state)
+    : { width: state.imageProfile.width, height: state.imageProfile.height };
+}
+
+function assetMatchesConfiguredResolution(asset: ImageAsset, target: { width: number; height: number }): boolean {
+  const targetWidth = Math.round(Number(target.width));
+  const targetHeight = Math.round(Number(target.height));
   if (!Number.isFinite(targetWidth) || !Number.isFinite(targetHeight) || targetWidth <= 0 || targetHeight <= 0) {
     return true;
   }
@@ -2231,7 +3289,8 @@ function createGeneratedAsset(
   cue: ImageCue,
   index: number,
   dataUrl?: string,
-  providerMetadata?: Record<string, unknown>
+  providerMetadata?: Record<string, unknown>,
+  origin: { backend: ImageBackendId; sceneCategory?: ImageSceneCategory } = { backend: "novelai" }
 ): ImageAsset {
   const palettes: Array<[string, string, string]> = [
     ["#213547", "#d5e1e8", "#f2b84b"],
@@ -2263,7 +3322,11 @@ function createGeneratedAsset(
     mimeType: dataUrl ? dataUrl.slice(5, dataUrl.indexOf(";")) : undefined,
     providerMetadata,
     reuseTags,
-    representative: index === 0
+    representative: index === 0,
+    // Top-level rather than read from providerMetadata: stored runs slim the metadata away, and the reuse filter,
+    // the badge and the gallery all need to know which renderer drew the image.
+    backend: origin.backend,
+    ...(origin.sceneCategory ? { sceneCategory: origin.sceneCategory } : {})
   };
 }
 
@@ -2286,8 +3349,14 @@ function findTurnIndex(state: AppState, turnId: string): number {
   return index >= 0 ? index : 0;
 }
 
-function validateImagePolicy(state: AppState, cue: ImageCue, count: number): ImagePolicyResult {
+function validateImagePolicy(state: AppState, cue: ImageCue, count: number, backend: ImageBackendId): ImagePolicyResult {
   const warnings: string[] = [];
+  // The count limit is a NovelAI setting guarding NovelAI spend (Anlas, the account's rate limits). A local
+  // photoreal cut costs neither, so it is neither stopped by the limit nor counted toward it — otherwise a
+  // photoreal-heavy session would silently use up the NovelAI cuts it never made.
+  if (backend !== "novelai") {
+    return { allowed: true, warnings };
+  }
   // Scoped to the CURRENT session, not the simulation's whole history. Counting every image ever completed
   // meant that once a long-running simulation crossed the limit (default 30) the pipeline stopped producing
   // images permanently and silently, while still paying for the annotation LLM call every turn. The setting
@@ -2296,7 +3365,10 @@ function validateImagePolicy(state: AppState, cue: ImageCue, count: number): Ima
     state.messages.filter((message) => message.sessionId === state.simulation.activeSessionId).map((message) => message.id)
   );
   const completedJobs = state.imageJobs.filter(
-    (job) => job.status === "completed" && (sessionJobIds.size === 0 || sessionJobIds.has(job.turnId))
+    (job) =>
+      job.status === "completed" &&
+      resolveImageJobBackend(job) === "novelai" &&
+      (sessionJobIds.size === 0 || sessionJobIds.has(job.turnId))
   ).length;
   const requestedTotal = completedJobs + count;
 
@@ -2331,6 +3403,7 @@ function cueFromJob(job: ImageGenerationJob): ImageCue {
     frame: normalizeImageCueFrame(cue?.frame, [
       ...(Array.isArray(cue?.baseTags) ? cue.baseTags : []),
       ...(Array.isArray(cue?.tags) ? cue.tags : [])
-    ])
+    ]),
+    kind: readCueKind(cue?.kind)
   };
 }

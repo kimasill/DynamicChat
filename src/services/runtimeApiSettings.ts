@@ -52,6 +52,7 @@ const PHOTOREAL_WORKFLOW_PRESET_IDS: Record<PhotorealWorkflowPresetId, true> = {
   custom: true
 };
 const PHOTOREAL_STYLE_PRESET_IDS: Record<PhotorealStylePresetId, true> = {
+  instagram: true,
   daily_look: true,
   film_portrait: true,
   cinematic: true,
@@ -98,10 +99,15 @@ export const DEFAULT_PHOTOREAL_SETTINGS: Readonly<PhotorealApiSettings> = Object
   width: 0,
   height: 0,
   seedFixed: false,
-  stylePreset: "daily_look",
+  // daily_look asked for a phone photo with lifted shadows and grain; people wanted the sharp, flattering
+  // influencer-feed look the name promised, so new simulations start from that.
+  stylePreset: "instagram",
   stylePrompt: "",
+  appearancePrompt: "",
   negativePrompt: "",
-  faceReferenceEnabled: true,
+  // Off until chosen: a profile image used as the reference held every later cut to that one photo's hair and
+  // makeup, which read as "the character's look is frozen" rather than as a convenience.
+  faceReferenceEnabled: false,
   vramHandoff: "auto",
   customWorkflow: "",
   timeoutSeconds: 300,
@@ -143,6 +149,7 @@ export function normalizePhotorealSettings(candidate: unknown): PhotorealApiSett
     ...(seed === undefined ? {} : { seed }),
     stylePreset: isPhotorealStylePresetId(source.stylePreset) ? source.stylePreset : defaults.stylePreset,
     stylePrompt: readString(source.stylePrompt, defaults.stylePrompt),
+    appearancePrompt: readString(source.appearancePrompt, defaults.appearancePrompt),
     negativePrompt: readString(source.negativePrompt, defaults.negativePrompt),
     faceReferenceEnabled: readBoolean(source.faceReferenceEnabled, defaults.faceReferenceEnabled),
     vramHandoff: source.vramHandoff === "auto" || source.vramHandoff === "off" ? source.vramHandoff : defaults.vramHandoff,

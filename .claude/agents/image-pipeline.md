@@ -1,7 +1,7 @@
 ---
 name: image-pipeline
 description: 이미지 생성 파이프라인 개발 전담. imageOrchestrator.ts(1822줄), novelAiClient.ts, novelAiModels.ts, contentRating.ts를 수정할 때 사용한다. NovelAI API 연동, 프롬프트 레이어 조립, 이미지 job 관리를 다룬다.
-model: claude-sonnet-4-6
+model: sonnet
 tools:
   - Read
   - Edit

@@ -231,6 +231,25 @@ export async function encodeNovelAiVibe(input: {
   return bytesToBase64(new Uint8Array(arrayBuffer));
 }
 
+/**
+ * Keeps NovelAI's emphasis syntax from swallowing a tag's trailing digits.
+ *
+ * NovelAI reads `<weight>::text::` as an emphasis group and, on the v4/v5 models, takes a number written
+ * straight against `::` as a weight. So in `1.5::artist:bm94199::` the closer is read as part of a group
+ * weighted ~94,199, the conditioning blows up, and every image comes back as pure noise — measured on
+ * nai-diffusion-5-full: noise with the group as written, a clean image with `1.5::artist:bm94199 ::`.
+ * Creators already wrote `pigeon666 ::` by hand for this reason; this does it for every closer, since the
+ * space changes nothing else (NovelAI trims whitespace inside a tag).
+ *
+ * Only a CLOSING `::` is touched. An opener is the bare number that starts a group (`1.5::`, `-2::`) and
+ * must keep its digits attached, or the group stops being weighted at all.
+ */
+export function protectEmphasisClosers(text: string): string {
+  return text.replace(/(^|[,\n]|\s)(-?\d+(?:\.\d+)?)::([\s\S]*?)::/gu, (match, lead: string, weight: string, body: string) =>
+    /\d$/u.test(body) ? `${lead}${weight}::${body} ::` : match
+  );
+}
+
 function createNovelAiPayload(input: {
   state: AppState;
   prompt: string;
@@ -240,6 +259,8 @@ function createNovelAiPayload(input: {
   characterReference?: NovelAiCharacterReferenceInput;
 }): Record<string, unknown> {
   const { state } = input;
+  const prompt = protectEmphasisClosers(input.prompt);
+  const negativePrompt = protectEmphasisClosers(input.negativePrompt);
   const model = resolveNovelAiModelName(state.novelAi.modelPreset, state.imageProfile.model);
   const seed = state.novelAi.seedFixed ? state.novelAi.seed : state.novelAi.seed ?? Math.floor(Math.random() * 4_294_967_295);
   const imageUserRules = createImageUserRulesForContentRating(state);
@@ -253,7 +274,7 @@ function createNovelAiPayload(input: {
     n_samples: 1,
     seed,
     extra_noise_seed: seed,
-    negative_prompt: input.negativePrompt,
+    negative_prompt: negativePrompt,
     cfg_rescale: state.novelAi.cfgRescale,
     ucPreset: state.novelAi.ucPreset,
     qualityToggle: Boolean(state.imageProfile.qualityPrompt),
@@ -306,15 +327,15 @@ function createNovelAiPayload(input: {
   if (model.includes("nai-diffusion-4") || model.includes("nai-diffusion-5")) {
     const cueCharacterPrompts = resolveNovelAiCharacterPrompts(input.cue);
     const characterCaptions: Array<{ char_caption: string; centers: Array<{ x: number; y: number }> }> = cueCharacterPrompts
-      .map((prompt, index, prompts) => ({
-        char_caption: prompt.prompt,
-        centers: [prompt.center ?? createDefaultCharacterCenter(index, prompts.length)]
+      .map((characterPrompt, index, prompts) => ({
+        char_caption: protectEmphasisClosers(characterPrompt.prompt),
+        centers: [characterPrompt.center ?? createDefaultCharacterCenter(index, prompts.length)]
       }))
       .filter((caption) => caption.char_caption.trim());
     const characterNegativeCaptions: Array<{ char_caption: string; centers: Array<{ x: number; y: number }> }> = cueCharacterPrompts
-      .map((prompt, index, prompts) => ({
-        char_caption: prompt.negativePrompt ?? "",
-        centers: [prompt.center ?? createDefaultCharacterCenter(index, prompts.length)]
+      .map((characterPrompt, index, prompts) => ({
+        char_caption: protectEmphasisClosers(characterPrompt.negativePrompt ?? ""),
+        centers: [characterPrompt.center ?? createDefaultCharacterCenter(index, prompts.length)]
       }))
       .filter((caption) => caption.char_caption.trim());
     const useCharacterCoords = characterCaptions.length > 1;
@@ -325,7 +346,7 @@ function createNovelAiPayload(input: {
     baseParameters.use_order = true;
     baseParameters.v4_prompt = {
       caption: {
-        base_caption: input.prompt,
+        base_caption: prompt,
         char_captions: characterCaptions
       },
       use_coords: useCharacterCoords,
@@ -334,7 +355,7 @@ function createNovelAiPayload(input: {
     };
     baseParameters.v4_negative_prompt = {
       caption: {
-        base_caption: input.negativePrompt,
+        base_caption: negativePrompt,
         char_captions: characterNegativeCaptions
       },
       use_coords: useCharacterCoords,
@@ -345,7 +366,7 @@ function createNovelAiPayload(input: {
 
   return {
     action: "generate",
-    input: input.prompt,
+    input: prompt,
     model,
     parameters: baseParameters
   };

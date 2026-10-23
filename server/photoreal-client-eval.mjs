@@ -1179,10 +1179,12 @@ async function evaluateComfyUiProbe(modules, relay) {
   const { probeComfyUi } = requireModule(modules, "comfy");
   const { PHOTOREAL_WORKFLOW_PRESETS } = requireModule(modules, "workflows");
   // Probing works before photoreal is enabled: it is how the user checks the setup first.
+  // Face lock on, so both presets are in play (it is off by default now; the face-lock-off case is checked below).
   const state = createRelayState(seedState, relay, {
     enabled: false,
     workflowPreset: "z_image_turbo",
-    referenceWorkflowPreset: "qwen_image_2_1_turbo"
+    referenceWorkflowPreset: "qwen_image_2_1_turbo",
+    faceReferenceEnabled: true
   });
   const requiredNodes = Array.from(
     new Set([...PHOTOREAL_WORKFLOW_PRESETS.z_image_turbo.requiredNodes, ...PHOTOREAL_WORKFLOW_PRESETS.qwen_image_2_1_turbo.requiredNodes])
@@ -1241,6 +1243,28 @@ async function evaluateComfyUiProbe(modules, relay) {
     "photoreal.probe",
     relay.requestsTo("/photoreal/comfyui/status")[0]?.query.baseUrl === "http://localhost:8190",
     "An explicit baseUrl argument overrides the stored one (testing an unsaved field)."
+  );
+
+  // Face lock off: the face-lock preset never runs, so its nodes are not asked about. Asking made a Z-Image-only
+  // ComfyUI report Qwen-Image 2.1's nodes as missing with face lock switched off.
+  relay.reset();
+  await probeComfyUi(
+    createRelayState(seedState, relay, {
+      enabled: true,
+      workflowPreset: "z_image_turbo",
+      referenceWorkflowPreset: "qwen_image_2_1_turbo",
+      faceReferenceEnabled: false
+    })
+  );
+  const unlockedNodes = (relay.requestsTo("/photoreal/comfyui/status")[0]?.query.nodes ?? "").split(",").filter(Boolean);
+  const qwenOnlyNodes = PHOTOREAL_WORKFLOW_PRESETS.qwen_image_2_1_turbo.requiredNodes.filter(
+    (node) => !PHOTOREAL_WORKFLOW_PRESETS.z_image_turbo.requiredNodes.includes(node)
+  );
+  assertCheck(
+    "photoreal.probe",
+    qwenOnlyNodes.length > 0 && qwenOnlyNodes.every((node) => !unlockedNodes.includes(node)) &&
+      PHOTOREAL_WORKFLOW_PRESETS.z_image_turbo.requiredNodes.every((node) => unlockedNodes.includes(node)),
+    `With face lock off only the generation preset's nodes are probed (${unlockedNodes.length} nodes).`
   );
 
   relay.reset();

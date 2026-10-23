@@ -1,7 +1,7 @@
 ---
 name: server-api
 description: DynamicChat API 서버 개발 전담 에이전트. 새 엔드포인트 추가, 라우트 수정, 퍼시스턴스 계층, rate limiting, CORS, 마이그레이션 작업을 맡긴다. 서버 코드 이외의 파일은 건드리지 않는다.
-model: claude-sonnet-4-6
+model: sonnet
 tools:
   - Read
   - Edit

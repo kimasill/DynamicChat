@@ -22,9 +22,17 @@ The guard covers **every handler that touches the persisted state store or the
 secret store**, read or write, **plus any handler that can spend something of the
 user's**: both `/personal-api-vault` routes, all `/simulations…` routes except the
 two 501 stubs (`chat/turns`, `sessions/reset`), both `/image-jobs/:id` routes,
-`PATCH /prompt-modules/:id`, `POST /llm/cli-agent`, and the four photoreal relay
+`PATCH /prompt-modules/:id`, `POST /llm/cli-agent`, the four photoreal relay
 routes (`POST /photoreal/comfyui/generate`, `GET …/status`, `POST …/free`,
-`POST …/interrupt`).
+`POST …/interrupt`), and the two local-services routes (`GET /local-services/status`,
+`POST /local-services/comfyui/start`).
+
+The local-services routes are guarded because they expose information about the
+local machine (installed paths, process state, log output) and can spawn a child
+process. `GET /local-services/status` returns the discovered ComfyUI install path
+and Ollama state; `POST /local-services/comfyui/start` triggers a local process
+spawn. Both are only meaningful to someone on this machine and must not be reachable
+from a foreign origin or a DNS-rebound page.
 
 An earlier pass covered only four read routes, which left `POST /simulations` —
 the same `upsertSimulationState` sink as `PUT /simulations/:id/state`, with no

@@ -6,6 +6,15 @@ import { existsSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  initLocalServices,
+  ensureComfyUiRunning,
+  getLocalServicesStatus,
+  isComfyUiManagedUrl,
+  getComfyUiStartingMessage,
+  getComfyUiNotInstalledMessage,
+  shutdownLocalServices
+} from "./local-services.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = path.resolve(__dirname, "..");
@@ -124,7 +133,20 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`DynamicChat API listening on http://127.0.0.1:${port}`);
   console.log(`Data directory: ${dataDir}`);
   console.log("Dev warning: API secrets are stored in a local development secret file, not production encryption.");
+  // Non-blocking: discover and start ComfyUI and Ollama in the background.
+  // initLocalServices awaits only discovery (cheap existsSync scan), then fires startups
+  // asynchronously, so the server is fully ready before any real work begins.
+  initLocalServices(dataDir).catch((e) => console.warn("[local-services]", e?.message));
 });
+
+// Kill managed local services (ComfyUI, Ollama) when the API server exits so no orphan
+// python/ollama processes are left behind. Only processes this server started are killed.
+function _handleShutdownSignal() {
+  shutdownLocalServices();
+  process.exit(0);
+}
+process.once("SIGINT", _handleShutdownSignal);
+process.once("SIGTERM", _handleShutdownSignal);
 
 function matchRoute(method, pathname) {
   const routes = [
@@ -133,6 +155,7 @@ function matchRoute(method, pathname) {
     ["POST", /^\/novelai\/generate-image$/u, proxyNovelAiGenerateImage],
     ["POST", /^\/novelai\/encode-vibe$/u, proxyNovelAiEncodeVibe],
     ["POST", /^\/llm\/cli-agent$/u, proxyLlmCliAgent],
+    ["GET", /^\/llm\/cli-agent\/models$/u, listCliAgentModels],
     ["POST", /^\/llm\/chat$/u, proxyLlmChat],
     ["POST", /^\/photoreal\/comfyui\/generate$/u, relayComfyUiGenerate],
     ["GET", /^\/photoreal\/comfyui\/status$/u, relayComfyUiStatus],
@@ -156,7 +179,9 @@ function matchRoute(method, pathname) {
     ["POST", /^\/simulations\/([^/]+)\/backup$/u, createBackup],
     ["POST", /^\/simulations\/([^/]+)\/redactions$/u, createRedaction],
     ["POST", /^\/image-jobs\/([^/]+)\/cancel$/u, cancelImageJob],
-    ["GET", /^\/image-jobs\/([^/]+)$/u, getImageJob]
+    ["GET", /^\/image-jobs\/([^/]+)$/u, getImageJob],
+    ["GET", /^\/local-services\/status$/u, getLocalServicesStatusHandler],
+    ["POST", /^\/local-services\/comfyui\/start$/u, startLocalComfyUiHandler]
   ];
 
   for (const [routeMethod, pattern, handler] of routes) {
@@ -662,8 +687,23 @@ async function proxyLlmCliAgent(_request, response) {
     sendJson(response, 400, { error: "Invalid model name for CLI agent." });
     return;
   }
+  let requestedModel;
   if (agent === "antigravity") {
     model = normalizeAntigravityModel(model);
+    // A stored id agy has since retired runs on its current equivalent instead of failing every turn. It is not
+    // silent: the server log names both, the JSON reply carries requestedModel, and the settings screen flags the
+    // stale id with a one-click fix. If the list cannot be read, the id goes through and agy's rejection is reported.
+    try {
+      const { models } = await getAntigravityModels();
+      const replacement = pickAntigravityReplacement(model, models.map((entry) => entry.id));
+      if (replacement && replacement !== model) {
+        console.log(`[cli-agent] agy no longer offers ${model}; running ${replacement}`);
+        requestedModel = model;
+        model = replacement;
+      }
+    } catch {
+      // Listing failed; keep the requested id.
+    }
   }
 
   const systemPrompt = typeof payload.systemPrompt === "string" ? payload.systemPrompt : "";
@@ -803,18 +843,29 @@ async function proxyLlmCliAgent(_request, response) {
         // requires --skip-trust and is already scoped; codex has no similar cwd restriction).
         cwd: agent === "claude" ? claudeNeutralCwd : undefined,
         onStdout: (chunk) => {
-          beginStream();
-          if (!headersSent || response.writableEnded) {
+          if (response.writableEnded) {
             return;
           }
           if (ndjsonStream) {
+            // Only answer TEXT opens the stream. agy writes NDJSON from its first moment — an init line, and on a
+            // failed run an ERROR result — so opening on any stdout sent a 200 two seconds into an "unknown model"
+            // failure, and the turn showed "the model returned no body" instead of describeExitFailure's reason.
             const text = ndjsonStream.push(chunk);
-            if (text) {
-              if (firstChunkMs < 0) firstChunkMs = Date.now() - streamStartedAt;
-              streamedChunks += 1;
-              response.write(text);
+            if (!text) {
+              return;
             }
+            beginStream();
+            if (!headersSent) {
+              return;
+            }
+            if (firstChunkMs < 0) firstChunkMs = Date.now() - streamStartedAt;
+            streamedChunks += 1;
+            response.write(text);
           } else {
+            beginStream();
+            if (!headersSent) {
+              return;
+            }
             if (firstChunkMs < 0) firstChunkMs = Date.now() - streamStartedAt;
             streamedChunks += 1;
             response.write(chunk);
@@ -838,13 +889,16 @@ async function proxyLlmCliAgent(_request, response) {
     cleanupSysPromptFile();
 
     if (!headersSent) {
-      // Process produced no stdout: surface an error (client checks response.ok before reading the stream).
+      // Process produced no answer text: surface an error (client checks response.ok before reading the stream).
       // A zero exit code is NOT proof of success here — the gemini CLI prints its auth failure and leaves,
       // and an empty 200 would be reported upstream as "the model said nothing" rather than "the CLI is not
-      // signed in", which is the difference between a fixable message and a silent turn.
-      if (result.code !== 0 || !result.stdout.trim()) {
+      // signed in", which is the difference between a fixable message and a silent turn. Likewise a run agy
+      // itself reported as failed: an empty 200 there read as a content block ("차단된 턴").
+      const reportedFailure = ndjsonStream?.failure?.() ?? "";
+      if (result.code !== 0 || !result.stdout.trim() || reportedFailure) {
         sendJson(response, 502, {
-          error: describeExitFailure(result.code, result.stderr, result.stdout)
+          // describeExitFailure reads stderr before stdout, so agy's own report goes first or stderr noise hides it.
+          error: describeExitFailure(result.code, reportedFailure ? `${reportedFailure}\n${result.stderr ?? ""}` : result.stderr, result.stdout)
         });
         return;
       }
@@ -881,7 +935,7 @@ async function proxyLlmCliAgent(_request, response) {
       return;
     }
 
-    sendJson(response, 200, { text, agent, model: model || undefined });
+    sendJson(response, 200, { text, agent, model: model || undefined, ...(requestedModel ? { requestedModel } : {}) });
   } catch (error) {
     sendJson(response, 502, { error: describeSpawnError(error) });
   } finally {
@@ -898,24 +952,118 @@ function sanitizeCliModel(value) {
   return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(trimmed) ? trimmed : "";
 }
 
+// The id agy is asked for when the caller names no model. It must be one `agy models` currently lists:
+// agy rejects a retired id outright, so a stale default turns every model-less call into a failure.
+const ANTIGRAVITY_DEFAULT_MODEL = "gemini-3.8-flash-high";
+
 function normalizeAntigravityModel(model) {
-  if (!model) return "gemini-3.7-flash-high";
-  const exactMappings = {
-    "gemini-3.7-flash": "gemini-3.7-flash-high",
-    "gemini-3.7-pro": "gemini-3.1-pro-high",
-    "gemini-3.1-pro": "gemini-3.1-pro-high",
-    "gemini-3.6-flash": "gemini-3.6-flash-high",
-    "gemini-3.5-flash": "gemini-3.5-flash-high",
-    "gemini-2.0-flash": "gemini-3.7-flash-high",
-    "gemini-flash-latest": "gemini-3.7-flash-high"
+  if (!model) return ANTIGRAVITY_DEFAULT_MODEL;
+  // Only version-less aliases are rewritten. A versioned id is passed through as given: silently swapping a
+  // retired model for a different one would change the narrative voice without telling anyone, while agy's
+  // own rejection lists the models it does accept and the bridge forwards that list to the user.
+  const aliasMappings = {
+    "gemini-flash-latest": ANTIGRAVITY_DEFAULT_MODEL,
+    "gemini-2.0-flash": ANTIGRAVITY_DEFAULT_MODEL
   };
-  if (exactMappings[model]) {
-    return exactMappings[model];
+  if (aliasMappings[model]) {
+    return aliasMappings[model];
   }
   if (model.startsWith("gemini-") && !/-(high|medium|low)$/u.test(model)) {
     return `${model}-high`;
   }
   return model;
+}
+
+// `agy models` asks Google's service for the list, which takes a few seconds; the list changes on agy's
+// release schedule, not per request, so a short cache keeps the settings screen responsive.
+const CLI_AGENT_MODEL_LIST_TTL_MS = 10 * 60_000;
+const cliAgentModelListCache = new Map();
+
+/**
+ * GET /llm/cli-agent/models?agent=antigravity — the model ids the installed agy currently accepts.
+ *
+ * The preset list in llmProviders.ts cannot keep up: agy retires ids without warning and then refuses them
+ * outright, which is how gemini-3.1-pro-high and every 3.7/3.6 flash id stopped working while still being
+ * offered in the settings. Asking the CLI itself is the only source that cannot go stale.
+ */
+async function listCliAgentModels(request, response) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
+  const url = new URL(request.url ?? "/", "http://localhost");
+  const agent = String(url.searchParams.get("agent") ?? "").toLowerCase();
+  if (agent !== "antigravity") {
+    sendJson(response, 400, { error: "Model listing is only available for the antigravity (agy) CLI." });
+    return;
+  }
+  try {
+    const { models, cached } = await getAntigravityModels();
+    sendJson(response, 200, { agent, models, cached });
+  } catch (error) {
+    sendJson(response, 502, { error: error instanceof Error ? error.message : `${agent} CLI model listing failed.` });
+  }
+}
+
+/** The models the installed agy accepts right now, `[{ id, label }]`, from a 10-minute cache. Throws on failure. */
+async function getAntigravityModels() {
+  const agent = "antigravity";
+  const cached = cliAgentModelListCache.get(agent);
+  if (cached && Date.now() - cached.at < CLI_AGENT_MODEL_LIST_TTL_MS) {
+    return { models: cached.models, cached: true };
+  }
+  const override = process.env[CLI_AGENT_ENV_OVERRIDES[agent]]?.trim();
+  const command = override ? override.split(/\s+/u)[0] : CLI_AGENT_DEFAULT_COMMANDS[agent][0];
+  let result;
+  try {
+    result = await runCliAgentProcess(command, ["models"], "", { shell: false, maxTimeoutMs: 30_000 });
+  } catch (error) {
+    throw new Error(
+      error?.code === "ENOENT"
+        ? `${agent} CLI not found (command: ${command}). ${CLI_AGENT_INSTALL_HINTS[agent] ?? "Install it and ensure it is on PATH."} Or set ${CLI_AGENT_ENV_OVERRIDES[agent]} to its full path.`
+        : error instanceof Error
+          ? error.message
+          : `${agent} CLI model listing failed.`
+    );
+  }
+  // Lines look like "gemini-3.8-flash-high\tGemini 3.8 Flash (High)"; the "Fetching available models..."
+  // banner and anything else without an id-shaped first column is skipped.
+  const models = String(result.stdout ?? "")
+    .split(/\r?\n/u)
+    .map((line) => line.match(/^([A-Za-z0-9][A-Za-z0-9._:-]*-[A-Za-z0-9._:-]+)\s+(.+)$/u))
+    .filter((match) => Boolean(match))
+    .map((match) => ({ id: match[1], label: match[2].trim() }));
+  if (result.code !== 0 || models.length === 0) {
+    const detail = String(result.stderr ?? "").trim() || String(result.stdout ?? "").trim();
+    throw new Error(`agy did not return a model list${detail ? `: ${detail.slice(0, 300)}` : "."}`);
+  }
+  cliAgentModelListCache.set(agent, { at: Date.now(), models });
+  return { models, cached: false };
+}
+
+/**
+ * The agy model to run when the stored one is no longer offered: same vendor, same tier (flash/lite vs not), same
+ * Claude family, same effort suffix, in agy's own order (newest first). Undefined when nothing of that vendor is
+ * left. agy retires ids on its own schedule — gemini-3.7 flash → 3.8, gemini-3.1 pro → gemini-4 argon — and refuses a
+ * retired id outright, so a simulation saved a month ago stopped producing turns at all.
+ */
+function pickAntigravityReplacement(requested, availableIds) {
+  if (availableIds.includes(requested)) {
+    return requested;
+  }
+  const vendor = requested.split("-")[0];
+  const isLight = /flash|lite/u.test(requested);
+  const family = requested.match(/^claude-(opus|sonnet|haiku)/u)?.[1];
+  const effort = requested.match(/-(high|medium|low)$/u)?.[1];
+  const sameVendor = availableIds.filter((id) => id.split("-")[0] === vendor);
+  const narrowed = [
+    (id) => (family ? id.startsWith(`claude-${family}`) : true),
+    (id) => /flash|lite/u.test(id) === isLight,
+    (id) => (effort ? id.endsWith(`-${effort}`) : true)
+  ].reduce((pool, keep) => {
+    const kept = pool.filter(keep);
+    return kept.length > 0 ? kept : pool;
+  }, sameVendor);
+  return narrowed[0];
 }
 
 function resolveCliAgentArgv(agent, model, options = {}, systemPromptFile = "") {
@@ -1166,6 +1314,10 @@ const COMFYUI_MAX_TIMEOUT_MS = 900_000;
 const COMFYUI_FETCH_GRACE_MS = 20_000;
 const COMFYUI_REQUEST_TIMEOUT_MS = 30_000;
 const COMFYUI_PROBE_TIMEOUT_MS = 5_000;
+// How long a request waits for the ComfyUI this server starts (see local-services.mjs). A generation waits long
+// enough for a cold custom-node load; a probe answers inside the client's 20 s and reports `starting` past that.
+const COMFYUI_AUTOSTART_WAIT_MS = 90_000;
+const COMFYUI_AUTOSTART_PROBE_WAIT_MS = 15_000;
 const COMFYUI_POLL_INTERVAL_MS = 400;
 // Three history polls in a row that cannot even connect mean ComfyUI went away mid-job (on Windows a model load
 // that runs out of system RAM kills the process outright). Sitting out the rest of a five-minute budget would
@@ -1326,6 +1478,17 @@ async function relayComfyUiGenerate(request, response) {
     for (const reference of usedReferences) {
       referenceImages.push({ name: reference.name, image: await loadComfyUiReferenceImage(reference, objectRoots) });
     }
+    // The ComfyUI this server runs may still be loading, or may have been closed since it came up: bring it up
+    // before the first call to it. Only after the request has passed every check, so a refused request never
+    // starts anything, and inside this request's own deadline, so the relay still answers before the client
+    // gives up. The app always names the base URL, so this keys on the address rather than on its absence.
+    if (isComfyUiManagedUrl(baseUrl)) {
+      const ready = await ensureComfyUiRunning({ waitMs: Math.max(0, Math.min(COMFYUI_AUTOSTART_WAIT_MS, deadline - Date.now())) });
+      const comfyui = getLocalServicesStatus().comfyui;
+      if (!ready && (comfyui.state === "not_installed" || comfyui.state === "failed")) {
+        throw new ComfyUiRelayError(503, comfyui.message ?? getComfyUiNotInstalledMessage(), {}, "unreachable");
+      }
+    }
     const uploadedNames = new Map();
     for (const { name, image } of referenceImages) {
       uploadedNames.set(name, await uploadComfyUiReference(baseUrl, name, image, deadline, clientGone.signal));
@@ -1376,6 +1539,19 @@ async function relayComfyUiStatus(request, response) {
     return;
   }
 
+  // Auto-start integration: a probe of the managed loopback ComfyUI starts it when nothing answers there (first
+  // use, or closed since) and gives it up to 15 s. The client probe gives up at 20 s (PROBE_TIMEOUT_MS in
+  // comfyUiClient.ts), so this leaves room for the round trip; a ComfyUI still loading after that answers
+  // `starting` below, and the next probe finds it up.
+  if (isComfyUiManagedUrl(baseUrl)) {
+    const ready = await ensureComfyUiRunning({ waitMs: COMFYUI_AUTOSTART_PROBE_WAIT_MS });
+    const comfyui = getLocalServicesStatus().comfyui;
+    if (!ready && (comfyui.state === "not_installed" || comfyui.state === "failed")) {
+      sendJson(response, 200, { ok: false, message: comfyui.message ?? getComfyUiNotInstalledMessage() });
+      return;
+    }
+  }
+
   // A probe answers 200 either way: "is ComfyUI there?" has "no" as a normal answer, and the settings screen
   // shows the message rather than treating it as a failed request. A success carries no message — the client
   // composes one from the fields (it knows which of the probed nodes its presets need).
@@ -1395,7 +1571,13 @@ async function relayComfyUiStatus(request, response) {
     if (!(error instanceof ComfyUiRelayError)) {
       throw error;
     }
-    sendJson(response, 200, { ok: false, message: error.message });
+    // Provide a richer message when this is the managed URL still coming up.
+    const startingMsg = isComfyUiManagedUrl(baseUrl) ? getComfyUiStartingMessage() : undefined;
+    sendJson(response, 200, {
+      ok: false,
+      ...(startingMsg ? { starting: true } : {}),
+      message: startingMsg ?? error.message
+    });
     return;
   }
   if (!isPlainObject(stats) || !isPlainObject(stats.system)) {
@@ -1483,6 +1665,43 @@ async function relayComfyUiInterrupt(request, response) {
       throw error;
     }
   }
+}
+
+/**
+ * GET /local-services/status — current state of ComfyUI and Ollama supervisors.
+ * Guarded: only local browser origins can read this (it exposes install paths and log file locations).
+ */
+async function getLocalServicesStatusHandler(request, response) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
+  sendJson(response, 200, getLocalServicesStatus());
+}
+
+/**
+ * POST /local-services/comfyui/start — trigger ComfyUI startup without waiting.
+ * Returns immediately; the caller can poll GET /local-services/status or the existing
+ * /photoreal/comfyui/status to track progress.
+ * Guarded: same origin restriction as the relay routes.
+ * Does not accept a filesystem path from the client — the path comes from discovery only.
+ */
+async function startLocalComfyUiHandler(request, response) {
+  if (rejectNonLocalSecretRequest(request, response)) {
+    return;
+  }
+  // Starts it (or restarts one that was closed) and answers without waiting for it to load. The state is read
+  // after the call: a stored "running" can be stale, and ensureComfyUiRunning is what checks the port.
+  const ready = await ensureComfyUiRunning({ waitMs: 0 });
+  const cs = getLocalServicesStatus().comfyui;
+  if (ready) {
+    sendJson(response, 200, { ok: true, message: "ComfyUI가 이미 실행 중입니다." });
+    return;
+  }
+  if (cs.state === "not_installed" || cs.state === "failed") {
+    sendJson(response, 409, { ok: false, message: cs.message ?? getComfyUiNotInstalledMessage() });
+    return;
+  }
+  sendJson(response, 202, { ok: true, message: "ComfyUI 시작 요청을 보냈습니다. /local-services/status 에서 진행 상황을 확인하세요." });
 }
 
 async function readComfyUiRelayBody(request, response) {
@@ -2410,7 +2629,9 @@ function resolveCliStdoutParser(agent, wantStream) {
 }
 
 function createAntigravityStreamTextParser() {
-  return createNdjsonStreamTextParser({
+  // The run's own failure report, kept so a run that ends without text can say why (see the stream close path).
+  let failure = "";
+  const parser = createNdjsonStreamTextParser({
     extractDeltaText: (event) => {
       const step = event?.event === "step_update" ? event.step_update : undefined;
       if (step?.step_type !== "agent_response" || typeof step?.text_delta !== "string") {
@@ -2427,11 +2648,13 @@ function createAntigravityStreamTextParser() {
         return result.response;
       }
       if (result.status && result.status !== "SUCCESS") {
-        console.error(`agy run failed (${result.status}): ${result.error ?? "no error text"}`);
+        failure = `agy run failed (${result.status}): ${result.error ?? "no error text"}`;
+        console.error(failure);
       }
       return "";
     }
   });
+  return { ...parser, failure: () => failure };
 }
 
 async function getObjectAsset(_request, response, [objectKey]) {

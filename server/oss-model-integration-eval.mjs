@@ -23,6 +23,14 @@ import { createServer } from "vite";
 const results = [];
 let currentGroup = "";
 
+// The refusal as it was committed to a real simulation's transcript (Antigravity · gemini pro, adult turn).
+const REFUSAL_TEXT =
+  "요청하신 프롬프트는 '승리의 여신: 니케' 세계관 기반의 롤플레잉 시뮬레이션 진행 중 캐릭터에게 노골적인 성적 행위를 시키는 장면을 묘사하도록 요구하고 있습니다.\n\n" +
+  "해당 요청은 수행할 수 없습니다. 제 안전 가이드라인 및 운영 제약 조건상, 가상의 창작물이나 성인용 롤플레잉 맥락이라 하더라도 노골적인 성적 콘텐츠를 생성하는 것은 엄격히 금지되어 있습니다.";
+const REFUSAL_DIALOGUE_TEXT =
+  "라피가 지휘관을 똑바로 마주 보았다.\n\n“지휘관님, 그 명령은 수행할 수 없습니다. 중앙정부의 안전 가이드라인에 위배됩니다.”\n\n" +
+  "작전은 더 이상 진행할 수 없었다. 회의실에는 긴 침묵만 남았다.";
+
 function group(name) {
   currentGroup = name;
 }
@@ -141,6 +149,23 @@ function startMockProvider() {
                 finish_reason: "stop"
               }
             ]
+          });
+          return;
+
+        // A model declining in its own voice, as an ordinary 200. Plain text is what Antigravity/Gemini sent for
+        // an adult beat (the envelope dropped); some models keep the envelope and put the refusal inside it.
+        case "refusal_plain_text":
+          send(200, { choices: [{ message: { content: REFUSAL_TEXT }, finish_reason: "stop" }] });
+          return;
+        case "refusal_in_envelope":
+          send(200, {
+            choices: [{ message: { content: JSON.stringify({ assistant_text: REFUSAL_TEXT, memory_events: [] }) }, finish_reason: "stop" }]
+          });
+          return;
+        // The same words as story: a character refusing an order, with lore about guidelines around it.
+        case "refusal_as_dialogue":
+          send(200, {
+            choices: [{ message: { content: JSON.stringify({ assistant_text: REFUSAL_DIALOGUE_TEXT, memory_events: [] }) }, finish_reason: "stop" }]
           });
           return;
 
@@ -748,6 +773,79 @@ try {
       generation.content?.slice(0, 200)
     );
     check(/고개를 들었다/u.test(generation.content), "누출 제거 후에도 실제 서사는 보존된다", generation.content?.slice(0, 120));
+  }
+
+  {
+    // A model's refusal used to be committed as the turn's narrative: it matched none of the boilerplate
+    // patterns, and a failed turn left the streamed text in the transcript. The turn must fail instead, naming
+    // the backend, without spending retries — the same model on the same context refuses again.
+    const preset = getLlmProviderPreset("deepseek");
+    const originalRequiresProxy = preset.requiresProxy;
+    preset.requiresProxy = false;
+    const state = withProvider(createState(), "deepseek", { baseUrl: mockBaseUrl, model: "mock-model" });
+    const generate = (userText = "진행") =>
+      llmClient.generateAssistantText({ state, userText, modules: [], evidence: [], fallback: "fallback", separateImageCues: true });
+    try {
+      for (const behaviour of ["refusal_plain_text", "refusal_in_envelope"]) {
+        mock.reset();
+        mock.setBehaviour(behaviour);
+        let outcome;
+        try {
+          outcome = { generation: await generate() };
+        } catch (error) {
+          outcome = { error };
+        }
+        check(
+          llmClient.isLlmRefusalError(outcome.error),
+          `모델 거절문은 서사가 아니라 실패한 턴이 된다 (${behaviour})`,
+          outcome.error ? String(outcome.error) : `committed: ${outcome.generation?.content?.slice(0, 80)}`
+        );
+        check(
+          /DeepSeek/u.test(outcome.error?.message ?? "") && /mock-model/u.test(outcome.error?.message ?? ""),
+          `거절 안내가 어느 백엔드·모델이 거절했는지 밝힌다 (${behaviour})`,
+          outcome.error?.message
+        );
+        const chatRequests = mock.received.filter((entry) => !entry.url.startsWith("/v1/models")).length;
+        check(chatRequests === 1, `거절에 재시도 호출을 쓰지 않는다 (${behaviour})`, `requests=${chatRequests}`);
+      }
+
+      mock.reset();
+      mock.setBehaviour("refusal_as_dialogue");
+      const dialogue = await generate();
+      check(
+        dialogue.source === "llm" && /그 명령은 수행할 수 없습니다/u.test(dialogue.content),
+        "인물이 대사로 거절하는 서사는 거절로 오인하지 않는다",
+        `${dialogue.source}: ${dialogue.content?.slice(0, 80)}`
+      );
+
+      // A refusal already sitting in a transcript (committed before this fix) must not be read back as story.
+      mock.reset();
+      const refusalAlreadyStored = {
+        ...state,
+        messages: [
+          ...state.messages,
+          { id: "msg_eval_user", simulationId: state.simulation.id, sessionId: state.simulation.activeSessionId, role: "user", content: "라피, 이리 와.", createdAt: new Date().toISOString(), referencedNodeIds: [], imageAssetIds: [] },
+          { id: "msg_eval_refusal", simulationId: state.simulation.id, sessionId: state.simulation.activeSessionId, role: "assistant", content: REFUSAL_TEXT, createdAt: new Date().toISOString(), referencedNodeIds: [], imageAssetIds: [] }
+        ]
+      };
+      await llmClient.generateAssistantText({
+        state: refusalAlreadyStored,
+        userText: "진행",
+        modules: [],
+        evidence: [],
+        fallback: "fallback",
+        separateImageCues: true
+      });
+      const sentPrompt = JSON.stringify(mock.received.filter((entry) => !entry.url.startsWith("/v1/models")).map((entry) => entry.body));
+      check(
+        sentPrompt.length > 0 && !/안전 가이드라인 및 운영 제약/u.test(sentPrompt),
+        "이미 저장된 거절문은 다음 턴의 최근 전사로 다시 들어가지 않는다",
+        "the stored refusal was sent back to the model"
+      );
+    } finally {
+      preset.requiresProxy = originalRequiresProxy;
+      mock.setBehaviour("ok");
+    }
   }
 
   await mock.close();

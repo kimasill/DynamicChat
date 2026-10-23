@@ -594,7 +594,9 @@ function createPhotorealJobPlan(
     // The style already carries photoreal.negativePrompt; only the per-character negatives are added here.
     style: resolvePhotorealStyle(settings),
     extraNegative: characterNegatives.join(", "),
-    referenceSyntax: preset.referenceSyntax
+    referenceSyntax: preset.referenceSyntax,
+    // Read by the floor with the style (describePhotorealStyleForScreening) before this cut was routed here.
+    womanAppearance: settings.appearancePrompt
   });
   const files = resolvePhotorealModelFiles(settings, presetId);
   const { width, height } = resolvePhotorealOutputSize(state);

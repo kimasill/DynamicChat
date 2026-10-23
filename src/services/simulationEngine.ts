@@ -72,6 +72,9 @@ const RETRIEVAL_SETTING_MODULE_CHARS = 360;
 // dedicated tag model (or the main model standing in for it), so naming the main model here sent the
 // operator to the wrong settings card.
 const MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON = "이미지 태그 LLM의 image_cues.tags가 비어 있어 이미지 작업을 만들지 않음";
+// Same suppression when the annotation call itself failed. The cadence still lays out its tagless paragraph
+// placeholders, and labelling those "the tag LLM sent empty tags" blamed a model that never answered.
+const ANNOTATION_FAILED_IMAGE_TAGS_SUPPRESSION_PREFIX = "이미지 태그 없음 — ";
 const IMAGE_PROGRESSION_CUE_TARGET = 10;
 
 interface RunSimulationTurnOptions {
@@ -81,14 +84,18 @@ interface RunSimulationTurnOptions {
   // so the UI can distinguish "retrieving context" time from "LLM generating" time (the latter includes the
   // image_cues that the field order emits before assistant_text). Carries the measured retrieval latency.
   onGenerationStart?: (info: { retrievalLatencyMs: number; selectedModuleCount: number }) => void;
-  // Fired as soon as the front-loaded image_cues are parsed from the LLM stream (before the narrative
-  // finishes), carrying the turn context the caller needs to dispatch the image request early.
+  // Fired each time another cue closes in the streamed annotation reply (after the narrative, before the
+  // annotation call ends), so the caller can start that cut's image while the rest of the list is written.
+  // `state` is the planning snapshot with this turn's state deltas already applied — the same shape the
+  // completed-turn planner receives — and `cues` is every cue so far, so cue i keeps index i.
   onEarlyImageCues?: (payload: {
     cues: AssistantImageCueDraft[];
     userMessage: ChatMessage;
     assistantMessage: ChatMessage;
     contextPack: ContextPack;
     promptModuleUsages: PromptModuleUsage[];
+    sidecar: AssistantSidecar;
+    state: AppState;
   }) => void;
   onAssistantText?: (snapshot: {
     userMessage: ChatMessage;
@@ -216,11 +223,56 @@ export async function runSimulationTurn(
     ...state,
     messages: [...state.messages, userMessage, { ...assistantMessageBase, content: assistantContent }]
   };
-  const annotationResult = await requestTurnAnnotations(annotationState, {
-    userText,
-    assistantText: assistantContent,
-    manualImage
-  });
+  const onEarlyImageCues = options.onEarlyImageCues;
+  const annotationResult = await requestTurnAnnotations(
+    annotationState,
+    {
+      userText,
+      assistantText: assistantContent,
+      manualImage
+    },
+    {
+      onStreamedImageCues: onEarlyImageCues
+        ? ({ cues, stateEvents }) => {
+            // Mirror the completed-turn path below: narrative events + this turn's state deltas, compiled the
+            // same way, layered onto the turn's messages — so an early cut sees the outfit this turn set.
+            const earlySidecar: AssistantSidecar = {
+              ...assistantGeneration.sidecar,
+              memoryEvents: [...assistantGeneration.sidecar.memoryEvents, ...stateEvents],
+              imageCues: cues,
+              imageCue: cues[0] ?? assistantGeneration.sidecar.imageCue
+            };
+            const earlyMemoryEvents = shouldCurateAssistantMemory(assistantGeneration)
+              ? memoryDeltaToEvents(
+                  state,
+                  compileSimulationMemoryDelta({
+                    state,
+                    userText,
+                    assistantText: assistantContent,
+                    sidecar: earlySidecar,
+                    sourceTurnId: userMessage.id
+                  })
+                )
+              : [];
+            const earlyAssistantMessage: ChatMessage = { ...assistantMessageBase, content: displayAssistantContent };
+            onEarlyImageCues({
+              cues,
+              userMessage,
+              assistantMessage: earlyAssistantMessage,
+              contextPack,
+              promptModuleUsages,
+              sidecar: earlySidecar,
+              state: {
+                ...optimisticState,
+                messages: [...optimisticState.messages, earlyAssistantMessage],
+                memoryEvents: [...state.memoryEvents, ...earlyMemoryEvents],
+                contextPacks: [...state.contextPacks, contextPack]
+              }
+            });
+          }
+        : undefined
+    }
+  );
 
   // Merge annotation results into the sidecar before memory compilation so both semantic events (from the
   // narrative) and state events (from the annotation) flow through a single memoryCompiler pass.
@@ -285,7 +337,8 @@ export async function runSimulationTurn(
         promptModuleUsages,
         sidecar: mergedSidecar,
         sidecarTrace,
-        manualImage
+        manualImage,
+        annotationFailureReason: annotationResult.failureReason ?? annotationResult.imageCueFailureReason
       });
   const imageCue = imagePlan.imageCue;
   const jobs = imagePlan.imageJobs.length > 0 ? imagePlan.imageJobs : imagePlan.imageJob ? [imagePlan.imageJob] : [];
@@ -426,6 +479,8 @@ export async function planImageJobForCompletedTurn(
     sidecar?: AssistantSidecar;
     sidecarTrace?: SidecarTrace;
     manualImage?: boolean;
+    /** Why the annotation pass produced no cut list, when it failed; names the cause on the tagless placeholders. */
+    annotationFailureReason?: string;
   }
 ): Promise<CompletedTurnImagePlan> {
   const sidecar = input.sidecar ?? createFallbackImageSidecar(input.assistantMessage.content, input.manualImage);
@@ -437,7 +492,7 @@ export async function planImageJobForCompletedTurn(
     baseDrafts,
     Boolean(input.manualImage)
   );
-  const drafts = requireMainLlmAuthoredImageTags(state, initialDrafts, Boolean(input.manualImage));
+  const drafts = requireMainLlmAuthoredImageTags(state, initialDrafts, Boolean(input.manualImage), input.annotationFailureReason);
   const imageCues = drafts.map((draft) =>
     planImageCue(
       state,
@@ -511,8 +566,12 @@ export async function planImageJobForCompletedTurn(
 function requireMainLlmAuthoredImageTags(
   state: AppState,
   drafts: ImageRuleBackedCueDraft[],
-  manualImage: boolean
+  manualImage: boolean,
+  annotationFailureReason?: string
 ): ImageRuleBackedCueDraft[] {
+  const suppressionReason = annotationFailureReason?.trim()
+    ? `${ANNOTATION_FAILED_IMAGE_TAGS_SUPPRESSION_PREFIX}${annotationFailureReason.trim()}`
+    : MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON;
   return drafts.map((draft) => {
     if (!isImageGenerationRequestedByDraft(state, draft, manualImage)) {
       return draft;
@@ -531,8 +590,8 @@ function requireMainLlmAuthoredImageTags(
       shouldGenerate: false,
       forceFreshImage: undefined,
       forceImagePlanning: false,
-      suppressionReason: MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON,
-      reason: draft.reason || MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON
+      suppressionReason,
+      reason: draft.reason || suppressionReason
     };
   });
 }
@@ -570,7 +629,10 @@ function hasLlmAuthoredImageTags(draft: ImageRuleBackedCueDraft | AssistantImage
 }
 
 function isImageCueSuppressedForMissingMainLlmTags(cue: ImageCue): boolean {
-  return cue.suppressionReason?.startsWith(MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON) === true;
+  return (
+    cue.suppressionReason?.startsWith(MISSING_MAIN_LLM_IMAGE_TAGS_SUPPRESSION_REASON) === true ||
+    cue.suppressionReason?.startsWith(ANNOTATION_FAILED_IMAGE_TAGS_SUPPRESSION_PREFIX) === true
+  );
 }
 
 function isGenericImageSceneTag(value: string): boolean {

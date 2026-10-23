@@ -371,7 +371,7 @@ export type PhotorealWorkflowPresetId =
   /** A user-supplied API-format ComfyUI workflow with %placeholders%. */
   | "custom";
 
-export type PhotorealStylePresetId = "daily_look" | "film_portrait" | "cinematic" | "studio_editorial" | "custom";
+export type PhotorealStylePresetId = "instagram" | "daily_look" | "film_portrait" | "cinematic" | "studio_editorial" | "custom";
 
 /** `proxy`: through the DynamicChat API server relay (ComfyUI refuses cross-origin browser calls). `mock`: dry run. */
 export type PhotorealRequestMode = "proxy" | "mock";
@@ -408,8 +408,13 @@ export interface PhotorealApiSettings {
   stylePreset: PhotorealStylePresetId;
   /** Appended to the preset's style text; the whole style when stylePreset is `custom`. */
   stylePrompt: string;
+  /**
+   * Photoreal only: how every woman in a photo cut looks, added to her own photorealPrompt ("beautiful realistic
+   * Korean woman, soft korean makeup, glossy lips"). Written once per simulation instead of into each character.
+   */
+  appearancePrompt: string;
   negativePrompt: string;
-  /** Use characters' photoreal profile images as face references. */
+  /** Use characters' photoreal profile images as face references. Off unless chosen: it fixes a character's look. */
   faceReferenceEnabled: boolean;
   /**
    * Hand the GPU back and forth between a local LLM (Ollama) and local ComfyUI. A 16 GB card cannot hold

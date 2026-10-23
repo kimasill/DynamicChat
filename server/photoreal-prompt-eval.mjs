@@ -59,6 +59,7 @@ try {
     runGroup("prompt.multi-person", () => evaluateMultiPerson(promptModule));
     runGroup("prompt.references", () => evaluateReferences(promptModule));
     runGroup("prompt.style", () => evaluateStylePresets(promptModule));
+    runGroup("prompt.look", () => evaluateLookAndBackground(promptModule));
     runGroup("prompt.negative", () => evaluateNegativeMerge(promptModule));
     runGroup("prompt.phrasing", () => evaluateNaturalPhrasing(promptModule));
     runGroup("prompt.length", () => evaluatePathologicalInput(promptModule));
@@ -517,6 +518,70 @@ function evaluateReferences(promptModule) {
   assertCheck("prompt.references", !unreferenced.prompt.includes("<image") && !/identity reference/u.test(unreferenced.prompt), "A cut without referenceIndex never mentions reference images.");
 }
 
+// The look people asked for: a shared appearance on every woman, NovelAI emphasis read as words, places with a
+// qualifier recognised, no daylight at night, and a face reference that does not freeze hair and makeup.
+function evaluateLookAndBackground(promptModule) {
+  const scope = "prompt.look";
+  const shared = "+2.5:: beautiful realistic Korean woman, soft korean makeup, glossy lips ::";
+  const woman = { tags: ["1girl", "long brown hair", "smile"], identityTags: ["1girl"] };
+  const solo = build(promptModule, { characters: [woman], womanAppearance: shared });
+  assertCheck(
+    scope,
+    /An adult woman, beautiful realistic Korean woman, soft korean makeup, glossy lips with long brown hair/u.test(solo.prompt),
+    `The shared appearance follows the noun, before her own features (got "${solo.subjectSentences[0]}").`
+  );
+  assertCheck(scope, !/::|\+2\.5/u.test(solo.prompt), "Emphasis syntax in the shared appearance is read as words; no '::' or '+2.5' reaches the prompt.");
+  const man = build(promptModule, { characters: [{ tags: ["1boy", "smile"], identityTags: ["1boy"] }], womanAppearance: shared });
+  assertCheck(scope, !/Korean woman|glossy lips/u.test(man.prompt), "A man never gets the women's shared appearance.");
+  const pair = build(promptModule, {
+    characters: [
+      { ...woman, center: { x: 0.25, y: 0.5 } },
+      { tags: ["1boy"], identityTags: ["1boy"], center: { x: 0.75, y: 0.5 } }
+    ],
+    womanAppearance: "soft korean makeup"
+  });
+  assertCheck(scope, /On the left, an adult woman, soft korean makeup/u.test(pair.prompt) && !/an adult man, soft korean makeup/u.test(pair.prompt), "In a mixed cut only the woman carries it.");
+  const own = build(promptModule, {
+    characters: [{ ...woman, appearance: "A Korean woman with sleek black hair" }],
+    womanAppearance: "glossy lips"
+  });
+  assertCheck(scope, /A Korean woman with sleek black hair, glossy lips/u.test(own.prompt), "With her own appearance the shared one is added after it.");
+  const referenced = build(promptModule, { characters: [{ ...woman, referenceIndex: 1 }], referenceSyntax: "qwen21", womanAppearance: "glossy lips" });
+  assertCheck(scope, /The woman from <image1>, glossy lips/u.test(referenced.prompt), "A referenced woman keeps the shared appearance after the reference phrase.");
+  const minorCoded = build(promptModule, { characters: [woman], womanAppearance: "beautiful, schoolgirl" });
+  assertCheck(scope, !/schoolgirl/u.test(minorCoded.prompt) && /beautiful/u.test(minorCoded.prompt), "A student-coded segment of the shared appearance is dropped like any appearance text.");
+
+  const weightedAppearance = build(promptModule, { characters: [{ ...woman, appearance: "+1.5:: a Korean woman with long black hair ::, {glossy lips}, (freckles:1.2)" }] });
+  assertCheck(
+    scope,
+    /a Korean woman with long black hair, glossy lips, freckles/iu.test(weightedAppearance.prompt) && !/::|[{}]|:1\.2/u.test(weightedAppearance.prompt),
+    "Emphasis in a character's own appearance is read as words."
+  );
+  const weightedTag = build(promptModule, { characters: [{ tags: ["1girl", "+1.5::glossy lips::"], identityTags: [] }] });
+  assertCheck(scope, /glossy lips/u.test(weightedTag.prompt) && !/\+1\.5|::/u.test(weightedTag.prompt), "A '+N::' weighted tag is read as its words.");
+  const negativeGroup = build(promptModule, { characters: [{ ...woman, appearance: "A Korean woman, -1:: heavy makeup ::" }] });
+  assertCheck(scope, !/heavy makeup/u.test(negativeGroup.prompt), "A negatively weighted group in free text is left out.");
+
+  const style = dailyLook(promptModule);
+  const person = [{ tags: ["1girl"], identityTags: [] }];
+  const cafe = promptModule.buildPhotorealPrompt({ characters: person, contextTags: ["cafe interior", "potted plant"], style, referenceSyntax: "none" });
+  assertCheck(scope, /Set in a cafe interior/u.test(cafe.prompt) && !/cream and white tones/u.test(cafe.prompt), `"cafe interior" is a place, so the preset's default room is not added (got "${cafe.settingSentence}").`);
+  const base = promptModule.buildPhotorealPrompt({ characters: person, contextTags: ["military base", "hangar interior"], style, referenceSyntax: "none" });
+  assertCheck(scope, /military base/u.test(base.settingSentence) && /hangar interior/u.test(base.settingSentence) && !/cream and white tones/u.test(base.prompt), "Military places are places.");
+  const night = promptModule.buildPhotorealPrompt({ characters: person, contextTags: ["city street", "night"], style, referenceSyntax: "none" });
+  assertCheck(scope, !/daylight/u.test(night.prompt), "A night cut with no lighting tag gets no default daylight.");
+
+  const keep = promptModule.createKeepIdentitySentence(["<image1>"]);
+  assertCheck(
+    scope,
+    /face and facial features/u.test(keep) && /hairstyle, makeup/u.test(keep) && !/hairstyle exactly the same/u.test(keep),
+    "The face reference keeps the face only; hairstyle and makeup come from the description."
+  );
+  assertCheck(scope, promptModule.PHOTOREAL_STYLE_PRESETS.instagram && !/grain|lifted shadows/u.test(promptModule.PHOTOREAL_STYLE_PRESETS.instagram.tail), "The instagram preset asks for a clean, sharp look (no grain, no lifted shadows).");
+  const screened = promptModule.describePhotorealStyleForScreening({ stylePreset: "instagram", stylePrompt: "", appearancePrompt: "glossy lips" });
+  assertCheck(scope, screened.includes("glossy lips"), "The safety floor reads the shared appearance with the style.");
+}
+
 function evaluateAmbientDefaults(promptModule) {
   // The preset's light and room are defaults, not facts: they may only fill what the cut left unsaid.
   const style = promptModule.resolvePhotorealStyle({ stylePreset: "daily_look", stylePrompt: "", negativePrompt: "" });
@@ -567,7 +632,7 @@ function evaluateStylePresets(promptModule) {
   assertCheck("prompt.style", splitList(appended.negative).includes("freckles") && (appended.negative.match(/anime/giu) ?? []).length === 1, "negativePrompt is appended to the preset negative, case-insensitively deduped.");
   const unknown = promptModule.resolvePhotorealStyle({ stylePreset: "vaporwave", stylePrompt: "", negativePrompt: "" });
   const inherited = promptModule.resolvePhotorealStyle({ stylePreset: "constructor", stylePrompt: "", negativePrompt: "" });
-  assertCheck("prompt.style", unknown.lead === presets.daily_look.lead && inherited.lead === presets.daily_look.lead, "An unknown preset id (or a prototype name) falls back to daily_look.");
+  assertCheck("prompt.style", unknown.lead === presets.instagram.lead && inherited.lead === presets.instagram.lead, "An unknown preset id (or a prototype name) falls back to the default look (instagram).");
 }
 
 function evaluateNegativeMerge(promptModule) {
@@ -665,7 +730,7 @@ function evaluatePathologicalInput(promptModule) {
     frame: { shot: "cowboy_shot", viewpoint: "front", visibleRegions: SHOT_REGIONS.cowboy_shot }
   });
   const max = promptModule.PHOTOREAL_PROMPT_MAX_CHARS;
-  assertCheck("prompt.length", max === 1600 && plan.prompt.length <= max, `A 120-tag caption stays within ${max} characters (got ${plan.prompt.length}).`);
+  assertCheck("prompt.length", max === 2400 && plan.prompt.length <= max, `A 120-tag caption stays within ${max} characters (got ${plan.prompt.length}).`);
   assertCheck("prompt.length", !HANGUL.test(plan.prompt) && !/::|[{}[\]]|artist/u.test(plan.prompt), "The capped prompt is English only, with no NovelAI syntax.");
   assertCheck("prompt.length", plan.prompt.endsWith(promptModule.createKeepIdentitySentence(["<image1>"])), "The reference sentence survives trimming intact, at the end.");
   assertCheck("prompt.length", /On the left, the woman from <image1>/u.test(plan.prompt) && /on the right, an adult man/u.test(plan.prompt), "Both subjects survive trimming.");

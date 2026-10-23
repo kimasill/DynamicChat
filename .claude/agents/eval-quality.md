@@ -1,7 +1,7 @@
 ---
 name: eval-quality
 description: DynamicChat 품질 평가 스크립트 개발 및 실행. server/simulation-quality-eval.mjs, image-prompt-quality-eval.mjs, simulation-run-quality-eval.mjs를 작성하거나 개선할 때 사용한다.
-model: claude-sonnet-4-6
+model: sonnet
 tools:
   - Read
   - Edit

@@ -36,6 +36,8 @@
  *                         <tmp>/dynamicchat-e2e-images) as <cadence>_<turn>_<job>_<category>.png with a .txt beside
  *                         it holding the prompt. SKIPs (not fails) when the relay or ComfyUI is not answering.
  *                         Not affected by E2E_SKIP_DISPATCH, which only keeps the NovelAI leg off novelai.net.
+ *   E2E_PHOTOREAL_PRESET  workflow preset id (default: the settings default, qwen_image_2_1_turbo), e.g.
+ *                         z_image_turbo on a ComfyUI without the Qwen-Image 2.1 nodes
  *
  *   E2E_PHOTOREAL=mixed E2E_PHOTOREAL_DISPATCH=first OSS_EVAL_MODEL=qwen3:14b node server/end-to-end-run-eval.mjs
  */
@@ -58,6 +60,8 @@ const comfyUiUrl = process.env.E2E_COMFYUI_URL ?? "http://127.0.0.1:8188";
 const relayUrl = process.env.E2E_RELAY_URL ?? "http://127.0.0.1:8788/photoreal/comfyui";
 const photorealDispatchMode = ["all", "first"].includes(process.env.E2E_PHOTOREAL_DISPATCH ?? "") ? process.env.E2E_PHOTOREAL_DISPATCH : undefined;
 const imageDir = process.env.E2E_IMAGE_DIR ?? path.join(os.tmpdir(), "dynamicchat-e2e-images");
+// The default preset needs ComfyUI nodes an older install lacks; z_image_turbo runs on those.
+const photorealPreset = process.env.E2E_PHOTOREAL_PRESET || undefined;
 
 try {
   const probe = await fetch(`${baseUrl}/models`, {
@@ -132,7 +136,8 @@ function freshState(cadence) {
             requestMode: "proxy",
             baseUrl: comfyUiUrl,
             proxyUrl: relayUrl,
-            vramHandoff: "auto"
+            vramHandoff: "auto",
+            ...(photorealPreset ? { workflowPreset: photorealPreset, referenceWorkflowPreset: photorealPreset } : {})
           }
         }
       : {}),

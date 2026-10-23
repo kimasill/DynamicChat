@@ -1,7 +1,7 @@
 ---
 name: frontend
 description: DynamicChat React 프론트엔드 개발 전담. App.tsx(13629줄), src/services/dynamicChatApi.ts, src/services/apiValidation.ts, src/styles.css를 수정할 때 사용한다. UI 컴포넌트, 상태 관리, API 클라이언트 레이어를 다룬다.
-model: claude-sonnet-4-6
+model: sonnet
 tools:
   - Read
   - Edit

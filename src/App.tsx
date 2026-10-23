@@ -70,7 +70,7 @@ import {
   MAX_MAIN_PROMPT_BODY_CHARS,
   promptModuleBodyCharLimit
 } from "./lib/promptLimits";
-import { listLocalLlmModels, normalizeApiToken, validateLlmApi, validateNovelAiApi } from "./services/apiValidation";
+import { listCliAgentModels, listLocalLlmModels, normalizeApiToken, validateLlmApi, validateNovelAiApi } from "./services/apiValidation";
 import {
   canUserRunQueuedImageJob,
   executeImageJob,
@@ -81,7 +81,7 @@ import {
   type ImageJobExecutionResult
 } from "./services/imageOrchestrator";
 import { generateAssistantText, isLlmAbortedError, setActiveTurnAbortSignal } from "./services/llmClient";
-import { LLM_PROVIDER_GROUP_LABELS, LLM_PROVIDER_PRESETS, type LlmProviderPreset } from "./services/llmProviders";
+import { LLM_PROVIDER_GROUP_LABELS, LLM_PROVIDER_PRESETS, pickAntigravityReplacementModel, type LlmProviderPreset } from "./services/llmProviders";
 import { describeImageCueFrame, normalizeImageCueFrame } from "./services/imageFrame";
 import { IMAGE_SCENE_CATEGORY_OPTIONS, resolveImageBackendRouting } from "./services/imageBackendRouting";
 import {
@@ -169,6 +169,7 @@ import type {
   ImageSafetyLevel,
   ImageTriggerMode,
   LlmApiSettings,
+  LlmProvider,
   ChatMessage,
   NeuralMapSettings,
   NovelAiAutomationTermination,
@@ -302,7 +303,15 @@ const photorealWorkflowPresetOrder: PhotorealWorkflowPresetId[] = [
   "qwen_image_edit_2511",
   "custom"
 ];
-const photorealStylePresetOrder: Array<Exclude<PhotorealStylePresetId, "custom">> = ["daily_look", "film_portrait", "cinematic", "studio_editorial"];
+const photorealStylePresetOrder: Array<Exclude<PhotorealStylePresetId, "custom">> = [
+  "instagram",
+  "daily_look",
+  "film_portrait",
+  "cinematic",
+  "studio_editorial"
+];
+const PHOTOREAL_SHARED_APPEARANCE_PLACEHOLDER =
+  "e.g. beautiful realistic Korean woman, soft Korean makeup, delicate facial features, glossy lips, elegant Korean beauty";
 // The 31-bit range the ComfyUI client keeps seeds in, so the seed typed here is the seed the graph receives.
 const PHOTOREAL_MAX_SEED = 2_147_483_647;
 
@@ -351,6 +360,33 @@ function resolveRightPanelGroup(panel: RightPanel): RightPanelGroup {
   }
   return panel === "ops" || panel === "settings" ? "settings" : "memory";
 }
+
+/**
+ * The 설정 group used to be one column: the diagnostics panel first, then ten settings sections under it, so
+ * reaching ComfyUI meant scrolling past every trace card and every LLM field. Each group now shows one section at
+ * a time behind a second row of tabs. 기억 reuses the panel ids it already had; 설정 splits the settings panel by
+ * what a person comes to change, and 진단 is the old "ops" panel.
+ */
+type SettingsSection = "model" | "image" | "photoreal" | "general";
+const SETTINGS_SECTIONS: ReadonlyArray<{ id: SettingsSection; label: string }> = [
+  { id: "model", label: "모델" },
+  { id: "image", label: "이미지" },
+  { id: "photoreal", label: "실사" },
+  { id: "general", label: "일반" }
+];
+// The builder's 이미지/연동 tab ran NovelAI, ComfyUI and NeuralMap into one column about three screens long.
+type BuilderApiSection = "novelai" | "photoreal" | "neuralmap";
+const BUILDER_API_SECTIONS: ReadonlyArray<{ id: BuilderApiSection; label: string }> = [
+  { id: "novelai", label: "NovelAI" },
+  { id: "photoreal", label: "실사 (ComfyUI)" },
+  { id: "neuralmap", label: "NeuralMap" }
+];
+const MEMORY_SUBPANELS: ReadonlyArray<{ id: RightPanel; label: string }> = [
+  { id: "memory", label: "메모리" },
+  { id: "relationship", label: "관계" },
+  { id: "persona", label: "페르소나" },
+  { id: "neuralmap", label: "Neural" }
+];
 type ModuleDropPosition = "before" | "after";
 type ImageScenePresetDropPosition = "before" | "after" | "inside";
 type DynamicTextBlockKind = "scene" | "impact" | "whisper" | "sfx" | "status" | "choice" | "memory" | "letter";
@@ -404,6 +440,7 @@ const SIMULATION_LIBRARY_STORAGE_KEY = "dynamicchat.simulationLibrary.v1";
 const PERSONAL_API_VAULT_STORAGE_KEY = "dynamicchat.personalApiVault.v1";
 const AUTO_PROGRESS_INTENT_STORAGE_KEY = "dynamicchat.autoProgressIntent.v1";
 const OPS_RAIL_WIDTH_STORAGE_KEY = "dynamicchat.opsRailWidth.v1";
+const SETTINGS_SECTION_STORAGE_KEY = "dynamicchat.settingsSection.v1";
 const DEFAULT_OPS_RAIL_WIDTH = 360;
 const MIN_OPS_RAIL_WIDTH = 280;
 const MAX_OPS_RAIL_WIDTH = 720;
@@ -1765,6 +1802,25 @@ function saveOpsRailWidth(width: number): void {
   window.localStorage.setItem(OPS_RAIL_WIDTH_STORAGE_KEY, String(clampOpsRailWidth(width)));
 }
 
+// The settings tab a person last used opens again next time. A convenience only: storage that is blocked or
+// holds something else falls back to the model tab.
+function loadSettingsSection(): SettingsSection {
+  try {
+    const stored = window.localStorage.getItem(SETTINGS_SECTION_STORAGE_KEY);
+    return SETTINGS_SECTIONS.find((section) => section.id === stored)?.id ?? "model";
+  } catch {
+    return "model";
+  }
+}
+
+function saveSettingsSection(section: SettingsSection): void {
+  try {
+    window.localStorage.setItem(SETTINGS_SECTION_STORAGE_KEY, section);
+  } catch {
+    // Not remembered; the tab still switches.
+  }
+}
+
 interface StoryScrollSnapshot {
   simulationId: string;
   /* A progress-run switch keeps simulation.id and swaps only the message array, so the scroll effect saw
@@ -2409,6 +2465,7 @@ interface ImageDispatchTurn {
   sidecar?: AssistantSidecar;
   sidecarTrace?: SidecarTrace;
   turnTrace: { id: string };
+  annotationFailureReason?: string;
 }
 
 // Payload the engine hands back the instant it has parsed the (front-loaded) image_cues mid-stream,
@@ -2419,6 +2476,9 @@ interface EarlyImageCuePayload {
   assistantMessage: ChatMessage;
   contextPack: ContextPack;
   promptModuleUsages: PromptModuleUsage[];
+  sidecar: AssistantSidecar;
+  /** Planning snapshot with this turn's messages and state deltas applied (runtime secrets already resolved). */
+  state: AppState;
 }
 
 async function runRunnableImageJobs(
@@ -6662,7 +6722,8 @@ function App() {
           promptModuleUsages: result.promptModuleUsages,
           sidecar: result.sidecar,
           sidecarTrace: result.sidecarTrace,
-          manualImage: manual
+          manualImage: manual,
+          annotationFailureReason: result.annotationFailureReason
         });
         const plannedImageJobs = imagePlan.imageJobs.length > 0 ? imagePlan.imageJobs : imagePlan.imageJob ? [imagePlan.imageJob] : [];
         // Keep only jobs that haven't been dispatched yet (claimed via dispatchedImageCueKeysRef) so mid-stream
@@ -6813,27 +6874,28 @@ function App() {
     [resolveStateWithRuntimeSecrets, runQueuedImageJob, showRuntimeNotice]
   );
 
-  // Fired the instant the engine has parsed the front-loaded image_cues mid-stream — dispatches the
-  // image request before the narrative finishes generating. The shared dispatch-key gate in
-  // planAndQueueImageForTurn guarantees the post-turn pass never re-fires these same cues.
+  // Fired each time another cue closes in the streamed annotation reply — starts that cut's image while the
+  // tag model is still writing the rest of the list, instead of after the whole call. The payload carries every
+  // cue so far, so earlier ones keep their indices and the shared dispatch-key gate in planAndQueueImageForTurn
+  // skips them; the post-turn pass skips all of them the same way.
   const dispatchEarlyTurnImages = useCallback(
-    (payload: EarlyImageCuePayload, snapshot: AppState, manual: boolean) => {
-      const [primaryCue, ...restCues] = payload.cues;
-      if (!primaryCue) {
-        return;
+    (payload: EarlyImageCuePayload, manual: boolean): Promise<void> => {
+      if (payload.cues.length === 0) {
+        return Promise.resolve();
       }
-      void planAndQueueImageForTurn(
+      return planAndQueueImageForTurn(
         {
           userMessage: payload.userMessage,
           assistantMessage: payload.assistantMessage,
           contextPack: payload.contextPack,
           promptModuleUsages: payload.promptModuleUsages,
-          sidecar: { assistantText: "", memoryEvents: [], imageCue: primaryCue, imageCues: [primaryCue, ...restCues] },
+          sidecar: payload.sidecar,
+          // The turn trace does not exist yet; the post-turn pass records the job counts on it.
           turnTrace: { id: "" }
         },
-        snapshot,
+        payload.state,
         manual,
-        snapshot
+        payload.state
       );
     },
     [planAndQueueImageForTurn]
@@ -6900,6 +6962,9 @@ function App() {
         // local Ollama model never loads while a photoreal render owns the VRAM, and the reverse. Image planning
         // below stays outside it: photoreal jobs take the lock themselves, after this turn has released it.
         let turnStarted = false;
+        // Cuts dispatched while the annotation reply is still streaming. Kept so auto-progress can wait on
+        // them like the post-turn jobs; each one is gated on the turn still being live.
+        const earlyImageDispatches: Promise<void>[] = [];
         const result = await awaitQueuedWork(
           localGpu.run("llm", turnBaseState, () => {
             turnStarted = true;
@@ -6909,6 +6974,12 @@ function App() {
             return runSimulationTurn(turnBaseState, text, shouldPlanManualImage, {
               deferImagePlanning: true,
               deferMemoryIngest: true,
+              onEarlyImageCues: (payload) => {
+                if (turnAbortController.signal.aborted || !ownsActiveRun(latestStateRef.current, turnOwner)) {
+                  return;
+                }
+                earlyImageDispatches.push(dispatchEarlyTurnImages(payload, shouldPlanManualImage));
+              },
               // Retrieval/module selection finished; the long part from here is the LLM call itself, so flip the card
               // to "generating" now instead of waiting for the first streamed assistant_text. Surface unusually slow
               // retrieval (e.g. an unreachable NeuralMap).
@@ -6955,6 +7026,8 @@ function App() {
           const baseState = autoResetApplied ? layerSessionResetOntoLiveState(current, turnBaseState) : current;
           return applyTurnResultToState(baseState, result);
         });
+        // Committed: from here a throw must not take the turn back out of the transcript.
+        streamedTurnMessageIds = [];
         // Use the committed turn state (it carries this turn's new Wearing/state memory events and
         // inherits the resolved runtime secrets) so the image reflects outfit changes from this turn.
         setTurnPhase("images");
@@ -6966,7 +7039,7 @@ function App() {
           // intermediate-turn jobs stay "queued" forever and only the final turn renders. Failures are surfaced
           // per job, so never let them reject the turn.
           try {
-            await imagePlanning;
+            await Promise.all([imagePlanning, ...earlyImageDispatches]);
           } catch {
             /* per-job errors already handled in runQueuedImageJob */
           }
@@ -6986,17 +7059,20 @@ function App() {
         }
         return committedTurnState;
       } catch (error) {
+        // Whatever streamed in is not a turn unless it was committed, so drop it on a failure as on a cancel.
+        // Only the cancel used to: a model refusal streamed into the transcript, stayed there cut mid-sentence
+        // with no trace or memory behind it, and the next turn read it back as story. The input stays in the
+        // composer (handleSubmit clears it only on a commit), so the user can resend or switch backends.
+        if (streamedTurnMessageIds.length > 0) {
+          const discardedIds = new Set(streamedTurnMessageIds);
+          setState((current) =>
+            ownsActiveRun(current, runOwner)
+              ? { ...current, messages: current.messages.filter((message) => !discardedIds.has(message.id)) }
+              : current
+          );
+        }
         if (isLlmAbortedError(error) || turnAbortController.signal.aborted) {
           // A cancel is a user decision, not a failure — say so plainly and do not colour it as an error.
-          // Drop whatever streamed in before the abort so the cancelled turn leaves no half-written reply.
-          if (streamedTurnMessageIds.length > 0) {
-            const discardedIds = new Set(streamedTurnMessageIds);
-            setState((current) =>
-              ownsActiveRun(current, runOwner)
-                ? { ...current, messages: current.messages.filter((message) => !discardedIds.has(message.id)) }
-                : current
-            );
-          }
           pushRuntimeNotice("진행을 취소했습니다.", "info");
           return null;
         }
@@ -8029,6 +8105,21 @@ function CrackSimulationRunPage({
   // A pending "show me this settings section" from a button outside the settings tab; the settings panel that is on
   // screen scrolls to it, focuses it and clears it.
   const [settingsJump, setSettingsJump] = useState<SettingsJumpRequest>();
+  const [settingsSection, setSettingsSectionState] = useState<SettingsSection>(loadSettingsSection);
+  const changeSettingsSection = useCallback((section: SettingsSection) => {
+    setSettingsSectionState(section);
+    saveSettingsSection(section);
+  }, []);
+  // Coming back to 기억 or 설정 reopens the sub-tab last used there instead of the group's first one.
+  const lastPanelByGroupRef = useRef<Partial<Record<RightPanelGroup, RightPanel>>>({});
+  useEffect(() => {
+    lastPanelByGroupRef.current[resolveRightPanelGroup(rightPanel)] = rightPanel;
+  }, [rightPanel]);
+  const resolveGroupEntryPanel = (panel: RightPanel): RightPanel => {
+    const group = resolveRightPanelGroup(panel);
+    // Only the bare group ids mean "the group"; a specific sub-panel asked for by id is honoured as is.
+    return panel === group ? lastPanelByGroupRef.current[group] ?? panel : panel;
+  };
   const assetsById = useMemo(() => new Map(state.imageAssets.map((asset) => [asset.id, asset])), [state.imageAssets]);
   const allJobsByTurnId = useMemo(() => {
     const groupedJobs = new Map<string, ImageGenerationJob[]>();
@@ -8122,6 +8213,7 @@ function CrackSimulationRunPage({
     } else {
       onRightPanelChange("settings");
     }
+    changeSettingsSection("photoreal");
     setSettingsJump({ section: "photoreal", id: createId("settings_jump") });
   };
   const clearSettingsJump = useCallback(() => setSettingsJump(undefined), []);
@@ -8568,20 +8660,23 @@ function CrackSimulationRunPage({
           />
           <div className="tabs" role="tablist" onKeyDown={handleTablistKeyDown} aria-label="오른쪽 패널">
             <TabButton active={resolveRightPanelGroup(rightPanel) === "image"} icon={<ImageIcon size={17} />} label="장면" onClick={() => onRightPanelChange("image")} panelKey="ops-image" />
-            <TabButton active={resolveRightPanelGroup(rightPanel) === "memory"} icon={<Brain size={17} />} label="기억" onClick={() => onRightPanelChange("memory")} panelKey="ops-memory" />
-            <TabButton active={resolveRightPanelGroup(rightPanel) === "settings"} icon={<Settings2 size={17} />} label="설정" onClick={() => onRightPanelChange("settings")} panelKey="ops-settings" />
+            <TabButton active={resolveRightPanelGroup(rightPanel) === "memory"} icon={<Brain size={17} />} label="기억" onClick={() => onRightPanelChange(resolveGroupEntryPanel("memory"))} panelKey="ops-memory" />
+            <TabButton active={resolveRightPanelGroup(rightPanel) === "settings"} icon={<Settings2 size={17} />} label="설정" onClick={() => onRightPanelChange(resolveGroupEntryPanel("settings"))} panelKey="ops-settings" />
           </div>
-          {/* The tablist above had no panel to name: RuntimePanelContent returns a fragment of two to four
-              sibling panels, so there was no element to carry role="tabpanel". This wrapper is that element.
-              The rail is block flow with no gap, so an unstyled block wrapper leaves the layout untouched.
-              No tabIndex — the panel is full of focusable controls and the rail itself is the scroller, so a
-              tab stop here would only add a stop that goes nowhere. */}
+          {/* The element role="tabpanel" names for the tablist above, and the rail's scroller: the tabs and the
+              sub-tabs at the top of RuntimePanelContent stay put while only the section under them scrolls.
+              No tabIndex — the panel is full of focusable controls, so a tab stop here would go nowhere. */}
           <div
+            className="ops-rail-panel"
             role="tabpanel"
             id={`tabpanel-ops-${resolveRightPanelGroup(rightPanel)}`}
             aria-labelledby={`tab-ops-${resolveRightPanelGroup(rightPanel)}`}
           >
             <RuntimePanelContent
+              idPrefix="ops"
+              onPanelChange={onRightPanelChange}
+              settingsSection={settingsSection}
+              onSettingsSectionChange={changeSettingsSection}
               panel={rightPanel}
               state={state}
               isSending={isSending}
@@ -8609,8 +8704,17 @@ function CrackSimulationRunPage({
           </div>
         </aside>
       </div>
-      <MobileOpsDock activePanel={rightPanel} open={mobilePanelOpen} onClose={() => setMobilePanelOpen(false)} onSelectPanel={openMobilePanel}>
+      <MobileOpsDock
+        activePanel={rightPanel}
+        open={mobilePanelOpen}
+        onClose={() => setMobilePanelOpen(false)}
+        onSelectPanel={(panel) => openMobilePanel(resolveGroupEntryPanel(panel))}
+      >
         <RuntimePanelContent
+          idPrefix="mobile-ops"
+          onPanelChange={onRightPanelChange}
+          settingsSection={settingsSection}
+          onSettingsSectionChange={changeSettingsSection}
           panel={rightPanel}
           state={state}
           isSending={isSending}
@@ -8663,9 +8767,17 @@ function RuntimePanelContent({
   onStateChange,
   settingsJump,
   onSettingsJumpHandled,
-  onRunLocalLlmTask
+  onRunLocalLlmTask,
+  idPrefix,
+  onPanelChange,
+  settingsSection,
+  onSettingsSectionChange
 }: {
   panel: RightPanel;
+  idPrefix: string;
+  onPanelChange: (panel: RightPanel) => void;
+  settingsSection: SettingsSection;
+  onSettingsSectionChange: (section: SettingsSection) => void;
   state: AppState;
   isSending: boolean;
   latestAssets: ImageAsset[];
@@ -8705,36 +8817,117 @@ function RuntimePanelContent({
     );
   }
 
-  // 기억: what the app remembers about this story, as sections of one panel rather than four peer tabs.
+  // 기억: what the app remembers about this story — one of its four panels at a time, picked from a second row.
   if (resolveRightPanelGroup(panel) === "memory") {
     return (
-      <>
-        <MemoryPanel state={state} selectedContextPackId={latestContextPackId} onRedactMemory={onRedactMemory} />
-        <RelationshipMapPanel state={state} onStateChange={onStateChange} />
-        <PersonaPanel state={state} onNotify={onNotify} onStateChange={onStateChange} />
-        <NeuralMapPanel state={state} isSending={isSending} pendingUserText={pendingUserText} onNotify={onNotify} onStateChange={onStateChange} />
-      </>
+      <RailSubtabs idPrefix={idPrefix} label="기억 패널" items={MEMORY_SUBPANELS} active={panel} onSelect={onPanelChange}>
+        {panel === "relationship" ? (
+          <RelationshipMapPanel state={state} onStateChange={onStateChange} />
+        ) : panel === "persona" ? (
+          <PersonaPanel state={state} onNotify={onNotify} onStateChange={onStateChange} />
+        ) : panel === "neuralmap" ? (
+          <NeuralMapPanel state={state} isSending={isSending} pendingUserText={pendingUserText} onNotify={onNotify} onStateChange={onStateChange} />
+        ) : (
+          <MemoryPanel state={state} selectedContextPackId={latestContextPackId} onRedactMemory={onRedactMemory} />
+        )}
+      </RailSubtabs>
     );
   }
 
-  // 설정: runtime diagnostics sit with the settings that change them.
+  // 설정: one settings section at a time, and the runtime diagnostics as the last tab rather than above them all.
+  const activeSettingsTab: SettingsSection | "ops" = panel === "ops" ? "ops" : settingsSection;
+  return (
+    <RailSubtabs
+      idPrefix={idPrefix}
+      label="설정 항목"
+      items={SETTINGS_RAIL_TABS}
+      active={activeSettingsTab}
+      onSelect={(tab) => {
+        if (tab === "ops") {
+          onPanelChange("ops");
+          return;
+        }
+        onPanelChange("settings");
+        onSettingsSectionChange(tab);
+      }}
+    >
+      {panel === "ops" ? (
+        <OperationalPanel state={state} onFeedback={onImageFeedback} />
+      ) : (
+        <SettingsPanel
+          section={settingsSection}
+          onSectionChange={onSettingsSectionChange}
+          state={state}
+          onImageProfileChange={onImageProfileChange}
+          onLlmChange={onLlmChange}
+          onImageTagLlmChange={onImageTagLlmChange}
+          onNovelAiChange={onNovelAiChange}
+          onNotify={onNotify}
+          onOpenPersonalSettings={onOpenPersonalSettings}
+          onStateChange={onStateChange}
+          onResetDemo={onResetDemo}
+          jumpRequest={settingsJump}
+          onJumpHandled={onSettingsJumpHandled}
+          onRunLocalLlmTask={onRunLocalLlmTask}
+        />
+      )}
+    </RailSubtabs>
+  );
+}
+
+const SETTINGS_RAIL_TABS: ReadonlyArray<{ id: SettingsSection | "ops"; label: string }> = [
+  ...SETTINGS_SECTIONS,
+  { id: "ops", label: "진단" }
+];
+
+/**
+ * The second row of tabs inside a rail group, and the tabpanel for whichever one is selected. It sticks to the top
+ * of the scroller it sits in (the rail's panel, or the mobile drawer), so switching never needs a scroll back up.
+ * `idPrefix` keeps the ids unique while the rail and the mobile drawer both hold one.
+ */
+function RailSubtabs<T extends string>({
+  idPrefix,
+  label,
+  items,
+  active,
+  onSelect,
+  children,
+  variant = "rail"
+}: {
+  idPrefix: string;
+  label: string;
+  items: ReadonlyArray<{ id: T; label: string }>;
+  active: T;
+  onSelect: (id: T) => void;
+  children: React.ReactNode;
+  /** "builder" for a page-scrolled builder tab: same control, not pinned, sized for the wider column. */
+  variant?: "rail" | "builder";
+}) {
   return (
     <>
-      <OperationalPanel state={state} onFeedback={onImageFeedback} />
-      <SettingsPanel
-      state={state}
-      onImageProfileChange={onImageProfileChange}
-      onLlmChange={onLlmChange}
-      onImageTagLlmChange={onImageTagLlmChange}
-      onNovelAiChange={onNovelAiChange}
-      onNotify={onNotify}
-      onOpenPersonalSettings={onOpenPersonalSettings}
-        onStateChange={onStateChange}
-        onResetDemo={onResetDemo}
-        jumpRequest={settingsJump}
-        onJumpHandled={onSettingsJumpHandled}
-        onRunLocalLlmTask={onRunLocalLlmTask}
-      />
+      <div className={variant === "builder" ? "rail-subtabs builder-subtabs" : "rail-subtabs"} role="tablist" aria-label={label} onKeyDown={handleTablistKeyDown}>
+        {items.map((item) => {
+          const selected = item.id === active;
+          return (
+            <button
+              className={selected ? "active" : ""}
+              key={item.id}
+              type="button"
+              role="tab"
+              id={`subtab-${idPrefix}-${item.id}`}
+              aria-controls={selected ? `subtabpanel-${idPrefix}-${item.id}` : undefined}
+              aria-selected={selected}
+              tabIndex={selected ? 0 : -1}
+              onClick={() => onSelect(item.id)}
+            >
+              {item.label}
+            </button>
+          );
+        })}
+      </div>
+      <div className="rail-subtab-panel" role="tabpanel" id={`subtabpanel-${idPrefix}-${active}`} aria-labelledby={`subtab-${idPrefix}-${active}`}>
+        {children}
+      </div>
     </>
   );
 }
@@ -10645,6 +10838,7 @@ function CreateSimulationPage({
   const [provisionalSimulationId] = useState(() => createId("draft_sim"));
   const profileImageSimulationId = simulationId ?? provisionalSimulationId;
   const [activeTab, setActiveTab] = useState<BuilderTab>("overview");
+  const [apiSection, setApiSection] = useState<BuilderApiSection>("novelai");
   const [selectedModuleId, setSelectedModuleId] = useState(() => initialDraft?.modules[0]?.id ?? "draft_main");
   const [draggedModuleId, setDraggedModuleId] = useState<string | undefined>();
   const [moduleDropTarget, setModuleDropTarget] = useState<{ moduleId: string; position: ModuleDropPosition } | undefined>();
@@ -11711,338 +11905,363 @@ function CreateSimulationPage({
         ) : null}
 
         {activeTab === "api" ? (
-          <div className="builder-grid">
-            <section className="builder-panel span-2">
-              <SectionTitle icon={<Sparkles size={17} />} title="NovelAI 이미지 설정" />
-              <div className="readonly-field">
-                <span>실행자 NovelAI</span>
-                <strong>NovelAI 토큰과 구독 상태는 시뮬레이션에 저장하지 않습니다.</strong>
-                <small>모델, 해상도, 샘플링 값만 제작 설정으로 저장하고 실제 토큰은 사용하는 사람이 따로 등록합니다.</small>
-              </div>
+          <RailSubtabs idPrefix="builder-api" label="이미지/연동 항목" items={BUILDER_API_SECTIONS} active={apiSection} onSelect={setApiSection} variant="builder">
+            <div className="builder-grid">
+              {apiSection === "novelai" ? (
+                <section className="builder-panel span-2">
+                  <SectionTitle icon={<Sparkles size={17} />} title="NovelAI 이미지 설정" />
+                  <div className="readonly-field">
+                    <span>실행자 NovelAI</span>
+                    <strong>NovelAI 토큰과 구독 상태는 시뮬레이션에 저장하지 않습니다.</strong>
+                    <small>모델, 해상도, 샘플링 값만 제작 설정으로 저장하고 실제 토큰은 사용하는 사람이 따로 등록합니다.</small>
+                  </div>
 
-              <div className="settings-section">
-                <SectionTitle icon={<KeyRound size={16} />} title="실행자 연결" />
-                <div className="two-fields">
-                  <label className="checkline">
-                    <input checked={draft.novelAi.enabled} type="checkbox" onChange={(event) => updateNovelAi({ enabled: event.target.checked })} />
-                    NovelAI 이미지 API 사용
-                  </label>
-                  <label className="checkline">
-                    <input checked={draft.novelAi.roundRobinEnabled} type="checkbox" onChange={(event) => updateNovelAi({ roundRobinEnabled: event.target.checked })} />
-                    계정 라운드로빈
-                  </label>
-                </div>
-                <div className="two-fields">
-                  <label>
-                    요청 방식
-                    <select value={draft.novelAi.requestMode} onChange={(event) => updateNovelAi({ requestMode: event.target.value as NovelAiApiSettings["requestMode"] })}>
-                      <option value="mock">mock</option>
-                      <option value="direct">direct</option>
-                      <option value="proxy">proxy</option>
-                    </select>
-                  </label>
-                  <label>
-                    계정 라벨
-                    <input value={draft.novelAi.accountLabel} onChange={(event) => updateNovelAi({ accountLabel: event.target.value })} />
-                  </label>
-                </div>
-                <div className="readonly-field">
-                  <span>공유 경계</span>
-                  <strong>{draft.novelAi.enabled ? "실행 시 사용자의 NovelAI 토큰을 사용합니다." : "저장 이미지 또는 mock 모드로 동작합니다."}</strong>
-                  <small>제작 화면에서는 NovelAI 토큰 등록 여부를 검사하지 않습니다.</small>
-                </div>
-                <div className="two-fields">
-                  <label>
-                    엔드포인트
-                    <input value={draft.novelAi.endpoint} onChange={(event) => updateNovelAi({ endpoint: event.target.value })} />
-                  </label>
-                  <label>
-                    프록시 URL
-                    <input value={draft.novelAi.proxyUrl} onChange={(event) => updateNovelAi({ proxyUrl: event.target.value })} />
-                  </label>
-                </div>
-              </div>
+                  <div className="settings-section">
+                    <SectionTitle icon={<KeyRound size={16} />} title="실행자 연결" />
+                    <div className="two-fields">
+                      <label className="checkline">
+                        <input checked={draft.novelAi.enabled} type="checkbox" onChange={(event) => updateNovelAi({ enabled: event.target.checked })} />
+                        NovelAI 이미지 API 사용
+                      </label>
+                      <label className="checkline">
+                        <input checked={draft.novelAi.roundRobinEnabled} type="checkbox" onChange={(event) => updateNovelAi({ roundRobinEnabled: event.target.checked })} />
+                        계정 라운드로빈
+                      </label>
+                    </div>
+                    <div className="two-fields">
+                      <label>
+                        요청 방식
+                        <select value={draft.novelAi.requestMode} onChange={(event) => updateNovelAi({ requestMode: event.target.value as NovelAiApiSettings["requestMode"] })}>
+                          <option value="mock">mock</option>
+                          <option value="direct">direct</option>
+                          <option value="proxy">proxy</option>
+                        </select>
+                      </label>
+                      <label>
+                        계정 라벨
+                        <input value={draft.novelAi.accountLabel} onChange={(event) => updateNovelAi({ accountLabel: event.target.value })} />
+                      </label>
+                    </div>
+                    <div className="readonly-field">
+                      <span>공유 경계</span>
+                      <strong>{draft.novelAi.enabled ? "실행 시 사용자의 NovelAI 토큰을 사용합니다." : "저장 이미지 또는 mock 모드로 동작합니다."}</strong>
+                      <small>제작 화면에서는 NovelAI 토큰 등록 여부를 검사하지 않습니다.</small>
+                    </div>
+                    <div className="two-fields">
+                      <label>
+                        엔드포인트
+                        <input value={draft.novelAi.endpoint} onChange={(event) => updateNovelAi({ endpoint: event.target.value })} />
+                      </label>
+                      <label>
+                        프록시 URL
+                        <input value={draft.novelAi.proxyUrl} onChange={(event) => updateNovelAi({ proxyUrl: event.target.value })} />
+                      </label>
+                    </div>
+                  </div>
 
-              <div className="settings-section">
-                <SectionTitle icon={<ImageIcon size={16} />} title="모델과 해상도" />
-                <div className="two-fields">
-                  <label>
-                    모델
-                    <select value={draft.novelAi.modelPreset} onChange={(event) => updateNovelAi({ modelPreset: event.target.value as NovelAiModelPreset })}>
-                      {novelAiModelPresets.map((preset) => (
-                        <option key={preset} value={preset}>
-                          {preset}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    해상도
-                    <select
-                      value={activeResolution}
-                      onChange={(event) => {
-                        const preset = resolutionPresets.find((item) => `${item.width}x${item.height}` === event.target.value);
-                        if (preset) {
-                          updateImageProfile({ width: preset.width, height: preset.height });
-                        }
-                      }}
-                    >
-                      {resolutionPresets.map((preset) => (
-                        <option key={preset.label} value={`${preset.width}x${preset.height}`}>
-                          {preset.label}
-                        </option>
-                      ))}
-                      <option value="custom">직접 입력</option>
-                    </select>
-                  </label>
-                </div>
-                <div className="four-fields">
-                  <label>
-                    너비
-                    <input min="256" max="2048" step="64" type="number" value={draft.imageProfile.width} onChange={(event) => updateImageProfile({ width: Number(event.target.value) })} />
-                  </label>
-                  <label>
-                    높이
-                    <input min="256" max="2048" step="64" type="number" value={draft.imageProfile.height} onChange={(event) => updateImageProfile({ height: Number(event.target.value) })} />
-                  </label>
-                  <label>
-                    스텝
-                    <input min="1" max="60" type="number" value={draft.imageProfile.steps} onChange={(event) => updateImageProfile({ steps: Number(event.target.value) })} />
-                  </label>
-                  <label>
-                    CFG
-                    <input min="1" max="15" step="0.1" type="number" value={draft.imageProfile.promptGuidance} onChange={(event) => updateImageProfile({ promptGuidance: Number(event.target.value) })} />
-                  </label>
-                </div>
-              </div>
+                  <div className="settings-section">
+                    <SectionTitle icon={<ImageIcon size={16} />} title="모델과 해상도" />
+                    <div className="two-fields">
+                      <label>
+                        모델
+                        <select value={draft.novelAi.modelPreset} onChange={(event) => updateNovelAi({ modelPreset: event.target.value as NovelAiModelPreset })}>
+                          {novelAiModelPresets.map((preset) => (
+                            <option key={preset} value={preset}>
+                              {preset}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        해상도
+                        <select
+                          value={activeResolution}
+                          onChange={(event) => {
+                            const preset = resolutionPresets.find((item) => `${item.width}x${item.height}` === event.target.value);
+                            if (preset) {
+                              updateImageProfile({ width: preset.width, height: preset.height });
+                            }
+                          }}
+                        >
+                          {resolutionPresets.map((preset) => (
+                            <option key={preset.label} value={`${preset.width}x${preset.height}`}>
+                              {preset.label}
+                            </option>
+                          ))}
+                          <option value="custom">직접 입력</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="four-fields">
+                      <label>
+                        너비
+                        <input min="256" max="2048" step="64" type="number" value={draft.imageProfile.width} onChange={(event) => updateImageProfile({ width: Number(event.target.value) })} />
+                      </label>
+                      <label>
+                        높이
+                        <input min="256" max="2048" step="64" type="number" value={draft.imageProfile.height} onChange={(event) => updateImageProfile({ height: Number(event.target.value) })} />
+                      </label>
+                      <label>
+                        스텝
+                        <input min="1" max="60" type="number" value={draft.imageProfile.steps} onChange={(event) => updateImageProfile({ steps: Number(event.target.value) })} />
+                      </label>
+                      <label>
+                        CFG
+                        <input min="1" max="15" step="0.1" type="number" value={draft.imageProfile.promptGuidance} onChange={(event) => updateImageProfile({ promptGuidance: Number(event.target.value) })} />
+                      </label>
+                    </div>
+                  </div>
 
-              <div className="settings-section">
-                <SectionTitle icon={<Settings2 size={16} />} title="샘플링" />
-                <div className="four-fields">
-                  <label>
-                    샘플러
-                    <select value={draft.novelAi.sampler} onChange={(event) => updateNovelAi({ sampler: event.target.value })}>
-                      {novelAiSamplers.map((sampler) => (
-                        <option key={sampler} value={sampler}>
-                          {sampler}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    스케줄러
-                    <select value={draft.novelAi.noiseSchedule} onChange={(event) => updateNovelAi({ noiseSchedule: event.target.value as NovelAiNoiseSchedule })}>
-                      {novelAiNoiseSchedules.map((schedule) => (
-                        <option key={schedule} value={schedule}>
-                          {schedule}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    CFG 보정
-                    <input min="0" max="1" step="0.02" type="number" value={draft.novelAi.cfgRescale} onChange={(event) => updateNovelAi({ cfgRescale: Number(event.target.value) })} />
-                  </label>
-                  <label>
-                    UC preset
-                    <input min="0" max="3" type="number" value={draft.novelAi.ucPreset} onChange={(event) => updateNovelAi({ ucPreset: Number(event.target.value) })} />
-                  </label>
-                </div>
-                <div className="two-fields">
-                  <label className="checkline">
-                    <input checked={draft.novelAi.seedFixed} type="checkbox" onChange={(event) => updateNovelAi({ seedFixed: event.target.checked })} />
-                    시드 고정
-                  </label>
-                  <label className="checkline">
-                    <input checked={draft.novelAi.varPlus} type="checkbox" onChange={(event) => updateNovelAi({ varPlus: event.target.checked })} />
-                    VAR+
-                  </label>
-                </div>
-              </div>
+                  <div className="settings-section">
+                    <SectionTitle icon={<Settings2 size={16} />} title="샘플링" />
+                    <div className="four-fields">
+                      <label>
+                        샘플러
+                        <select value={draft.novelAi.sampler} onChange={(event) => updateNovelAi({ sampler: event.target.value })}>
+                          {novelAiSamplers.map((sampler) => (
+                            <option key={sampler} value={sampler}>
+                              {sampler}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        스케줄러
+                        <select value={draft.novelAi.noiseSchedule} onChange={(event) => updateNovelAi({ noiseSchedule: event.target.value as NovelAiNoiseSchedule })}>
+                          {novelAiNoiseSchedules.map((schedule) => (
+                            <option key={schedule} value={schedule}>
+                              {schedule}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        CFG 보정
+                        <input min="0" max="1" step="0.02" type="number" value={draft.novelAi.cfgRescale} onChange={(event) => updateNovelAi({ cfgRescale: Number(event.target.value) })} />
+                      </label>
+                      <label>
+                        UC preset
+                        <input min="0" max="3" type="number" value={draft.novelAi.ucPreset} onChange={(event) => updateNovelAi({ ucPreset: Number(event.target.value) })} />
+                      </label>
+                    </div>
+                    <div className="two-fields">
+                      <label className="checkline">
+                        <input checked={draft.novelAi.seedFixed} type="checkbox" onChange={(event) => updateNovelAi({ seedFixed: event.target.checked })} />
+                        시드 고정
+                      </label>
+                      <label className="checkline">
+                        <input checked={draft.novelAi.varPlus} type="checkbox" onChange={(event) => updateNovelAi({ varPlus: event.target.checked })} />
+                        VAR+
+                      </label>
+                    </div>
+                  </div>
 
-              <div className="settings-section">
-                <SectionTitle icon={<RefreshCcw size={16} />} title="자동 생성 운영" />
-                <div className="two-fields">
-                  <label>
-                    시드
-                    <input type="number" value={draft.novelAi.seed ?? ""} onChange={(event) => updateNovelAi({ seed: event.target.value ? Number(event.target.value) : undefined })} />
-                  </label>
-                  <label>
-                    지연 초
-                    <input min="0" max="120" type="number" value={draft.novelAi.generationDelaySeconds} onChange={(event) => updateNovelAi({ generationDelaySeconds: Number(event.target.value) })} />
-                  </label>
-                </div>
-                <div className="four-fields">
-                  <label className="checkline">
-                    <input checked={draft.novelAi.randomDelayEnabled} type="checkbox" onChange={(event) => updateNovelAi({ randomDelayEnabled: event.target.checked })} />
-                    랜덤 지연
-                  </label>
-                  <label>
-                    반복
-                    <input min="1" max="100" type="number" value={draft.novelAi.repeatCount} onChange={(event) => updateNovelAi({ repeatCount: Number(event.target.value) })} />
-                  </label>
-                  <label>
-                    종료 조건
-                    <select value={draft.novelAi.automationTermination} onChange={(event) => updateNovelAi({ automationTermination: event.target.value as NovelAiAutomationTermination })}>
-                      {novelAiAutomationTerminations.map((termination) => (
-                        <option key={termination} value={termination}>
-                          {termination}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    제한값
-                    <input
-                      min="1"
-                      max="999"
-                      type="number"
-                      value={draft.novelAi.automationTermination === "timer" ? draft.novelAi.timerMinutes : draft.novelAi.countLimit}
-                      onChange={(event) =>
-                        updateNovelAi(
-                          draft.novelAi.automationTermination === "timer"
-                            ? { timerMinutes: Number(event.target.value) }
-                            : { countLimit: Number(event.target.value) }
-                        )
-                      }
-                    />
-                  </label>
-                </div>
-              </div>
-            </section>
+                  <div className="settings-section">
+                    <SectionTitle icon={<RefreshCcw size={16} />} title="자동 생성 운영" />
+                    <div className="two-fields">
+                      <label>
+                        시드
+                        <input type="number" value={draft.novelAi.seed ?? ""} onChange={(event) => updateNovelAi({ seed: event.target.value ? Number(event.target.value) : undefined })} />
+                      </label>
+                      <label>
+                        지연 초
+                        <input min="0" max="120" type="number" value={draft.novelAi.generationDelaySeconds} onChange={(event) => updateNovelAi({ generationDelaySeconds: Number(event.target.value) })} />
+                      </label>
+                    </div>
+                    <div className="four-fields">
+                      <label className="checkline">
+                        <input checked={draft.novelAi.randomDelayEnabled} type="checkbox" onChange={(event) => updateNovelAi({ randomDelayEnabled: event.target.checked })} />
+                        랜덤 지연
+                      </label>
+                      <label>
+                        반복
+                        <input min="1" max="100" type="number" value={draft.novelAi.repeatCount} onChange={(event) => updateNovelAi({ repeatCount: Number(event.target.value) })} />
+                      </label>
+                      <label>
+                        종료 조건
+                        <select value={draft.novelAi.automationTermination} onChange={(event) => updateNovelAi({ automationTermination: event.target.value as NovelAiAutomationTermination })}>
+                          {novelAiAutomationTerminations.map((termination) => (
+                            <option key={termination} value={termination}>
+                              {termination}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        제한값
+                        <input
+                          min="1"
+                          max="999"
+                          type="number"
+                          value={draft.novelAi.automationTermination === "timer" ? draft.novelAi.timerMinutes : draft.novelAi.countLimit}
+                          onChange={(event) =>
+                            updateNovelAi(
+                              draft.novelAi.automationTermination === "timer"
+                                ? { timerMinutes: Number(event.target.value) }
+                                : { countLimit: Number(event.target.value) }
+                            )
+                          }
+                        />
+                      </label>
+                    </div>
+                  </div>
+                </section>
+              ) : null}
 
-            <section className="builder-panel span-2">
-              <SectionTitle icon={<ImageIcon size={17} />} title="실사 이미지 (ComfyUI)" />
-              <div className="readonly-field">
-                <span>실행자 ComfyUI</span>
-                <strong>실사 컷은 시뮬레이션을 실행하는 사람의 PC에서 ComfyUI로 생성됩니다.</strong>
-                <small>여기서는 라우팅과 프리셋, 스타일만 정합니다. ComfyUI 주소 · 크기 · GPU 교대는 실행 화면의 설정 탭에서 조정합니다.</small>
-              </div>
-              <ImageBackendRoutingCard
-                routing={draftBackendRouting}
-                novelAiEnabled={draft.novelAi.enabled}
-                photorealEnabled={draft.photoreal.enabled}
-                onChange={(backendRouting) => updateImageProfile({ backendRouting })}
-              />
-              <div className="settings-section">
-                <SectionTitle icon={<Settings2 size={16} />} title="실사 렌더러" />
-                <div className="two-fields">
-                  <label className="checkline">
-                    <input checked={draft.photoreal.enabled} type="checkbox" onChange={(event) => updatePhotoreal({ enabled: event.target.checked })} />
-                    실사 이미지 사용
-                  </label>
-                  <label className="checkline">
-                    <input
-                      checked={draft.photoreal.faceReferenceEnabled}
-                      type="checkbox"
-                      onChange={(event) => updatePhotoreal({ faceReferenceEnabled: event.target.checked })}
-                    />
-                    캐릭터 실사 프로필로 얼굴 고정
-                  </label>
-                </div>
-                <div className="two-fields">
-                  <label>
-                    생성용 워크플로
-                    <select
-                      value={draft.photoreal.workflowPreset}
-                      onChange={(event) => updatePhotoreal({ workflowPreset: event.target.value as PhotorealWorkflowPresetId })}
-                    >
-                      {photorealWorkflowPresetOrder.map((presetId) => (
-                        <option key={presetId} value={presetId}>
-                          {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    얼굴 고정용 워크플로
-                    <select
-                      value={draft.photoreal.referenceWorkflowPreset}
-                      onChange={(event) => updatePhotoreal({ referenceWorkflowPreset: event.target.value as PhotorealWorkflowPresetId })}
-                    >
-                      {photorealWorkflowPresetOrder
-                        .filter(
-                          (presetId) =>
-                            PHOTOREAL_WORKFLOW_PRESETS[presetId].supportsReferences || presetId === draft.photoreal.referenceWorkflowPreset
-                        )
-                        .map((presetId) => (
-                          <option key={presetId} value={presetId}>
-                            {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
+              {apiSection === "photoreal" ? (
+                <section className="builder-panel span-2">
+                  <SectionTitle icon={<ImageIcon size={17} />} title="실사 이미지 (ComfyUI)" />
+                  <div className="readonly-field">
+                    <span>실행자 ComfyUI</span>
+                    <strong>실사 컷은 시뮬레이션을 실행하는 사람의 PC에서 ComfyUI로 생성됩니다.</strong>
+                    <small>여기서는 라우팅과 프리셋, 스타일만 정합니다. ComfyUI 주소 · 크기 · GPU 교대는 실행 화면의 설정 탭에서 조정합니다.</small>
+                  </div>
+                  <ImageBackendRoutingCard
+                    routing={draftBackendRouting}
+                    novelAiEnabled={draft.novelAi.enabled}
+                    photorealEnabled={draft.photoreal.enabled}
+                    onChange={(backendRouting) => updateImageProfile({ backendRouting })}
+                  />
+                  <div className="settings-section">
+                    <SectionTitle icon={<Settings2 size={16} />} title="실사 렌더러" />
+                    <div className="two-fields">
+                      <label className="checkline">
+                        <input checked={draft.photoreal.enabled} type="checkbox" onChange={(event) => updatePhotoreal({ enabled: event.target.checked })} />
+                        실사 이미지 사용
+                      </label>
+                      <label className="checkline">
+                        <input
+                          checked={draft.photoreal.faceReferenceEnabled}
+                          type="checkbox"
+                          onChange={(event) => updatePhotoreal({ faceReferenceEnabled: event.target.checked })}
+                        />
+                        캐릭터 실사 프로필로 얼굴 고정
+                      </label>
+                    </div>
+                    <div className="two-fields">
+                      <label>
+                        생성용 워크플로
+                        <select
+                          value={draft.photoreal.workflowPreset}
+                          onChange={(event) => updatePhotoreal({ workflowPreset: event.target.value as PhotorealWorkflowPresetId })}
+                        >
+                          {photorealWorkflowPresetOrder.map((presetId) => (
+                            <option key={presetId} value={presetId}>
+                              {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        얼굴 고정용 워크플로
+                        <select
+                          value={draft.photoreal.referenceWorkflowPreset}
+                          onChange={(event) => updatePhotoreal({ referenceWorkflowPreset: event.target.value as PhotorealWorkflowPresetId })}
+                        >
+                          {photorealWorkflowPresetOrder
+                            .filter(
+                              (presetId) =>
+                                PHOTOREAL_WORKFLOW_PRESETS[presetId].supportsReferences || presetId === draft.photoreal.referenceWorkflowPreset
+                            )
+                            .map((presetId) => (
+                              <option key={presetId} value={presetId}>
+                                {PHOTOREAL_WORKFLOW_PRESETS[presetId].label}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                    </div>
+                    {draftRenderingPresets.map(({ preset, role }) => (
+                      <div className="photoreal-preset-note" key={preset.id}>
+                        <PhotorealLicenseTag preset={preset} />
+                        <p className="runtime-hint">
+                          {draftRenderingPresets.length > 1 ? <strong>{role} · {preset.label}</strong> : null}
+                          {draftRenderingPresets.length > 1 ? " — " : null}
+                          {preset.description} 라이선스: {preset.license}.
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="settings-section">
+                    <SectionTitle icon={<Sparkles size={16} />} title="실사 스타일" />
+                    <label>
+                      스타일 프리셋
+                      <select
+                        value={draft.photoreal.stylePreset}
+                        onChange={(event) => updatePhotoreal({ stylePreset: event.target.value as PhotorealStylePresetId })}
+                      >
+                        {photorealStylePresetOrder.map((stylePreset) => (
+                          <option key={stylePreset} value={stylePreset}>
+                            {PHOTOREAL_STYLE_PRESETS[stylePreset].label}
                           </option>
                         ))}
-                    </select>
-                  </label>
-                </div>
-                {draftRenderingPresets.map(({ preset, role }) => (
-                  <div className="photoreal-preset-note" key={preset.id}>
-                    <PhotorealLicenseTag preset={preset} />
+                        <option value="custom">사용자 지정</option>
+                      </select>
+                    </label>
                     <p className="runtime-hint">
-                      {draftRenderingPresets.length > 1 ? <strong>{role} · {preset.label}</strong> : null}
-                      {draftRenderingPresets.length > 1 ? " — " : null}
-                      {preset.description} 라이선스: {preset.license}.
+                      {draft.photoreal.stylePreset === "custom"
+                        ? "아래 스타일 문장이 전부입니다. 첫 문장이 프롬프트 맨 앞에 오고, 나머지는 끝에 붙습니다."
+                        : PHOTOREAL_STYLE_PRESETS[draft.photoreal.stylePreset].description}
                     </p>
+                    <label>
+                      {draft.photoreal.stylePreset === "custom" ? "스타일 (영어)" : "스타일 추가 (영어, 선택)"}
+                      <textarea
+                        rows={3}
+                        value={draft.photoreal.stylePrompt}
+                        aria-describedby="builder-photoreal-style-screen"
+                        onChange={(event) => updatePhotoreal({ stylePrompt: event.target.value })}
+                      />
+                    </label>
+                    <PhotorealTextScreenNote
+                      id="builder-photoreal-style-screen"
+                      scope="style"
+                      state={draftScreeningState}
+                      text={draft.photoreal.stylePrompt}
+                    />
+                    <label>
+                      여성 인물 공통 외모 (실사 전용, 영어)
+                      <textarea
+                        rows={3}
+                        value={draft.photoreal.appearancePrompt}
+                        placeholder={PHOTOREAL_SHARED_APPEARANCE_PLACEHOLDER}
+                        aria-describedby="builder-photoreal-appearance-screen"
+                        onChange={(event) => updatePhotoreal({ appearancePrompt: event.target.value })}
+                      />
+                    </label>
+                    <PhotorealTextScreenNote
+                      id="builder-photoreal-appearance-screen"
+                      scope="appearance"
+                      state={draftScreeningState}
+                      text={draft.photoreal.appearancePrompt}
+                    />
+                    <p className="runtime-hint">실사 컷의 모든 여성 인물에게 붙습니다. 캐릭터마다 다른 외형은 캐릭터의 실사 외형 칸에 씁니다.</p>
+                    <label>
+                      네거티브 추가 (영어, 선택)
+                      <textarea rows={2} value={draft.photoreal.negativePrompt} onChange={(event) => updatePhotoreal({ negativePrompt: event.target.value })} />
+                    </label>
                   </div>
-                ))}
-              </div>
-              <div className="settings-section">
-                <SectionTitle icon={<Sparkles size={16} />} title="실사 스타일" />
-                <label>
-                  스타일 프리셋
-                  <select
-                    value={draft.photoreal.stylePreset}
-                    onChange={(event) => updatePhotoreal({ stylePreset: event.target.value as PhotorealStylePresetId })}
-                  >
-                    {photorealStylePresetOrder.map((stylePreset) => (
-                      <option key={stylePreset} value={stylePreset}>
-                        {PHOTOREAL_STYLE_PRESETS[stylePreset].label}
-                      </option>
-                    ))}
-                    <option value="custom">사용자 지정</option>
-                  </select>
-                </label>
-                <p className="runtime-hint">
-                  {draft.photoreal.stylePreset === "custom"
-                    ? "아래 스타일 문장이 전부입니다. 첫 문장이 프롬프트 맨 앞에 오고, 나머지는 끝에 붙습니다."
-                    : PHOTOREAL_STYLE_PRESETS[draft.photoreal.stylePreset].description}
-                </p>
-                <label>
-                  {draft.photoreal.stylePreset === "custom" ? "스타일 (영어)" : "스타일 추가 (영어, 선택)"}
-                  <textarea
-                    rows={3}
-                    value={draft.photoreal.stylePrompt}
-                    aria-describedby="builder-photoreal-style-screen"
-                    onChange={(event) => updatePhotoreal({ stylePrompt: event.target.value })}
-                  />
-                </label>
-                <PhotorealTextScreenNote
-                  id="builder-photoreal-style-screen"
-                  scope="style"
-                  state={draftScreeningState}
-                  text={draft.photoreal.stylePrompt}
-                />
-                <label>
-                  네거티브 추가 (영어, 선택)
-                  <textarea rows={2} value={draft.photoreal.negativePrompt} onChange={(event) => updatePhotoreal({ negativePrompt: event.target.value })} />
-                </label>
-              </div>
-            </section>
+                </section>
+              ) : null}
 
-            <section className="builder-panel">
-              <SectionTitle icon={<Database size={17} />} title="NeuralMap" />
-              <label className="checkline">
-                <input checked={draft.neuralMap.enabled} type="checkbox" onChange={(event) => updateNeuralMap({ enabled: event.target.checked })} />
-                API 연동 사용
-              </label>
-              <label>
-                기본 URL
-                <input value={draft.neuralMap.baseUrl} onChange={(event) => updateNeuralMap({ baseUrl: event.target.value })} />
-              </label>
-              <label>
-                검색 문맥 토큰 예산
-                <input min="800" max="12000" step="200" type="number" value={draft.neuralMap.tokenBudget} onChange={(event) => updateNeuralMap({ tokenBudget: Number(event.target.value) })} />
-              </label>
-            </section>
-          </div>
+              {apiSection === "neuralmap" ? (
+                <section className="builder-panel">
+                  <SectionTitle icon={<Database size={17} />} title="NeuralMap" />
+                  <label className="checkline">
+                    <input checked={draft.neuralMap.enabled} type="checkbox" onChange={(event) => updateNeuralMap({ enabled: event.target.checked })} />
+                    API 연동 사용
+                  </label>
+                  <label>
+                    기본 URL
+                    <input value={draft.neuralMap.baseUrl} onChange={(event) => updateNeuralMap({ baseUrl: event.target.value })} />
+                  </label>
+                  <label>
+                    검색 문맥 토큰 예산
+                    <input min="800" max="12000" step="200" type="number" value={draft.neuralMap.tokenBudget} onChange={(event) => updateNeuralMap({ tokenBudget: Number(event.target.value) })} />
+                  </label>
+                </section>
+              ) : null}
+            </div>
+          </RailSubtabs>
         ) : null}
 
         {activeTab === "review" ? (
@@ -17334,34 +17553,43 @@ function PersonaPanel({
 }
 
 /**
- * Keeps the model list of a local backend in sync with what that server is actually serving.
+ * Keeps a backend's model list in sync with what that backend actually accepts right now.
  *
- * Local presets ship no model names on purpose — the list lives on the machine, not in the code — so until
- * something asks the server the dropdown is empty and the keyless path looks broken. Selecting the provider
- * is the moment the address becomes known, so that is when discovery runs; the button only exists to retry
- * after the user starts the server. The auto pass is silent because the base-URL field updates per
- * keystroke: it is debounced, and only an explicit retry reports what it found.
+ * Two kinds of backend need this. Local presets ship no model names on purpose — the list lives on the
+ * machine, not in the code — so until something asks the server the dropdown is empty and the keyless path
+ * looks broken. The agy CLI ships a preset list, but agy retires ids without warning and then refuses them
+ * outright, so the preset alone drifts into offering models that can only fail; asking agy is the fix.
+ *
+ * Selecting the provider is the moment the source becomes known, so that is when discovery runs; the button
+ * only exists to retry after the user starts the server or signs in. The auto pass is silent because the
+ * base-URL field updates per keystroke: it is debounced, and only an explicit retry reports what it found.
  */
-function useLocalLlmModelDiscovery(
+function useLlmModelDiscovery(
   settings: Pick<LlmApiSettings, "provider" | "baseUrl" | "apiKey">,
   onNotify: (message: string) => void
-): { models: string[]; isLoading: boolean; reload: () => void } {
+): { models: string[]; isLoading: boolean; reload: () => void; isDiscoverable: boolean } {
   const { provider, baseUrl, apiKey } = settings;
   const [models, setModels] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const isLocalProvider = getLlmProviderOption(provider).group === "local";
+  const isAgyProvider = provider === "antigravity_cli";
+  const isDiscoverable = isAgyProvider || (isLocalProvider && Boolean(baseUrl.trim()));
+  const discover = useCallback(
+    () => (isAgyProvider ? listCliAgentModels("antigravity") : listLocalLlmModels({ baseUrl, apiKey })),
+    [apiKey, baseUrl, isAgyProvider]
+  );
 
   useEffect(() => {
-    // A provider switch invalidates whatever the previous server reported.
+    // A provider switch invalidates whatever the previous source reported.
     setModels([]);
-    if (!isLocalProvider || !baseUrl.trim()) {
+    if (!isDiscoverable) {
       return;
     }
 
     let cancelled = false;
     const timer = window.setTimeout(() => {
       setIsLoading(true);
-      void listLocalLlmModels({ baseUrl, apiKey })
+      void discover()
         .then((found) => {
           if (!cancelled) {
             setModels(found);
@@ -17375,27 +17603,70 @@ function useLocalLlmModelDiscovery(
     }, 400);
 
     return () => {
-      // Guards against a switch mid-flight publishing the previous server's list.
+      // Guards against a switch mid-flight publishing the previous source's list.
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [apiKey, baseUrl, isLocalProvider, provider]);
+  }, [discover, isDiscoverable, provider]);
 
   const reload = useCallback(() => {
     setIsLoading(true);
-    void listLocalLlmModels({ baseUrl, apiKey })
+    void discover()
       .then((found) => {
         setModels(found);
         onNotify(
           found.length > 0
-            ? `로컬 서버에서 모델 ${found.length}개를 불러왔습니다.`
-            : "로컬 서버에서 모델 목록을 가져오지 못했습니다. 서버가 실행 중인지, 기본 URL이 맞는지 확인하세요."
+            ? `${isAgyProvider ? "agy" : "로컬 서버"}에서 모델 ${found.length}개를 불러왔습니다.`
+            : isAgyProvider
+              ? "agy에서 모델 목록을 가져오지 못했습니다. API 서버가 실행 중인지, agy에 로그인되어 있는지 확인하세요."
+              : "로컬 서버에서 모델 목록을 가져오지 못했습니다. 서버가 실행 중인지, 기본 URL이 맞는지 확인하세요."
         );
       })
       .finally(() => setIsLoading(false));
-  }, [apiKey, baseUrl, onNotify]);
+  }, [discover, isAgyProvider, onNotify]);
 
-  return { models, isLoading, reload };
+  return { models, isLoading, reload, isDiscoverable };
+}
+
+/**
+ * A stored agy model id that agy no longer lists. agy retires ids without notice and then refuses them, and a
+ * simulation saved before that stopped producing turns with nothing on screen saying why. The API bridge now runs
+ * the replacement below in its place; this says so, and offers to store it so the setting matches what runs.
+ */
+function StaleAgyModelNote({
+  model,
+  discovered,
+  onReplace
+}: {
+  model: string;
+  discovered: string[];
+  onReplace: (replacement: string) => void;
+}) {
+  const current = model.trim();
+  if (!current || discovered.length === 0 || discovered.includes(current)) {
+    return null;
+  }
+  const replacement = pickAntigravityReplacementModel(current, discovered);
+  return (
+    <div className="stale-model-note">
+      <p className="settings-note warning">
+        agy가 더 이상 <code>{current}</code> 모델을 제공하지 않습니다.
+        {replacement ? ` 지금은 같은 계열의 ${replacement}(으)로 대신 진행합니다.` : " 위 목록에서 모델을 다시 고르세요."}
+      </p>
+      {replacement ? (
+        <button className="icon-text-button full" type="button" onClick={() => onReplace(replacement)}>
+          <Check size={15} />
+          {replacement}(으)로 바꾸기
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/** Preset + discovered models for the dropdown. A discovered agy list is authoritative (see the hook above). */
+function mergeDiscoveredModels(provider: LlmProvider, discovered: string[], presetModels: string[]): string[] {
+  const models = provider === "antigravity_cli" && discovered.length > 0 ? discovered : [...discovered, ...presetModels];
+  return uniqueIds(models).filter((model) => model !== "custom");
 }
 
 function SettingsPanel({
@@ -17410,7 +17681,9 @@ function SettingsPanel({
   onResetDemo,
   jumpRequest,
   onJumpHandled,
-  onRunLocalLlmTask
+  onRunLocalLlmTask,
+  section,
+  onSectionChange
 }: {
   state: AppState;
   onImageProfileChange: (patch: Partial<ImageGenerationProfile>) => void;
@@ -17426,14 +17699,23 @@ function SettingsPanel({
   onJumpHandled?: () => void;
   /** The shared local-GPU lock for LLM calls made here; without it the call runs directly. */
   onRunLocalLlmTask?: LocalLlmTaskRunner;
+  /** The one section to show (the rail's sub-tabs). Without it every section renders in one column. */
+  section?: SettingsSection;
+  onSectionChange?: (section: SettingsSection) => void;
 }) {
   const [isRuntimeVerifying, setIsRuntimeVerifying] = useState(false);
   const photorealSectionRef = useRef<HTMLDivElement>(null);
+  const shows = (target: SettingsSection) => section === undefined || section === target;
   // Runs where the panel is on screen only: the rail and the mobile drawer can both hold a settings panel, and the
   // hidden one must leave the request to the visible one. A frame later, so a drawer that has just opened has
   // already moved focus to its first control, and this focus is the one that stays.
   useEffect(() => {
     if (jumpRequest?.section !== "photoreal") {
+      return;
+    }
+    // The ComfyUI section only exists on its own tab; switch first, and this runs again once it is rendered.
+    if (section !== undefined && section !== "photoreal") {
+      onSectionChange?.("photoreal");
       return;
     }
     const frame = window.requestAnimationFrame(() => {
@@ -17447,7 +17729,7 @@ function SettingsPanel({
       onJumpHandled?.();
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [jumpRequest, onJumpHandled]);
+  }, [jumpRequest, onJumpHandled, section, onSectionChange]);
   const [runtimeCheck, setRuntimeCheck] = useState("");
   const [vibeEncodeStatus, setVibeEncodeStatus] = useState<Record<string, { state: "encoding" | "error"; message?: string }>>({});
   const [dynamicChatApiBaseUrl, setDynamicChatApiBaseUrl] = useState(() => getConfiguredDynamicChatApiBaseUrl());
@@ -17485,16 +17767,15 @@ function SettingsPanel({
   const novelAiSupportsCharacterReference = novelAiCharacterReferencePresets.has(state.novelAi.modelPreset);
   const novelAiIsV5 = state.novelAi.modelPreset.startsWith("NAID5");
   const notifyApplied = useCallback((message: string) => onNotify?.(message), [onNotify]);
-  // Models discovered from a running local server, merged into the preset list. Keeps the keyless local
-  // path usable without asking the user to type an exact model id from memory.
+  // Models discovered from a running local server or from agy. A local list is merged into the preset list,
+  // which keeps the keyless path usable without typing an exact id from memory. An agy list REPLACES the
+  // preset: agy refuses retired ids outright, so offering them next to the live list only offers failures.
   const {
     models: discoveredLocalModels,
     isLoading: isLoadingLocalModels,
     reload: loadLocalModels
-  } = useLocalLlmModelDiscovery(state.llm, notifyApplied);
-  const availableLlmModels = uniqueIds([...discoveredLocalModels, ...llmProvider.models]).filter(
-    (model) => model !== "custom"
-  );
+  } = useLlmModelDiscovery(state.llm, notifyApplied);
+  const availableLlmModels = mergeDiscoveredModels(state.llm.provider, discoveredLocalModels, llmProvider.models);
   const selectedLlmModel = availableLlmModels.includes(state.llm.model) ? state.llm.model : "custom";
   // The image-tag model gets its own discovery and its own context size. Running the tag pass on a second,
   // smaller local model is the setup that makes a high-density cadence affordable — but it only works if
@@ -17503,11 +17784,12 @@ function SettingsPanel({
     models: discoveredImageTagLocalModels,
     isLoading: isLoadingImageTagLocalModels,
     reload: loadImageTagLocalModels
-  } = useLocalLlmModelDiscovery(state.imageTagLlm, notifyApplied);
-  const availableImageTagLlmModels = uniqueIds([
-    ...discoveredImageTagLocalModels,
-    ...imageTagLlmProvider.models
-  ]).filter((model) => model !== "custom");
+  } = useLlmModelDiscovery(state.imageTagLlm, notifyApplied);
+  const availableImageTagLlmModels = mergeDiscoveredModels(
+    state.imageTagLlm.provider,
+    discoveredImageTagLocalModels,
+    imageTagLlmProvider.models
+  );
   const selectedImageTagLlmModel = availableImageTagLlmModels.includes(state.imageTagLlm.model)
     ? state.imageTagLlm.model
     : "custom";
@@ -17525,6 +17807,27 @@ function SettingsPanel({
     },
     [notifyApplied, onLlmChange]
   );
+  // The local presets ship with no model (an untouched field must not POST a made-up id), so switching to Ollama
+  // left the field empty and every turn failed with "모델 이름이 비어 있습니다" although the installed list was already
+  // loaded into the dropdown. Take the first installed model when a list arrives for an empty field. It runs only
+  // when a new list arrives, so choosing "직접 입력" afterwards is left alone.
+  const llmModelIsEmpty = !state.llm.model.trim();
+  const imageTagLlmModelIsEmpty = !state.imageTagLlm.model.trim();
+  useEffect(() => {
+    const first = discoveredLocalModels[0];
+    if (first && llmModelIsEmpty && getLlmProviderOption(state.llm.provider).group === "local") {
+      applyLlmChange({ model: first }, `설치된 로컬 모델 ${first} 을(를) 선택했습니다.`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only a newly discovered list should trigger this
+  }, [discoveredLocalModels]);
+  useEffect(() => {
+    const first = discoveredImageTagLocalModels[0];
+    if (first && imageTagLlmModelIsEmpty && getLlmProviderOption(state.imageTagLlm.provider).group === "local") {
+      onImageTagLlmChange({ model: first });
+      notifyApplied(`이미지 태그 LLM에 설치된 로컬 모델 ${first} 을(를) 선택했습니다.`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only a newly discovered list should trigger this
+  }, [discoveredImageTagLocalModels]);
   const applyNovelAiChange = useCallback(
     (patch: Partial<NovelAiApiSettings>, message: string) => {
       onNovelAiChange(patch);
@@ -17739,348 +18042,208 @@ function SettingsPanel({
 
   return (
     <div className="settings-panel">
-      <div className="runtime-settings-overview">
-        <div>
-          <span className="section-kicker">진행 설정</span>
-          <strong>{activePromptModeOption.label} 모드</strong>
-          <p>{activePromptModeOption.description}</p>
-        </div>
-        <div className="runtime-settings-metrics">
-          <Metric label="LLM" value={llmProvider.label} />
-          <Metric label="출력" value={activeOutputLengthLabel} />
-          <Metric label="문맥" value={`${state.neuralMap.tokenBudget}토큰`} />
-          <Metric label="등급" value={activeContentRatingOption.label} />
-          <Metric label="Prompt" value={`${state.modules.filter((module) => module.enabled).length}개`} />
-          <Metric label="Image" value={activeImageGenerationCadence.label} />
-          <Metric label="실사" value={photorealMetricLabel} />
-        </div>
-      </div>
-
-      <SectionTitle icon={<ShieldCheck size={17} />} title="콘텐츠 등급" />
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>{activeContentRatingOption.label}</strong>
-          <span>{activeContentRatingOption.detail}</span>
-        </div>
-        <label>
-          진행 등급
-          <select value={state.simulation.contentRating} onChange={(event) => applyContentRatingChange(event.target.value as ContentRating)}>
-            {contentRatingOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <p className="settings-note">DynamicChat 앱은 콘텐츠 차단기를 두지 않고, 등급은 LLM/NovelAI 설정과 사용자 규칙에 전달됩니다.</p>
-      </div>
-
-      <SectionTitle icon={<ShieldCheck size={17} />} title="저장/권한" />
-      <div className="context-pack">
-        <strong>{state.security.scope.ownerId} · {state.security.scope.workspaceId}</strong>
-        <div className="evidence-row">
-          <span>scope</span>
-          <p>{state.security.scope.projectId}</p>
-          <small>{state.security.scope.environment} · browser secret cache {state.security.browserSecretCacheEnabled ? "on" : "off"}</small>
-        </div>
-        <div className="evidence-row">
-          <span>secret</span>
-          <p>{state.security.secretStorage}</p>
-          <small>{state.security.warning}</small>
-        </div>
-      </div>
-
-      <SectionTitle icon={<Database size={17} />} title="DynamicChat API" />
-      <label>
-        기본 URL
-        <input
-          placeholder="http://127.0.0.1:8788"
-          value={dynamicChatApiBaseUrl}
-          onChange={(event) => {
-            setDynamicChatApiBaseUrl(event.target.value);
-            configureDynamicChatApiBaseUrl(event.target.value);
-          }}
-          onBlur={() => notifyApplied("DynamicChat API 기본 URL이 적용되었습니다.")}
-        />
-      </label>
-
-      <SectionTitle icon={<ImageIcon size={17} />} title="이미지 트리거/프롬프트" />
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>생성 트리거</strong>
-          <span>{state.simulation.realtimeImageEnabled ? "실시간" : "비활성"}</span>
-        </div>
-        <label className="checkline">
-          <input
-            checked={state.simulation.realtimeImageEnabled}
-            type="checkbox"
-            onChange={(event) =>
-              applyStateChange(
-                (current) => ({
-                  ...current,
-                  simulation: {
-                    ...current.simulation,
-                    realtimeImageEnabled: event.target.checked
-                  }
-                }),
-                event.target.checked ? "실시간 이미지가 활성화되었습니다." : "실시간 이미지가 비활성화되었습니다."
-              )
-            }
-          />
-          실시간 이미지 활성화
-        </label>
-        <label>
-          생성 모드
-          <select
-            value={state.imageProfile.triggerMode}
-            onChange={(event) => applyImageProfileChange({ triggerMode: event.target.value as ImageTriggerMode }, "이미지 생성 모드가 적용되었습니다.")}
-          >
-            {triggerModes.map((mode) => (
-              <option key={mode} value={mode}>
-                {mode}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="runtime-preset-field">
-          생성 밀도 <span className="inline-value">{activeImageGenerationCadence.label}</span>
-          <div className="runtime-preset-grid" role="group" aria-label="이미지 생성 밀도 프리셋">
-            {imageGenerationCadenceOptions.map((option) => (
-              <button
-                key={option.value}
-                className={state.imageProfile.generationCadence === option.value ? "active" : ""}
-                type="button"
-                onClick={() => applyImageProfileChange({ generationCadence: option.value }, `${option.label} 이미지 생성 밀도가 적용되었습니다.`)}
-              >
-                <strong>{option.label}</strong>
-                <span>{option.detail}</span>
-              </button>
-            ))}
+      {shows("general") ? (
+        <>
+          <div className="runtime-settings-overview">
+            <div>
+              <span className="section-kicker">진행 설정</span>
+              <strong>{activePromptModeOption.label} 모드</strong>
+              <p>{activePromptModeOption.description}</p>
+            </div>
+            <div className="runtime-settings-metrics">
+              <Metric label="LLM" value={llmProvider.label} />
+              <Metric label="출력" value={activeOutputLengthLabel} />
+              <Metric label="문맥" value={`${state.neuralMap.tokenBudget}토큰`} />
+              <Metric label="등급" value={activeContentRatingOption.label} />
+              <Metric label="Prompt" value={`${state.modules.filter((module) => module.enabled).length}개`} />
+              <Metric label="Image" value={activeImageGenerationCadence.label} />
+              <Metric label="실사" value={photorealMetricLabel} />
+            </div>
           </div>
-        </label>
-      </div>
-      <ImageBackendRoutingCard
-        routing={imageBackendRouting}
-        novelAiEnabled={state.novelAi.enabled}
-        photorealEnabled={photorealSettings.enabled}
-        onChange={(backendRouting, message) => applyImageProfileChange({ backendRouting }, message)}
-      />
-      <div className="runtime-parameter-card image-prompt-settings-card">
-        <div className="runtime-card-subhead">
-          <strong>프롬프트 레이어</strong>
-          <span>태그/규정</span>
-        </div>
-        <div className="two-fields">
-          <label>
-            작가 프롬프트
-            <textarea value={state.imageProfile.artistPrompt} onChange={(event) => onImageProfileChange({ artistPrompt: event.target.value })} onBlur={() => notifyApplied("작가 프롬프트가 적용되었습니다.")} />
-          </label>
-          <label>
-            기본 퀄리티 프롬프트
-            <textarea value={state.imageProfile.qualityPrompt} onChange={(event) => onImageProfileChange({ qualityPrompt: event.target.value })} onBlur={() => notifyApplied("퀄리티 프롬프트가 적용되었습니다.")} />
-          </label>
-        </div>
-        <label>
-          스타일 프롬프트
-          <textarea value={state.imageProfile.stylePrompt} onChange={(event) => onImageProfileChange({ stylePrompt: event.target.value })} onBlur={() => notifyApplied("스타일 프롬프트가 적용되었습니다.")} />
-        </label>
-        <label>
-          공통 negative prompt
-          <textarea value={state.imageProfile.negativePrompt} onChange={(event) => onImageProfileChange({ negativePrompt: event.target.value })} onBlur={() => notifyApplied("Negative prompt가 적용되었습니다.")} />
-        </label>
-        <label>
-          사용자 규정 / LLM 지시문
-          <textarea value={state.imageProfile.userRules} onChange={(event) => onImageProfileChange({ userRules: event.target.value })} onBlur={() => notifyApplied("사용자 이미지 규정이 적용되었습니다.")} />
-        </label>
-      </div>
 
-      <SectionTitle icon={<Bot size={17} />} title="LLM 런타임" />
-      <div className="runtime-model-card">
-        <div className="runtime-model-heading">
-          <div>
-            <span>현재 API</span>
-            <strong>{llmProvider.label}</strong>
+          <SectionTitle icon={<ShieldCheck size={17} />} title="콘텐츠 등급" />
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>{activeContentRatingOption.label}</strong>
+              <span>{activeContentRatingOption.detail}</span>
+            </div>
+            <label>
+              진행 등급
+              <select value={state.simulation.contentRating} onChange={(event) => applyContentRatingChange(event.target.value as ContentRating)}>
+                {contentRatingOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="settings-note">DynamicChat 앱은 콘텐츠 차단기를 두지 않고, 등급은 LLM/NovelAI 설정과 사용자 규칙에 전달됩니다.</p>
           </div>
-          <StatusPill
-            icon={<Bot size={15} />}
-            label={llmStatusLabel}
-            tone={llmHasSecret && state.llm.registrationStatus !== "failed" ? "good" : "neutral"}
-          />
-        </div>
-        {llmNeedsSecret || state.llm.registrationStatus === "failed" || state.llm.registrationStatus === "verifying" ? (
-          <ApiStatusCard title="LLM 등록 상태" status={state.llm.registrationStatus} message={state.llm.verificationMessage} verifiedAt={state.llm.verifiedAt} />
-        ) : null}
-        <p className="settings-note">LLM API 키는 개인 설정에서 관리하고, 여기서는 진행 중인 시뮬레이션의 Provider와 실행 모델만 바꿉니다.</p>
-        <label>
-          공급자
-          <select
-            value={state.llm.provider}
-            onChange={(event) => {
-              const provider = event.target.value as LlmApiSettings["provider"];
-              applyLlmChange(createLlmProviderPatch(provider), `${getLlmProviderOption(provider).label} 공급자가 적용되었습니다.`);
-            }}
-          >
-            <LlmProviderOptionGroups />
-          </select>
-          {llmProvider.hint ? <small className="provider-hint">{llmProvider.hint}</small> : null}
-        </label>
-        {llmProvider.advancedBaseUrl ? (
+
+          <SectionTitle icon={<ShieldCheck size={17} />} title="저장/권한" />
+          <div className="context-pack">
+            <strong>{state.security.scope.ownerId} · {state.security.scope.workspaceId}</strong>
+            <div className="evidence-row">
+              <span>scope</span>
+              <p>{state.security.scope.projectId}</p>
+              <small>{state.security.scope.environment} · browser secret cache {state.security.browserSecretCacheEnabled ? "on" : "off"}</small>
+            </div>
+            <div className="evidence-row">
+              <span>secret</span>
+              <p>{state.security.secretStorage}</p>
+              <small>{state.security.warning}</small>
+            </div>
+          </div>
+
+          <SectionTitle icon={<Database size={17} />} title="DynamicChat API" />
           <label>
             기본 URL
             <input
-              value={state.llm.baseUrl}
-              onChange={(event) => onLlmChange({ baseUrl: event.target.value, registrationStatus: "idle", verificationMessage: "" })}
-              onBlur={() => notifyApplied("LLM 기본 URL이 적용되었습니다.")}
-            />
-          </label>
-        ) : null}
-        <div className="runtime-model-grid">
-          <label>
-            사용 가능 모델
-            <select
-              value={selectedLlmModel}
+              placeholder="http://127.0.0.1:8788"
+              value={dynamicChatApiBaseUrl}
               onChange={(event) => {
-                if (event.target.value === "custom") {
-                  applyLlmChange({ model: "" }, "커스텀 LLM 모델 입력으로 전환했습니다.");
-                  return;
-                }
-                applyLlmChange({ model: event.target.value }, `${event.target.value} 모델이 적용되었습니다.`);
+                setDynamicChatApiBaseUrl(event.target.value);
+                configureDynamicChatApiBaseUrl(event.target.value);
               }}
-            >
-              {availableLlmModels.map((model) => (
-                <option key={model} value={model}>
-                  {model}
-                </option>
-              ))}
-              <option value="custom">직접 입력</option>
-            </select>
-          </label>
-          {/* Local backends are the keyless path, so there is no vendor console to copy a model id from and
-              a typo surfaces as an opaque upstream 404. Every local server implements GET /v1/models. */}
-          {llmProvider.group === "local" ? (
-            <label>
-              설치된 모델
-              <button className="icon-text-button full" type="button" onClick={loadLocalModels} disabled={isLoadingLocalModels}>
-                <RefreshCcw size={15} />
-                {isLoadingLocalModels
-                  ? "불러오는 중…"
-                  : discoveredLocalModels.length > 0
-                    ? `${discoveredLocalModels.length}개 — 다시 불러오기`
-                    : "서버를 찾지 못함 — 다시 시도"}
-              </button>
-            </label>
-          ) : null}
-          {/* Ollama serves every model at a 4096-token context unless told otherwise, so the same model name
-              can mean 4k or 32k. The prompt is sized from this and the native transport passes it as
-              num_ctx, which is what makes the annotation pass fit at all on a local setup. */}
-          <label>
-            컨텍스트 (토큰)
-            <input
-              type="number"
-              min="2048"
-              step="1024"
-              value={state.llm.contextTokens ?? llmProvider.contextTokens}
-              onChange={(event) => onLlmChange({ contextTokens: Math.max(2048, Number(event.target.value) || 0) })}
-              onBlur={() => notifyApplied("LLM 컨텍스트 크기가 적용되었습니다.")}
+              onBlur={() => notifyApplied("DynamicChat API 기본 URL이 적용되었습니다.")}
             />
           </label>
-          <label>
-            직접 입력
-            <input
-              value={state.llm.model}
-              placeholder={llmProvider.defaultModel}
-              onChange={(event) => onLlmChange({ model: event.target.value })}
-              onBlur={() => notifyApplied("LLM 모델 입력값이 적용되었습니다.")}
-            />
-          </label>
-        </div>
-        <div className="runtime-model-grid compact">
-          <label className="runtime-preset-field">
-            출력량 목표
-            <div className="runtime-preset-grid" role="group" aria-label="LLM 출력량 프리셋">
-              {outputLengthPresets.map((preset) => (
-                <button
-                  key={preset.id}
-                  className={activeOutputLengthPreset === preset.id ? "active" : ""}
-                  type="button"
-                  onClick={() => applyLlmChange({ maxTokens: preset.tokens }, `${preset.label} 출력량 목표가 적용되었습니다.`)}
-                >
-                  <strong>{preset.label}</strong>
-                  <span>{preset.detail}</span>
-                </button>
-              ))}
-            </div>
-          </label>
-          <label>
-            응답 출력 토큰 <span className="inline-value">{activeOutputLengthLabel}</span>
-            <input
-              type="number"
-              min="512"
-              max="8000"
-              step="100"
-              value={state.llm.maxTokens}
-              onChange={(event) => onLlmChange({ maxTokens: Number(event.target.value) })}
-              onBlur={() => notifyApplied("LLM 최대 출력 토큰이 적용되었습니다.")}
-            />
-          </label>
-          <label>
-            온도 <span className="inline-value">{state.llm.temperature.toFixed(2)}</span>
-            <input
-              type="range"
-              min="0"
-              max="1.5"
-              step="0.05"
-              value={state.llm.temperature}
-              onChange={(event) => onLlmChange({ temperature: Number(event.target.value) })}
-              onMouseUp={() => notifyApplied("LLM temperature가 적용되었습니다.")}
-              onTouchEnd={() => notifyApplied("LLM temperature가 적용되었습니다.")}
-            />
-          </label>
-        </div>
-        {llmNeedsSecret ? (
-          <div className="readonly-field runtime-secret-state warning">
-            <span>개인 API 키</span>
-            <strong>개인 설정에서 {llmProvider.label} 키 등록 필요</strong>
-            <small>제작자 키는 포함되지 않으므로 실행자의 개인 키만 사용합니다.</small>
-          </div>
-        ) : null}
-        <button className="icon-text-button full" type="button" onClick={onOpenPersonalSettings}>
-          <KeyRound size={16} />
-          개인 설정에서 LLM 키 관리
-        </button>
-      </div>
+        </>
+      ) : null}
 
-      <SectionTitle icon={<Bot size={17} />} title="이미지 태그 전용 LLM" />
-      <div className="runtime-model-card">
-        <p className="settings-note">내러티브 모델과 분리되어 더 저렴한 모델로 이미지 태그(NovelAI 태그)를 생성할 수 있습니다. 비활성화하면 메인 LLM을 사용합니다.</p>
-        <label className="checkline">
-          <input
-            type="checkbox"
-            checked={state.imageTagLlm.enabled}
-            onChange={(event) => onImageTagLlmChange({ enabled: event.target.checked })}
+      {shows("image") ? (
+        <>
+          <SectionTitle icon={<ImageIcon size={17} />} title="이미지 트리거/프롬프트" />
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>생성 트리거</strong>
+              <span>{state.simulation.realtimeImageEnabled ? "실시간" : "비활성"}</span>
+            </div>
+            <label className="checkline">
+              <input
+                checked={state.simulation.realtimeImageEnabled}
+                type="checkbox"
+                onChange={(event) =>
+                  applyStateChange(
+                    (current) => ({
+                      ...current,
+                      simulation: {
+                        ...current.simulation,
+                        realtimeImageEnabled: event.target.checked
+                      }
+                    }),
+                    event.target.checked ? "실시간 이미지가 활성화되었습니다." : "실시간 이미지가 비활성화되었습니다."
+                  )
+                }
+              />
+              실시간 이미지 활성화
+            </label>
+            <label>
+              생성 모드
+              <select
+                value={state.imageProfile.triggerMode}
+                onChange={(event) => applyImageProfileChange({ triggerMode: event.target.value as ImageTriggerMode }, "이미지 생성 모드가 적용되었습니다.")}
+              >
+                {triggerModes.map((mode) => (
+                  <option key={mode} value={mode}>
+                    {mode}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="runtime-preset-field">
+              생성 밀도 <span className="inline-value">{activeImageGenerationCadence.label}</span>
+              <div className="runtime-preset-grid" role="group" aria-label="이미지 생성 밀도 프리셋">
+                {imageGenerationCadenceOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    className={state.imageProfile.generationCadence === option.value ? "active" : ""}
+                    type="button"
+                    onClick={() => applyImageProfileChange({ generationCadence: option.value }, `${option.label} 이미지 생성 밀도가 적용되었습니다.`)}
+                  >
+                    <strong>{option.label}</strong>
+                    <span>{option.detail}</span>
+                  </button>
+                ))}
+              </div>
+            </label>
+          </div>
+          <ImageBackendRoutingCard
+            routing={imageBackendRouting}
+            novelAiEnabled={state.novelAi.enabled}
+            photorealEnabled={photorealSettings.enabled}
+            onChange={(backendRouting, message) => applyImageProfileChange({ backendRouting }, message)}
           />
-          별도 모델로 이미지 태그 생성
-        </label>
-        {state.imageTagLlm.enabled ? (
-          <>
+          <div className="runtime-parameter-card image-prompt-settings-card">
+            <div className="runtime-card-subhead">
+              <strong>프롬프트 레이어</strong>
+              <span>태그/규정</span>
+            </div>
+            <div className="two-fields">
+              <label>
+                작가 프롬프트
+                <textarea value={state.imageProfile.artistPrompt} onChange={(event) => onImageProfileChange({ artistPrompt: event.target.value })} onBlur={() => notifyApplied("작가 프롬프트가 적용되었습니다.")} />
+              </label>
+              <label>
+                기본 퀄리티 프롬프트
+                <textarea value={state.imageProfile.qualityPrompt} onChange={(event) => onImageProfileChange({ qualityPrompt: event.target.value })} onBlur={() => notifyApplied("퀄리티 프롬프트가 적용되었습니다.")} />
+              </label>
+            </div>
+            <label>
+              스타일 프롬프트
+              <textarea value={state.imageProfile.stylePrompt} onChange={(event) => onImageProfileChange({ stylePrompt: event.target.value })} onBlur={() => notifyApplied("스타일 프롬프트가 적용되었습니다.")} />
+            </label>
+            <label>
+              공통 negative prompt
+              <textarea value={state.imageProfile.negativePrompt} onChange={(event) => onImageProfileChange({ negativePrompt: event.target.value })} onBlur={() => notifyApplied("Negative prompt가 적용되었습니다.")} />
+            </label>
+            <label>
+              사용자 규정 / LLM 지시문
+              <textarea value={state.imageProfile.userRules} onChange={(event) => onImageProfileChange({ userRules: event.target.value })} onBlur={() => notifyApplied("사용자 이미지 규정이 적용되었습니다.")} />
+            </label>
+          </div>
+        </>
+      ) : null}
+
+      {shows("model") ? (
+        <>
+          <SectionTitle icon={<Bot size={17} />} title="LLM 런타임" />
+          <div className="runtime-model-card">
+            <div className="runtime-model-heading">
+              <div>
+                <span>현재 API</span>
+                <strong>{llmProvider.label}</strong>
+              </div>
+              <StatusPill
+                icon={<Bot size={15} />}
+                label={llmStatusLabel}
+                tone={llmHasSecret && state.llm.registrationStatus !== "failed" ? "good" : "neutral"}
+              />
+            </div>
+            {llmNeedsSecret || state.llm.registrationStatus === "failed" || state.llm.registrationStatus === "verifying" ? (
+              <ApiStatusCard title="LLM 등록 상태" status={state.llm.registrationStatus} message={state.llm.verificationMessage} verifiedAt={state.llm.verifiedAt} />
+            ) : null}
+            <p className="settings-note">LLM API 키는 개인 설정에서 관리하고, 여기서는 진행 중인 시뮬레이션의 Provider와 실행 모델만 바꿉니다.</p>
             <label>
               공급자
               <select
-                value={state.imageTagLlm.provider}
+                value={state.llm.provider}
                 onChange={(event) => {
                   const provider = event.target.value as LlmApiSettings["provider"];
-                  onImageTagLlmChange(createLlmProviderPatch(provider));
+                  applyLlmChange(createLlmProviderPatch(provider), `${getLlmProviderOption(provider).label} 공급자가 적용되었습니다.`);
                 }}
               >
                 <LlmProviderOptionGroups />
               </select>
+              {llmProvider.hint ? <small className="provider-hint">{llmProvider.hint}</small> : null}
             </label>
-            {imageTagLlmProvider.advancedBaseUrl ? (
+            {llmProvider.advancedBaseUrl ? (
               <label>
                 기본 URL
                 <input
-                  value={state.imageTagLlm.baseUrl}
-                  onChange={(event) => onImageTagLlmChange({ baseUrl: event.target.value })}
+                  value={state.llm.baseUrl}
+                  onChange={(event) => onLlmChange({ baseUrl: event.target.value, registrationStatus: "idle", verificationMessage: "" })}
+                  onBlur={() => notifyApplied("LLM 기본 URL이 적용되었습니다.")}
                 />
               </label>
             ) : null}
@@ -18088,16 +18251,16 @@ function SettingsPanel({
               <label>
                 사용 가능 모델
                 <select
-                  value={selectedImageTagLlmModel}
+                  value={selectedLlmModel}
                   onChange={(event) => {
                     if (event.target.value === "custom") {
-                      onImageTagLlmChange({ model: "" });
+                      applyLlmChange({ model: "" }, "커스텀 LLM 모델 입력으로 전환했습니다.");
                       return;
                     }
-                    onImageTagLlmChange({ model: event.target.value });
+                    applyLlmChange({ model: event.target.value }, `${event.target.value} 모델이 적용되었습니다.`);
                   }}
                 >
-                  {availableImageTagLlmModels.map((model) => (
+                  {availableLlmModels.map((model) => (
                     <option key={model} value={model}>
                       {model}
                     </option>
@@ -18105,639 +18268,824 @@ function SettingsPanel({
                   <option value="custom">직접 입력</option>
                 </select>
               </label>
+              {/* Local backends are the keyless path, so there is no vendor console to copy a model id from and
+                  a typo surfaces as an opaque upstream 404. Every local server implements GET /v1/models. */}
+              {llmProvider.group === "local" || state.llm.provider === "antigravity_cli" ? (
+                <label>
+                  설치된 모델
+                  <button className="icon-text-button full model-discovery-button" type="button" onClick={loadLocalModels} disabled={isLoadingLocalModels}>
+                    <RefreshCcw size={15} />
+                    <span>
+                      {isLoadingLocalModels
+                        ? "불러오는 중…"
+                        : discoveredLocalModels.length > 0
+                          ? `${discoveredLocalModels.length}개 · 새로고침`
+                          : "못 찾음 · 다시 시도"}
+                    </span>
+                  </button>
+                </label>
+              ) : null}
+              {/* Ollama serves every model at a 4096-token context unless told otherwise, so the same model name
+                  can mean 4k or 32k. The prompt is sized from this and the native transport passes it as
+                  num_ctx, which is what makes the annotation pass fit at all on a local setup. */}
+              <label>
+                컨텍스트 (토큰)
+                <input
+                  type="number"
+                  min="2048"
+                  step="1024"
+                  value={state.llm.contextTokens ?? llmProvider.contextTokens}
+                  onChange={(event) => onLlmChange({ contextTokens: Math.max(2048, Number(event.target.value) || 0) })}
+                  onBlur={() => notifyApplied("LLM 컨텍스트 크기가 적용되었습니다.")}
+                />
+              </label>
               <label>
                 직접 입력
                 <input
-                  value={state.imageTagLlm.model}
-                  placeholder={imageTagLlmProvider.defaultModel}
-                  onChange={(event) => onImageTagLlmChange({ model: event.target.value })}
+                  value={state.llm.model}
+                  placeholder={llmProvider.defaultModel}
+                  onChange={(event) => onLlmChange({ model: event.target.value })}
+                  onBlur={() => notifyApplied("LLM 모델 입력값이 적용되었습니다.")}
                 />
               </label>
             </div>
-            {imageTagLlmProvider.group === "local" ? (
-              <label>
-                설치된 모델
-                <button
-                  className="icon-text-button full"
-                  type="button"
-                  onClick={loadImageTagLocalModels}
-                  disabled={isLoadingImageTagLocalModels}
-                >
-                  <RefreshCcw size={15} />
-                  {isLoadingImageTagLocalModels
-                    ? "불러오는 중…"
-                    : discoveredImageTagLocalModels.length > 0
-                      ? `${discoveredImageTagLocalModels.length}개 — 다시 불러오기`
-                      : "서버를 찾지 못함 — 다시 시도"}
-                </button>
-              </label>
+            {state.llm.provider === "antigravity_cli" ? (
+              <StaleAgyModelNote
+                model={state.llm.model}
+                discovered={discoveredLocalModels}
+                onReplace={(replacement) => applyLlmChange({ model: replacement }, `${replacement} 모델이 적용되었습니다.`)}
+              />
             ) : null}
-            {/* The annotation pass is the largest prompt of the turn, so this value — not the main model's —
-                is what decides its detail tier. Sharing the main model's context here silently mis-sized it. */}
-            <label>
-              컨텍스트 (토큰)
-              <input
-                type="number"
-                min="2048"
-                step="1024"
-                value={state.imageTagLlm.contextTokens ?? imageTagLlmProvider.contextTokens}
-                onChange={(event) =>
-                  onImageTagLlmChange({ contextTokens: Math.max(2048, Number(event.target.value) || 0) })
-                }
-                onBlur={() => notifyApplied("이미지 태그 모델 컨텍스트 크기가 적용되었습니다.")}
-              />
-            </label>
-            <label>
-              API 키
-              <input
-                type="password"
-                value={state.imageTagLlm.apiKey}
-                onChange={(event) => onImageTagLlmChange({ apiKey: event.target.value, registrationStatus: "idle", verificationMessage: "" })}
-                placeholder={imageTagLlmProvider.keyPlaceholder}
-                disabled={state.imageTagLlm.provider === "mock" || isCliAgentLlmProvider(state.imageTagLlm.provider)}
-              />
-            </label>
             <div className="runtime-model-grid compact">
+              <label className="runtime-preset-field">
+                출력량 목표
+                <div className="runtime-preset-grid" role="group" aria-label="LLM 출력량 프리셋">
+                  {outputLengthPresets.map((preset) => (
+                    <button
+                      key={preset.id}
+                      className={activeOutputLengthPreset === preset.id ? "active" : ""}
+                      type="button"
+                      onClick={() => applyLlmChange({ maxTokens: preset.tokens }, `${preset.label} 출력량 목표가 적용되었습니다.`)}
+                    >
+                      <strong>{preset.label}</strong>
+                      <span>{preset.detail}</span>
+                    </button>
+                  ))}
+                </div>
+              </label>
               <label>
-                응답 출력 토큰 <span className="inline-value">{state.imageTagLlm.maxTokens}</span>
+                응답 출력 토큰 <span className="inline-value">{activeOutputLengthLabel}</span>
                 <input
                   type="number"
-                  min="256"
-                  max="4000"
+                  min="512"
+                  max="8000"
                   step="100"
-                  value={state.imageTagLlm.maxTokens}
-                  onChange={(event) => onImageTagLlmChange({ maxTokens: Number(event.target.value) })}
+                  value={state.llm.maxTokens}
+                  onChange={(event) => onLlmChange({ maxTokens: Number(event.target.value) })}
+                  onBlur={() => notifyApplied("LLM 최대 출력 토큰이 적용되었습니다.")}
                 />
               </label>
               <label>
-                온도 <span className="inline-value">{state.imageTagLlm.temperature.toFixed(2)}</span>
+                온도 <span className="inline-value">{state.llm.temperature.toFixed(2)}</span>
                 <input
                   type="range"
                   min="0"
                   max="1.5"
                   step="0.05"
-                  value={state.imageTagLlm.temperature}
-                  onChange={(event) => onImageTagLlmChange({ temperature: Number(event.target.value) })}
+                  value={state.llm.temperature}
+                  onChange={(event) => onLlmChange({ temperature: Number(event.target.value) })}
+                  onMouseUp={() => notifyApplied("LLM temperature가 적용되었습니다.")}
+                  onTouchEnd={() => notifyApplied("LLM temperature가 적용되었습니다.")}
                 />
               </label>
             </div>
-          </>
-        ) : (
-          <p className="settings-note">메인 LLM을 사용합니다.</p>
-        )}
-      </div>
+            {llmNeedsSecret ? (
+              <div className="readonly-field runtime-secret-state warning">
+                <span>개인 API 키</span>
+                <strong>개인 설정에서 {llmProvider.label} 키 등록 필요</strong>
+                <small>제작자 키는 포함되지 않으므로 실행자의 개인 키만 사용합니다.</small>
+              </div>
+            ) : null}
+            <button className="icon-text-button full" type="button" onClick={onOpenPersonalSettings}>
+              <KeyRound size={16} />
+              개인 설정에서 LLM 키 관리
+            </button>
+          </div>
 
-      <SectionTitle icon={<Sparkles size={17} />} title="NovelAI 런타임" />
-      <div className="runtime-model-card">
-        <div className="runtime-model-heading">
-          <div>
-            <span>제작 설정</span>
-            <strong>{state.novelAi.modelPreset} · {state.imageProfile.width}x{state.imageProfile.height}</strong>
-          </div>
-          <StatusPill icon={<Sparkles size={15} />} label={novelAiStatusLabel} tone={novelAiNeedsSecret || state.novelAi.registrationStatus === "failed" ? "neutral" : "good"} />
-        </div>
-        <div className="runtime-summary-grid">
-          <div>
-            <span>샘플러</span>
-            <strong>{state.novelAi.sampler}</strong>
-          </div>
-          <div>
-            <span>스케줄러</span>
-            <strong>{state.novelAi.noiseSchedule}</strong>
-          </div>
-          <div>
-            <span>밀도</span>
-            <strong>{activeImageGenerationCadence.label}</strong>
-          </div>
-          <div>
-            <span>요청</span>
-            <strong>{state.novelAi.requestMode}</strong>
-          </div>
-        </div>
-      </div>
-      {novelAiNeedsSecret || state.novelAi.registrationStatus === "failed" || state.novelAi.registrationStatus === "verifying" ? (
-        <ApiStatusCard
-          title="NovelAI 등록 상태"
-          status={state.novelAi.registrationStatus}
-          message={state.novelAi.verificationMessage}
-          verifiedAt={state.novelAi.verifiedAt}
-          detail={state.novelAi.subscriptionTier ? `tier: ${state.novelAi.subscriptionTier}` : undefined}
-        />
-      ) : null}
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>연결</strong>
-          <span>{state.novelAi.requestMode}</span>
-        </div>
-        <div className="two-fields">
-          <label className="checkline">
-            <input
-              checked={state.novelAi.enabled}
-              type="checkbox"
-              onChange={(event) => applyNovelAiChange({ enabled: event.target.checked }, event.target.checked ? "NovelAI 이미지 API가 활성화되었습니다." : "NovelAI 이미지 API가 비활성화되었습니다.")}
-            />
-            NovelAI 사용
-          </label>
-          <label className="checkline">
-            <input
-              checked={state.novelAi.roundRobinEnabled}
-              type="checkbox"
-              onChange={(event) => applyNovelAiChange({ roundRobinEnabled: event.target.checked }, event.target.checked ? "NovelAI 라운드로빈이 활성화되었습니다." : "NovelAI 라운드로빈이 비활성화되었습니다.")}
-            />
-            계정 라운드로빈
-          </label>
-        </div>
-        <label>
-          요청 방식
-          <select
-            value={state.novelAi.requestMode}
-            onChange={(event) => applyNovelAiChange({ requestMode: event.target.value as NovelAiApiSettings["requestMode"] }, `NovelAI ${event.target.value} 요청 모드가 적용되었습니다.`)}
-          >
-            <option value="mock">mock</option>
-            <option value="direct">direct</option>
-            <option value="proxy">proxy</option>
-          </select>
-        </label>
-        <label>
-          엔드포인트
-          <input value={state.novelAi.endpoint} onChange={(event) => onNovelAiChange({ endpoint: event.target.value })} onBlur={() => notifyApplied("NovelAI 엔드포인트가 적용되었습니다.")} />
-        </label>
-        <label>
-          프록시 URL
-          <input value={state.novelAi.proxyUrl} onChange={(event) => onNovelAiChange({ proxyUrl: event.target.value })} onBlur={() => notifyApplied("NovelAI 프록시 URL이 적용되었습니다.")} />
-        </label>
-        {novelAiNeedsSecret ? (
-          <div className="readonly-field runtime-secret-state warning">
-            <span>개인 NovelAI 토큰</span>
-            <strong>개인 설정에서 NovelAI 토큰 등록 필요</strong>
-            <small>제작자 토큰은 포함되지 않으므로 실행자의 개인 토큰만 사용합니다.</small>
-          </div>
-        ) : null}
-      </div>
-
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>모델과 출력</strong>
-          <span>{state.novelAi.modelPreset}</span>
-        </div>
-        <label>
-          모델 프리셋
-          <select
-            value={state.novelAi.modelPreset}
-            onChange={(event) => applyNovelAiChange({ modelPreset: event.target.value as NovelAiModelPreset }, `${event.target.value} 모델 프리셋이 적용되었습니다.`)}
-          >
-            {novelAiModelPresets.map((preset) => (
-              <option key={preset} value={preset}>
-                {preset}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          해상도
-          <select
-            value={activeRuntimeResolution}
-            onChange={(event) => {
-              const preset = resolutionPresets.find((item) => `${item.width}x${item.height}` === event.target.value);
-              if (preset) {
-                applyImageProfileChange({ width: preset.width, height: preset.height }, `${preset.label} 해상도가 적용되었습니다.`);
-              }
-            }}
-          >
-            {resolutionPresets.map((preset) => (
-              <option key={preset.label} value={`${preset.width}x${preset.height}`}>
-                {preset.label}
-              </option>
-            ))}
-            <option value="custom">직접 입력</option>
-          </select>
-        </label>
-        <div className="two-fields">
-          <label>
-            너비
-            <input
-              min="256"
-              max="2048"
-              step="64"
-              type="number"
-              value={state.imageProfile.width}
-              onChange={(event) => onImageProfileChange({ width: Number(event.target.value) })}
-              onBlur={() => notifyApplied("이미지 해상도 설정이 적용되었습니다.")}
-            />
-          </label>
-          <label>
-            높이
-            <input
-              min="256"
-              max="2048"
-              step="64"
-              type="number"
-              value={state.imageProfile.height}
-              onChange={(event) => onImageProfileChange({ height: Number(event.target.value) })}
-              onBlur={() => notifyApplied("이미지 해상도 설정이 적용되었습니다.")}
-            />
-          </label>
-        </div>
-        <div className="two-fields">
-          <label>
-            스텝
-            <input
-              type="number"
-              min="1"
-              max="60"
-              value={state.imageProfile.steps}
-              onChange={(event) => onImageProfileChange({ steps: Number(event.target.value) })}
-              onBlur={() => notifyApplied("이미지 steps 설정이 적용되었습니다.")}
-            />
-          </label>
-          <label>
-            Guidance
-            <input
-              type="number"
-              min="1"
-              max="15"
-              step="0.5"
-              value={state.imageProfile.promptGuidance}
-              onChange={(event) => onImageProfileChange({ promptGuidance: Number(event.target.value) })}
-              onBlur={() => notifyApplied("이미지 guidance 설정이 적용되었습니다.")}
-            />
-          </label>
-        </div>
-      </div>
-
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>샘플링</strong>
-          <span>{state.novelAi.sampler}</span>
-        </div>
-        <div className="two-fields">
-          <label>
-            샘플러
-            <select value={state.novelAi.sampler} onChange={(event) => applyNovelAiChange({ sampler: event.target.value }, `${event.target.value} sampler가 적용되었습니다.`)}>
-              {novelAiSamplers.map((sampler) => (
-                <option key={sampler} value={sampler}>
-                  {sampler}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            스케줄러
-            <select
-              value={state.novelAi.noiseSchedule}
-              onChange={(event) => applyNovelAiChange({ noiseSchedule: event.target.value as NovelAiNoiseSchedule }, `${event.target.value} scheduler가 적용되었습니다.`)}
-            >
-              {novelAiNoiseSchedules.map((schedule) => (
-                <option key={schedule} value={schedule}>
-                  {schedule}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="two-fields">
-          <label>
-            CFG 보정
-            <input min="0" max="1" step="0.02" type="number" value={state.novelAi.cfgRescale} onChange={(event) => onNovelAiChange({ cfgRescale: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI CFG rescale이 적용되었습니다.")} />
-          </label>
-          <label>
-            UC preset
-            <input type="number" min="0" max="3" value={state.novelAi.ucPreset} onChange={(event) => onNovelAiChange({ ucPreset: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI UC preset이 적용되었습니다.")} />
-          </label>
-        </div>
-        <div className="two-fields">
-          <label className="checkline">
-            <input checked={state.novelAi.seedFixed} type="checkbox" onChange={(event) => applyNovelAiChange({ seedFixed: event.target.checked }, event.target.checked ? "시드 고정이 활성화되었습니다." : "시드 고정이 비활성화되었습니다.")} />
-            시드 고정
-          </label>
-          <label className="checkline">
-            <input checked={state.novelAi.varPlus} type="checkbox" onChange={(event) => applyNovelAiChange({ varPlus: event.target.checked }, event.target.checked ? "VAR+가 활성화되었습니다." : "VAR+가 비활성화되었습니다.")} />
-            VAR+
-          </label>
-        </div>
-        <label>
-          시드
-          <input type="number" value={state.novelAi.seed ?? ""} onChange={(event) => onNovelAiChange({ seed: event.target.value ? Number(event.target.value) : undefined })} onBlur={() => notifyApplied("NovelAI seed 설정이 적용되었습니다.")} />
-        </label>
-      </div>
-
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>Vibe Transfer</strong>
-          <span>{state.novelAi.vibeTransferEnabled ? `${state.novelAi.vibeTransferReferences.length}장` : "off"}</span>
-        </div>
-        <label className="checkline">
-          <input
-            checked={state.novelAi.vibeTransferEnabled}
-            type="checkbox"
-            onChange={(event) => applyNovelAiChange({ vibeTransferEnabled: event.target.checked }, event.target.checked ? "Vibe Transfer가 활성화되었습니다." : "Vibe Transfer가 비활성화되었습니다.")}
-          />
-          Vibe Transfer 사용
-        </label>
-        <p className="settings-note">참조 이미지를 첨부하면 NovelAI 이미지 생성 요청에 함께 전송됩니다. 이미지마다 reference strength와 information extracted를 조절할 수 있습니다.{requiresVibeEncoding ? " v4/v4.5 모델은 생성 전에 각 이미지를 한 번 인코딩해야 하며(1회 2 Anlas), 모델이나 information extracted를 바꾸면 다시 인코딩하세요." : ""}</p>
-        {/* V5 refuses vibe arrays outright, so the client leaves them out of every V5 request. Said here rather
-            than discovered as "the vibe did nothing". */}
-        <p className={`settings-note${novelAiIsV5 && state.novelAi.vibeTransferEnabled ? " warning" : " muted"}`}>
-          V5 프리셋(NAID5F · NAID5C · NAID5)은 Vibe Transfer를 지원하지 않아, 그 모델로 생성할 때는 참조 이미지를 보내지 않고 건너뜁니다.
-        </p>
-        <label className="vibe-transfer-import icon-text-button full">
-          <ImagePlus size={16} />
-          참조 이미지 추가
-          <input
-            type="file"
-            accept="image/*"
-            multiple
-            style={{ display: "none" }}
-            onChange={(event) => {
-              addVibeTransferReferences(event.target.files);
-              event.target.value = "";
-            }}
-          />
-        </label>
-        {state.novelAi.vibeTransferReferences.length === 0 ? (
-          <p className="settings-note muted">아직 추가된 참조 이미지가 없습니다.</p>
-        ) : (
-          <div className="vibe-transfer-list">
-            {state.novelAi.vibeTransferReferences.map((reference) => {
-              const encodeStatus = vibeEncodeStatus[reference.id];
-              const isEncoding = encodeStatus?.state === "encoding";
-              const isEncoded =
-                Boolean(reference.encodedVibe) &&
-                reference.encodedModel === state.novelAi.modelPreset &&
-                reference.encodedInformationExtracted === reference.informationExtracted;
-              const isStale = Boolean(reference.encodedVibe) && !isEncoded;
-              return (
-                <div className="vibe-transfer-item" key={reference.id}>
-                  <div className="vibe-transfer-item-head">
-                    <img className="vibe-transfer-thumb" src={reference.image} alt={reference.name || "vibe reference"} />
-                    <div className="vibe-transfer-item-meta">
-                      <strong title={reference.name}>{reference.name || "참조 이미지"}</strong>
-                      <button type="button" className="icon-text-button subtle" onClick={() => removeVibeTransferReference(reference.id)}>
-                        제거
-                      </button>
-                    </div>
-                  </div>
+          <SectionTitle icon={<Bot size={17} />} title="이미지 태그 전용 LLM" />
+          <div className="runtime-model-card">
+            <p className="settings-note">내러티브 모델과 분리되어 더 저렴한 모델로 이미지 태그(NovelAI 태그)를 생성할 수 있습니다. 비활성화하면 메인 LLM을 사용합니다.</p>
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={state.imageTagLlm.enabled}
+                onChange={(event) => onImageTagLlmChange({ enabled: event.target.checked })}
+              />
+              별도 모델로 이미지 태그 생성
+            </label>
+            {state.imageTagLlm.enabled ? (
+              <>
+                <label>
+                  공급자
+                  <select
+                    value={state.imageTagLlm.provider}
+                    onChange={(event) => {
+                      const provider = event.target.value as LlmApiSettings["provider"];
+                      onImageTagLlmChange(createLlmProviderPatch(provider));
+                    }}
+                  >
+                    <LlmProviderOptionGroups />
+                  </select>
+                </label>
+                {imageTagLlmProvider.advancedBaseUrl ? (
                   <label>
-                    Reference strength <span className="inline-value">{reference.referenceStrength.toFixed(2)}</span>
+                    기본 URL
                     <input
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={reference.referenceStrength}
-                      onChange={(event) => updateVibeTransferReference(reference.id, { referenceStrength: Number(event.target.value) })}
-                      onMouseUp={() => notifyApplied("Vibe Transfer reference strength가 적용되었습니다.")}
-                      onTouchEnd={() => notifyApplied("Vibe Transfer reference strength가 적용되었습니다.")}
+                      value={state.imageTagLlm.baseUrl}
+                      onChange={(event) => onImageTagLlmChange({ baseUrl: event.target.value })}
                     />
                   </label>
+                ) : null}
+                <div className="runtime-model-grid">
                   <label>
-                    Information extracted <span className="inline-value">{reference.informationExtracted.toFixed(2)}</span>
+                    사용 가능 모델
+                    <select
+                      value={selectedImageTagLlmModel}
+                      onChange={(event) => {
+                        if (event.target.value === "custom") {
+                          onImageTagLlmChange({ model: "" });
+                          return;
+                        }
+                        onImageTagLlmChange({ model: event.target.value });
+                      }}
+                    >
+                      {availableImageTagLlmModels.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))}
+                      <option value="custom">직접 입력</option>
+                    </select>
+                  </label>
+                  <label>
+                    직접 입력
                     <input
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={reference.informationExtracted}
-                      onChange={(event) => updateVibeTransferReference(reference.id, { informationExtracted: Number(event.target.value) })}
-                      onMouseUp={() => notifyApplied("Vibe Transfer information extracted가 적용되었습니다.")}
-                      onTouchEnd={() => notifyApplied("Vibe Transfer information extracted가 적용되었습니다.")}
+                      value={state.imageTagLlm.model}
+                      placeholder={imageTagLlmProvider.defaultModel}
+                      onChange={(event) => onImageTagLlmChange({ model: event.target.value })}
                     />
                   </label>
-                  {requiresVibeEncoding ? (
-                    <div className="vibe-transfer-encode-row">
-                      <span className={`vibe-encode-state ${isEncoded ? "ok" : isStale ? "stale" : "pending"}`}>
-                        {isEncoding ? "인코딩 중…" : isEncoded ? "인코딩됨" : isStale ? "재인코딩 필요" : "미인코딩"}
-                      </span>
-                      <button
-                        type="button"
-                        className="icon-text-button subtle"
-                        disabled={!canEncodeVibe || isEncoding}
-                        onClick={() => encodeVibeTransferReference(reference)}
-                      >
-                        <WandSparkles size={14} />
-                        {isEncoded ? "다시 인코딩" : "인코딩"}
-                      </button>
-                      {reference.encodedVibe ? (
-                        <button
-                          type="button"
-                          className="icon-text-button subtle"
-                          disabled={isEncoding}
-                          onClick={() => clearVibeTransferEncoding(reference.id)}
-                        >
-                          인코딩 해제
-                        </button>
-                      ) : null}
-                    </div>
-                  ) : null}
-                  {requiresVibeEncoding && !canEncodeVibe ? (
-                    <p className="settings-note muted">인코딩하려면 개인 설정에서 NovelAI 토큰을 먼저 등록하세요.</p>
-                  ) : null}
-                  {encodeStatus?.state === "error" ? <p className="settings-note warning">{encodeStatus.message}</p> : null}
                 </div>
-              );
-            })}
+                {state.imageTagLlm.provider === "antigravity_cli" ? (
+                  <StaleAgyModelNote
+                    model={state.imageTagLlm.model}
+                    discovered={discoveredImageTagLocalModels}
+                    onReplace={(replacement) => {
+                      onImageTagLlmChange({ model: replacement });
+                      notifyApplied(`이미지 태그 LLM을 ${replacement} 모델로 바꿨습니다.`);
+                    }}
+                  />
+                ) : null}
+                {imageTagLlmProvider.group === "local" || state.imageTagLlm.provider === "antigravity_cli" ? (
+                  <label>
+                    설치된 모델
+                    <button
+                      className="icon-text-button full model-discovery-button"
+                      type="button"
+                      onClick={loadImageTagLocalModels}
+                      disabled={isLoadingImageTagLocalModels}
+                    >
+                      <RefreshCcw size={15} />
+                      <span>
+                        {isLoadingImageTagLocalModels
+                          ? "불러오는 중…"
+                          : discoveredImageTagLocalModels.length > 0
+                            ? `${discoveredImageTagLocalModels.length}개 · 새로고침`
+                            : "못 찾음 · 다시 시도"}
+                      </span>
+                    </button>
+                  </label>
+                ) : null}
+                {/* The annotation pass is the largest prompt of the turn, so this value — not the main model's —
+                    is what decides its detail tier. Sharing the main model's context here silently mis-sized it. */}
+                <label>
+                  컨텍스트 (토큰)
+                  <input
+                    type="number"
+                    min="2048"
+                    step="1024"
+                    value={state.imageTagLlm.contextTokens ?? imageTagLlmProvider.contextTokens}
+                    onChange={(event) =>
+                      onImageTagLlmChange({ contextTokens: Math.max(2048, Number(event.target.value) || 0) })
+                    }
+                    onBlur={() => notifyApplied("이미지 태그 모델 컨텍스트 크기가 적용되었습니다.")}
+                  />
+                </label>
+                <label>
+                  API 키
+                  <input
+                    type="password"
+                    value={state.imageTagLlm.apiKey}
+                    onChange={(event) => onImageTagLlmChange({ apiKey: event.target.value, registrationStatus: "idle", verificationMessage: "" })}
+                    placeholder={imageTagLlmProvider.keyPlaceholder}
+                    disabled={state.imageTagLlm.provider === "mock" || isCliAgentLlmProvider(state.imageTagLlm.provider)}
+                  />
+                </label>
+                <div className="runtime-model-grid compact">
+                  <label>
+                    응답 출력 토큰 <span className="inline-value">{state.imageTagLlm.maxTokens}</span>
+                    <input
+                      type="number"
+                      min="256"
+                      max="4000"
+                      step="100"
+                      value={state.imageTagLlm.maxTokens}
+                      onChange={(event) => onImageTagLlmChange({ maxTokens: Number(event.target.value) })}
+                    />
+                  </label>
+                  <label>
+                    온도 <span className="inline-value">{state.imageTagLlm.temperature.toFixed(2)}</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1.5"
+                      step="0.05"
+                      value={state.imageTagLlm.temperature}
+                      onChange={(event) => onImageTagLlmChange({ temperature: Number(event.target.value) })}
+                    />
+                  </label>
+                </div>
+              </>
+            ) : (
+              <p className="settings-note">메인 LLM을 사용합니다.</p>
+            )}
           </div>
-        )}
-      </div>
+        </>
+      ) : null}
 
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>캐릭터 레퍼런스 (Precise Reference)</strong>
-          <span>{state.novelAi.characterReferenceEnabled ? "on" : "off"}</span>
-        </div>
-        <label className="checkline">
-          <input
-            checked={state.novelAi.characterReferenceEnabled === true}
-            type="checkbox"
-            onChange={(event) =>
-              applyNovelAiChange(
-                { characterReferenceEnabled: event.target.checked },
-                event.target.checked ? "NovelAI 캐릭터 레퍼런스가 활성화되었습니다." : "NovelAI 캐릭터 레퍼런스가 비활성화되었습니다."
-              )
-            }
-          />
-          캐릭터 NovelAI 프로필 이미지로 얼굴 고정
-        </label>
-        {/* Opt-in because it is the one NovelAI feature that costs Anlas per image even on Opus. */}
-        <p className="settings-note">
-          이미지당 +5 Anlas (Opus 포함) · V4.5 전용. 캐릭터에 NovelAI 프로필 이미지가 있어야 적용되며, 레퍼런스가 붙는 컷에서는 Vibe Transfer가 빠집니다.
-        </p>
-        {state.novelAi.characterReferenceEnabled && !novelAiSupportsCharacterReference ? (
-          <p className="settings-note warning">
-            현재 모델 {state.novelAi.modelPreset}은(는) Precise Reference를 지원하지 않아 레퍼런스 없이 생성됩니다. NAID4.5F 또는 NAID4.5C를 고르세요.
-          </p>
-        ) : null}
-        <label>
-          레퍼런스 강도{" "}
-          <span className="inline-value">
-            {(state.novelAi.characterReferenceStrength ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_STRENGTH).toFixed(2)}
-          </span>
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            disabled={state.novelAi.characterReferenceEnabled !== true}
-            value={state.novelAi.characterReferenceStrength ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_STRENGTH}
-            onChange={(event) => onNovelAiChange({ characterReferenceStrength: Number(event.target.value) })}
-            onMouseUp={() => notifyApplied("캐릭터 레퍼런스 강도가 적용되었습니다.")}
-            onTouchEnd={() => notifyApplied("캐릭터 레퍼런스 강도가 적용되었습니다.")}
-          />
-        </label>
-        <label>
-          충실도{" "}
-          <span className="inline-value">
-            {(state.novelAi.characterReferenceFidelity ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_FIDELITY).toFixed(2)}
-          </span>
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            disabled={state.novelAi.characterReferenceEnabled !== true}
-            value={state.novelAi.characterReferenceFidelity ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_FIDELITY}
-            onChange={(event) => onNovelAiChange({ characterReferenceFidelity: Number(event.target.value) })}
-            onMouseUp={() => notifyApplied("캐릭터 레퍼런스 충실도가 적용되었습니다.")}
-            onTouchEnd={() => notifyApplied("캐릭터 레퍼런스 충실도가 적용되었습니다.")}
-          />
-        </label>
-        <p className="runtime-hint">레퍼런스의 자세나 표정이 모든 컷에 따라붙으면 강도를 낮추세요.</p>
-        <label className="checkline">
-          <input
-            checked={state.novelAi.characterReferenceStyleAware === true}
-            disabled={state.novelAi.characterReferenceEnabled !== true}
-            type="checkbox"
-            onChange={(event) =>
-              applyNovelAiChange(
-                { characterReferenceStyleAware: event.target.checked },
-                event.target.checked ? "레퍼런스의 화풍까지 따릅니다." : "레퍼런스에서 캐릭터만 가져옵니다."
-              )
-            }
-          />
-          화풍까지 따르기 (style aware)
-        </label>
-      </div>
+      {shows("image") ? (
+        <>
+          <SectionTitle icon={<Sparkles size={17} />} title="NovelAI 런타임" />
+          <div className="runtime-model-card">
+            <div className="runtime-model-heading">
+              <div>
+                <span>제작 설정</span>
+                <strong>{state.novelAi.modelPreset} · {state.imageProfile.width}x{state.imageProfile.height}</strong>
+              </div>
+              <StatusPill icon={<Sparkles size={15} />} label={novelAiStatusLabel} tone={novelAiNeedsSecret || state.novelAi.registrationStatus === "failed" ? "neutral" : "good"} />
+            </div>
+            <div className="runtime-summary-grid">
+              <div>
+                <span>샘플러</span>
+                <strong>{state.novelAi.sampler}</strong>
+              </div>
+              <div>
+                <span>스케줄러</span>
+                <strong>{state.novelAi.noiseSchedule}</strong>
+              </div>
+              <div>
+                <span>밀도</span>
+                <strong>{activeImageGenerationCadence.label}</strong>
+              </div>
+              <div>
+                <span>요청</span>
+                <strong>{state.novelAi.requestMode}</strong>
+              </div>
+            </div>
+          </div>
+          {novelAiNeedsSecret || state.novelAi.registrationStatus === "failed" || state.novelAi.registrationStatus === "verifying" ? (
+            <ApiStatusCard
+              title="NovelAI 등록 상태"
+              status={state.novelAi.registrationStatus}
+              message={state.novelAi.verificationMessage}
+              verifiedAt={state.novelAi.verifiedAt}
+              detail={state.novelAi.subscriptionTier ? `tier: ${state.novelAi.subscriptionTier}` : undefined}
+            />
+          ) : null}
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>연결</strong>
+              <span>{state.novelAi.requestMode}</span>
+            </div>
+            <div className="two-fields">
+              <label className="checkline">
+                <input
+                  checked={state.novelAi.enabled}
+                  type="checkbox"
+                  onChange={(event) => applyNovelAiChange({ enabled: event.target.checked }, event.target.checked ? "NovelAI 이미지 API가 활성화되었습니다." : "NovelAI 이미지 API가 비활성화되었습니다.")}
+                />
+                NovelAI 사용
+              </label>
+              <label className="checkline">
+                <input
+                  checked={state.novelAi.roundRobinEnabled}
+                  type="checkbox"
+                  onChange={(event) => applyNovelAiChange({ roundRobinEnabled: event.target.checked }, event.target.checked ? "NovelAI 라운드로빈이 활성화되었습니다." : "NovelAI 라운드로빈이 비활성화되었습니다.")}
+                />
+                계정 라운드로빈
+              </label>
+            </div>
+            <label>
+              요청 방식
+              <select
+                value={state.novelAi.requestMode}
+                onChange={(event) => applyNovelAiChange({ requestMode: event.target.value as NovelAiApiSettings["requestMode"] }, `NovelAI ${event.target.value} 요청 모드가 적용되었습니다.`)}
+              >
+                <option value="mock">mock</option>
+                <option value="direct">direct</option>
+                <option value="proxy">proxy</option>
+              </select>
+            </label>
+            <label>
+              엔드포인트
+              <input value={state.novelAi.endpoint} onChange={(event) => onNovelAiChange({ endpoint: event.target.value })} onBlur={() => notifyApplied("NovelAI 엔드포인트가 적용되었습니다.")} />
+            </label>
+            <label>
+              프록시 URL
+              <input value={state.novelAi.proxyUrl} onChange={(event) => onNovelAiChange({ proxyUrl: event.target.value })} onBlur={() => notifyApplied("NovelAI 프록시 URL이 적용되었습니다.")} />
+            </label>
+            {novelAiNeedsSecret ? (
+              <div className="readonly-field runtime-secret-state warning">
+                <span>개인 NovelAI 토큰</span>
+                <strong>개인 설정에서 NovelAI 토큰 등록 필요</strong>
+                <small>제작자 토큰은 포함되지 않으므로 실행자의 개인 토큰만 사용합니다.</small>
+              </div>
+            ) : null}
+          </div>
 
-      <div className="runtime-parameter-card">
-        <div className="runtime-card-subhead">
-          <strong>자동 생성</strong>
-          <span>{state.novelAi.automationTermination}</span>
-        </div>
-        <div className="two-fields">
-          <label>
-            지연 초
-            <input min="0" max="120" type="number" value={state.novelAi.generationDelaySeconds} onChange={(event) => onNovelAiChange({ generationDelaySeconds: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI 생성 지연 설정이 적용되었습니다.")} />
-          </label>
-          <label>
-            반복
-            <input min="1" max="100" type="number" value={state.novelAi.repeatCount} onChange={(event) => onNovelAiChange({ repeatCount: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI repeat 설정이 적용되었습니다.")} />
-          </label>
-        </div>
-        <label className="checkline">
-          <input checked={state.novelAi.randomDelayEnabled} type="checkbox" onChange={(event) => applyNovelAiChange({ randomDelayEnabled: event.target.checked }, event.target.checked ? "랜덤 지연이 활성화되었습니다." : "랜덤 지연이 비활성화되었습니다.")} />
-          랜덤 지연
-        </label>
-        <div className="two-fields">
-          <label>
-            종료 조건
-            <select value={state.novelAi.automationTermination} onChange={(event) => applyNovelAiChange({ automationTermination: event.target.value as NovelAiAutomationTermination }, "NovelAI 자동 생성 종료 조건이 적용되었습니다.")}>
-              {novelAiAutomationTerminations.map((termination) => (
-                <option key={termination} value={termination}>
-                  {termination}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            수량 제한
-            <input min="1" max="500" type="number" value={state.novelAi.countLimit} onChange={(event) => onNovelAiChange({ countLimit: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI count limit이 적용되었습니다.")} />
-          </label>
-        </div>
-      </div>
-      <button className="icon-text-button full" type="button" onClick={onOpenPersonalSettings}>
-        <KeyRound size={16} />
-        개인 설정에서 NovelAI 토큰 관리
-      </button>
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>모델과 출력</strong>
+              <span>{state.novelAi.modelPreset}</span>
+            </div>
+            <label>
+              모델 프리셋
+              <select
+                value={state.novelAi.modelPreset}
+                onChange={(event) => applyNovelAiChange({ modelPreset: event.target.value as NovelAiModelPreset }, `${event.target.value} 모델 프리셋이 적용되었습니다.`)}
+              >
+                {novelAiModelPresets.map((preset) => (
+                  <option key={preset} value={preset}>
+                    {preset}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              해상도
+              <select
+                value={activeRuntimeResolution}
+                onChange={(event) => {
+                  const preset = resolutionPresets.find((item) => `${item.width}x${item.height}` === event.target.value);
+                  if (preset) {
+                    applyImageProfileChange({ width: preset.width, height: preset.height }, `${preset.label} 해상도가 적용되었습니다.`);
+                  }
+                }}
+              >
+                {resolutionPresets.map((preset) => (
+                  <option key={preset.label} value={`${preset.width}x${preset.height}`}>
+                    {preset.label}
+                  </option>
+                ))}
+                <option value="custom">직접 입력</option>
+              </select>
+            </label>
+            <div className="two-fields">
+              <label>
+                너비
+                <input
+                  min="256"
+                  max="2048"
+                  step="64"
+                  type="number"
+                  value={state.imageProfile.width}
+                  onChange={(event) => onImageProfileChange({ width: Number(event.target.value) })}
+                  onBlur={() => notifyApplied("이미지 해상도 설정이 적용되었습니다.")}
+                />
+              </label>
+              <label>
+                높이
+                <input
+                  min="256"
+                  max="2048"
+                  step="64"
+                  type="number"
+                  value={state.imageProfile.height}
+                  onChange={(event) => onImageProfileChange({ height: Number(event.target.value) })}
+                  onBlur={() => notifyApplied("이미지 해상도 설정이 적용되었습니다.")}
+                />
+              </label>
+            </div>
+            <div className="two-fields">
+              <label>
+                스텝
+                <input
+                  type="number"
+                  min="1"
+                  max="60"
+                  value={state.imageProfile.steps}
+                  onChange={(event) => onImageProfileChange({ steps: Number(event.target.value) })}
+                  onBlur={() => notifyApplied("이미지 steps 설정이 적용되었습니다.")}
+                />
+              </label>
+              <label>
+                Guidance
+                <input
+                  type="number"
+                  min="1"
+                  max="15"
+                  step="0.5"
+                  value={state.imageProfile.promptGuidance}
+                  onChange={(event) => onImageProfileChange({ promptGuidance: Number(event.target.value) })}
+                  onBlur={() => notifyApplied("이미지 guidance 설정이 적용되었습니다.")}
+                />
+              </label>
+            </div>
+          </div>
 
-      <SectionTitle
-        icon={<ImageIcon size={17} />}
-        title="실사 이미지 (ComfyUI)"
-        className="settings-jump-target"
-        headingRef={photorealSectionRef}
-      />
-      <PhotorealRuntimeSettings state={state} onChange={applyPhotorealChange} onNotify={notifyApplied} onStateChange={onStateChange} />
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>샘플링</strong>
+              <span>{state.novelAi.sampler}</span>
+            </div>
+            <div className="two-fields">
+              <label>
+                샘플러
+                <select value={state.novelAi.sampler} onChange={(event) => applyNovelAiChange({ sampler: event.target.value }, `${event.target.value} sampler가 적용되었습니다.`)}>
+                  {novelAiSamplers.map((sampler) => (
+                    <option key={sampler} value={sampler}>
+                      {sampler}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                스케줄러
+                <select
+                  value={state.novelAi.noiseSchedule}
+                  onChange={(event) => applyNovelAiChange({ noiseSchedule: event.target.value as NovelAiNoiseSchedule }, `${event.target.value} scheduler가 적용되었습니다.`)}
+                >
+                  {novelAiNoiseSchedules.map((schedule) => (
+                    <option key={schedule} value={schedule}>
+                      {schedule}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="two-fields">
+              <label>
+                CFG 보정
+                <input min="0" max="1" step="0.02" type="number" value={state.novelAi.cfgRescale} onChange={(event) => onNovelAiChange({ cfgRescale: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI CFG rescale이 적용되었습니다.")} />
+              </label>
+              <label>
+                UC preset
+                <input type="number" min="0" max="3" value={state.novelAi.ucPreset} onChange={(event) => onNovelAiChange({ ucPreset: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI UC preset이 적용되었습니다.")} />
+              </label>
+            </div>
+            <div className="two-fields">
+              <label className="checkline">
+                <input checked={state.novelAi.seedFixed} type="checkbox" onChange={(event) => applyNovelAiChange({ seedFixed: event.target.checked }, event.target.checked ? "시드 고정이 활성화되었습니다." : "시드 고정이 비활성화되었습니다.")} />
+                시드 고정
+              </label>
+              <label className="checkline">
+                <input checked={state.novelAi.varPlus} type="checkbox" onChange={(event) => applyNovelAiChange({ varPlus: event.target.checked }, event.target.checked ? "VAR+가 활성화되었습니다." : "VAR+가 비활성화되었습니다.")} />
+                VAR+
+              </label>
+            </div>
+            <label>
+              시드
+              <input type="number" value={state.novelAi.seed ?? ""} onChange={(event) => onNovelAiChange({ seed: event.target.value ? Number(event.target.value) : undefined })} onBlur={() => notifyApplied("NovelAI seed 설정이 적용되었습니다.")} />
+            </label>
+          </div>
 
-      <SectionTitle icon={<Play size={17} />} title="실제 시뮬레이션 검증" />
-      <button className="send-button wide-action" type="button" onClick={verifyRuntimeTurn} disabled={isRuntimeVerifying}>
-        <Play size={16} />
-        {isRuntimeVerifying ? "턴 검증 중" : "실제 API 턴 테스트"}
-      </button>
-      {runtimeCheck ? <p className="settings-note">{runtimeCheck}</p> : null}
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>Vibe Transfer</strong>
+              <span>{state.novelAi.vibeTransferEnabled ? `${state.novelAi.vibeTransferReferences.length}장` : "off"}</span>
+            </div>
+            <label className="checkline">
+              <input
+                checked={state.novelAi.vibeTransferEnabled}
+                type="checkbox"
+                onChange={(event) => applyNovelAiChange({ vibeTransferEnabled: event.target.checked }, event.target.checked ? "Vibe Transfer가 활성화되었습니다." : "Vibe Transfer가 비활성화되었습니다.")}
+              />
+              Vibe Transfer 사용
+            </label>
+            <p className="settings-note">참조 이미지를 첨부하면 NovelAI 이미지 생성 요청에 함께 전송됩니다. 이미지마다 reference strength와 information extracted를 조절할 수 있습니다.{requiresVibeEncoding ? " v4/v4.5 모델은 생성 전에 각 이미지를 한 번 인코딩해야 하며(1회 2 Anlas), 모델이나 information extracted를 바꾸면 다시 인코딩하세요." : ""}</p>
+            {/* V5 refuses vibe arrays outright, so the client leaves them out of every V5 request. Said here rather
+                than discovered as "the vibe did nothing". */}
+            <p className={`settings-note${novelAiIsV5 && state.novelAi.vibeTransferEnabled ? " warning" : " muted"}`}>
+              V5 프리셋(NAID5F · NAID5C · NAID5)은 Vibe Transfer를 지원하지 않아, 그 모델로 생성할 때는 참조 이미지를 보내지 않고 건너뜁니다.
+            </p>
+            <label className="vibe-transfer-import icon-text-button full">
+              <ImagePlus size={16} />
+              참조 이미지 추가
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                style={{ display: "none" }}
+                onChange={(event) => {
+                  addVibeTransferReferences(event.target.files);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+            {state.novelAi.vibeTransferReferences.length === 0 ? (
+              <p className="settings-note muted">아직 추가된 참조 이미지가 없습니다.</p>
+            ) : (
+              <div className="vibe-transfer-list">
+                {state.novelAi.vibeTransferReferences.map((reference) => {
+                  const encodeStatus = vibeEncodeStatus[reference.id];
+                  const isEncoding = encodeStatus?.state === "encoding";
+                  const isEncoded =
+                    Boolean(reference.encodedVibe) &&
+                    reference.encodedModel === state.novelAi.modelPreset &&
+                    reference.encodedInformationExtracted === reference.informationExtracted;
+                  const isStale = Boolean(reference.encodedVibe) && !isEncoded;
+                  return (
+                    <div className="vibe-transfer-item" key={reference.id}>
+                      <div className="vibe-transfer-item-head">
+                        <img className="vibe-transfer-thumb" src={reference.image} alt={reference.name || "vibe reference"} />
+                        <div className="vibe-transfer-item-meta">
+                          <strong title={reference.name}>{reference.name || "참조 이미지"}</strong>
+                          <button type="button" className="icon-text-button subtle" onClick={() => removeVibeTransferReference(reference.id)}>
+                            제거
+                          </button>
+                        </div>
+                      </div>
+                      <label>
+                        Reference strength <span className="inline-value">{reference.referenceStrength.toFixed(2)}</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="1"
+                          step="0.05"
+                          value={reference.referenceStrength}
+                          onChange={(event) => updateVibeTransferReference(reference.id, { referenceStrength: Number(event.target.value) })}
+                          onMouseUp={() => notifyApplied("Vibe Transfer reference strength가 적용되었습니다.")}
+                          onTouchEnd={() => notifyApplied("Vibe Transfer reference strength가 적용되었습니다.")}
+                        />
+                      </label>
+                      <label>
+                        Information extracted <span className="inline-value">{reference.informationExtracted.toFixed(2)}</span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="1"
+                          step="0.05"
+                          value={reference.informationExtracted}
+                          onChange={(event) => updateVibeTransferReference(reference.id, { informationExtracted: Number(event.target.value) })}
+                          onMouseUp={() => notifyApplied("Vibe Transfer information extracted가 적용되었습니다.")}
+                          onTouchEnd={() => notifyApplied("Vibe Transfer information extracted가 적용되었습니다.")}
+                        />
+                      </label>
+                      {requiresVibeEncoding ? (
+                        <div className="vibe-transfer-encode-row">
+                          <span className={`vibe-encode-state ${isEncoded ? "ok" : isStale ? "stale" : "pending"}`}>
+                            {isEncoding ? "인코딩 중…" : isEncoded ? "인코딩됨" : isStale ? "재인코딩 필요" : "미인코딩"}
+                          </span>
+                          <button
+                            type="button"
+                            className="icon-text-button subtle"
+                            disabled={!canEncodeVibe || isEncoding}
+                            onClick={() => encodeVibeTransferReference(reference)}
+                          >
+                            <WandSparkles size={14} />
+                            {isEncoded ? "다시 인코딩" : "인코딩"}
+                          </button>
+                          {reference.encodedVibe ? (
+                            <button
+                              type="button"
+                              className="icon-text-button subtle"
+                              disabled={isEncoding}
+                              onClick={() => clearVibeTransferEncoding(reference.id)}
+                            >
+                              인코딩 해제
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {requiresVibeEncoding && !canEncodeVibe ? (
+                        <p className="settings-note muted">인코딩하려면 개인 설정에서 NovelAI 토큰을 먼저 등록하세요.</p>
+                      ) : null}
+                      {encodeStatus?.state === "error" ? <p className="settings-note warning">{encodeStatus.message}</p> : null}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
-      <SectionTitle icon={<Database size={17} />} title="NeuralMap" />
-      <label className="checkline">
-        <input
-          checked={state.neuralMap.enabled}
-          type="checkbox"
-          onChange={(event) =>
-            applyStateChange(
-              (current) => ({
-                ...current,
-                neuralMap: {
-                  ...current.neuralMap,
-                  enabled: event.target.checked
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>캐릭터 레퍼런스 (Precise Reference)</strong>
+              <span>{state.novelAi.characterReferenceEnabled ? "on" : "off"}</span>
+            </div>
+            <label className="checkline">
+              <input
+                checked={state.novelAi.characterReferenceEnabled === true}
+                type="checkbox"
+                onChange={(event) =>
+                  applyNovelAiChange(
+                    { characterReferenceEnabled: event.target.checked },
+                    event.target.checked ? "NovelAI 캐릭터 레퍼런스가 활성화되었습니다." : "NovelAI 캐릭터 레퍼런스가 비활성화되었습니다."
+                  )
                 }
-              }),
-              event.target.checked ? "NeuralMap 연동이 활성화되었습니다." : "NeuralMap 연동이 비활성화되었습니다."
-            )
-          }
-        />
-        API 연동 사용
-      </label>
-      <label>
-        기본 URL
-        <input
-          value={state.neuralMap.baseUrl}
-          onChange={(event) =>
-            onStateChange((current) => ({
-              ...current,
-              neuralMap: {
-                ...current.neuralMap,
-                baseUrl: event.target.value
+              />
+              캐릭터 NovelAI 프로필 이미지로 얼굴 고정
+            </label>
+            {/* Opt-in because it is the one NovelAI feature that costs Anlas per image even on Opus. */}
+            <p className="settings-note">
+              이미지당 +5 Anlas (Opus 포함) · V4.5 전용. 캐릭터에 NovelAI 프로필 이미지가 있어야 적용되며, 레퍼런스가 붙는 컷에서는 Vibe Transfer가 빠집니다.
+            </p>
+            {state.novelAi.characterReferenceEnabled && !novelAiSupportsCharacterReference ? (
+              <p className="settings-note warning">
+                현재 모델 {state.novelAi.modelPreset}은(는) Precise Reference를 지원하지 않아 레퍼런스 없이 생성됩니다. NAID4.5F 또는 NAID4.5C를 고르세요.
+              </p>
+            ) : null}
+            <label>
+              레퍼런스 강도{" "}
+              <span className="inline-value">
+                {(state.novelAi.characterReferenceStrength ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_STRENGTH).toFixed(2)}
+              </span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                disabled={state.novelAi.characterReferenceEnabled !== true}
+                value={state.novelAi.characterReferenceStrength ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_STRENGTH}
+                onChange={(event) => onNovelAiChange({ characterReferenceStrength: Number(event.target.value) })}
+                onMouseUp={() => notifyApplied("캐릭터 레퍼런스 강도가 적용되었습니다.")}
+                onTouchEnd={() => notifyApplied("캐릭터 레퍼런스 강도가 적용되었습니다.")}
+              />
+            </label>
+            <label>
+              충실도{" "}
+              <span className="inline-value">
+                {(state.novelAi.characterReferenceFidelity ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_FIDELITY).toFixed(2)}
+              </span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                disabled={state.novelAi.characterReferenceEnabled !== true}
+                value={state.novelAi.characterReferenceFidelity ?? NOVELAI_CHARACTER_REFERENCE_DEFAULT_FIDELITY}
+                onChange={(event) => onNovelAiChange({ characterReferenceFidelity: Number(event.target.value) })}
+                onMouseUp={() => notifyApplied("캐릭터 레퍼런스 충실도가 적용되었습니다.")}
+                onTouchEnd={() => notifyApplied("캐릭터 레퍼런스 충실도가 적용되었습니다.")}
+              />
+            </label>
+            <p className="runtime-hint">레퍼런스의 자세나 표정이 모든 컷에 따라붙으면 강도를 낮추세요.</p>
+            <label className="checkline">
+              <input
+                checked={state.novelAi.characterReferenceStyleAware === true}
+                disabled={state.novelAi.characterReferenceEnabled !== true}
+                type="checkbox"
+                onChange={(event) =>
+                  applyNovelAiChange(
+                    { characterReferenceStyleAware: event.target.checked },
+                    event.target.checked ? "레퍼런스의 화풍까지 따릅니다." : "레퍼런스에서 캐릭터만 가져옵니다."
+                  )
+                }
+              />
+              화풍까지 따르기 (style aware)
+            </label>
+          </div>
+
+          <div className="runtime-parameter-card">
+            <div className="runtime-card-subhead">
+              <strong>자동 생성</strong>
+              <span>{state.novelAi.automationTermination}</span>
+            </div>
+            <div className="two-fields">
+              <label>
+                지연 초
+                <input min="0" max="120" type="number" value={state.novelAi.generationDelaySeconds} onChange={(event) => onNovelAiChange({ generationDelaySeconds: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI 생성 지연 설정이 적용되었습니다.")} />
+              </label>
+              <label>
+                반복
+                <input min="1" max="100" type="number" value={state.novelAi.repeatCount} onChange={(event) => onNovelAiChange({ repeatCount: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI repeat 설정이 적용되었습니다.")} />
+              </label>
+            </div>
+            <label className="checkline">
+              <input checked={state.novelAi.randomDelayEnabled} type="checkbox" onChange={(event) => applyNovelAiChange({ randomDelayEnabled: event.target.checked }, event.target.checked ? "랜덤 지연이 활성화되었습니다." : "랜덤 지연이 비활성화되었습니다.")} />
+              랜덤 지연
+            </label>
+            <div className="two-fields">
+              <label>
+                종료 조건
+                <select value={state.novelAi.automationTermination} onChange={(event) => applyNovelAiChange({ automationTermination: event.target.value as NovelAiAutomationTermination }, "NovelAI 자동 생성 종료 조건이 적용되었습니다.")}>
+                  {novelAiAutomationTerminations.map((termination) => (
+                    <option key={termination} value={termination}>
+                      {termination}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                수량 제한
+                <input min="1" max="500" type="number" value={state.novelAi.countLimit} onChange={(event) => onNovelAiChange({ countLimit: Number(event.target.value) })} onBlur={() => notifyApplied("NovelAI count limit이 적용되었습니다.")} />
+              </label>
+            </div>
+          </div>
+          <button className="icon-text-button full" type="button" onClick={onOpenPersonalSettings}>
+            <KeyRound size={16} />
+            개인 설정에서 NovelAI 토큰 관리
+          </button>
+        </>
+      ) : null}
+
+      {shows("photoreal") ? (
+        <>
+          <SectionTitle
+            icon={<ImageIcon size={17} />}
+            title="실사 이미지 (ComfyUI)"
+            className="settings-jump-target"
+            headingRef={photorealSectionRef}
+          />
+          <PhotorealRuntimeSettings state={state} onChange={applyPhotorealChange} onNotify={notifyApplied} onStateChange={onStateChange} />
+        </>
+      ) : null}
+
+      {shows("general") ? (
+        <>
+          <SectionTitle icon={<Play size={17} />} title="실제 시뮬레이션 검증" />
+          <button className="send-button wide-action" type="button" onClick={verifyRuntimeTurn} disabled={isRuntimeVerifying}>
+            <Play size={16} />
+            {isRuntimeVerifying ? "턴 검증 중" : "실제 API 턴 테스트"}
+          </button>
+          {runtimeCheck ? <p className="settings-note">{runtimeCheck}</p> : null}
+
+          <SectionTitle icon={<Database size={17} />} title="NeuralMap" />
+          <label className="checkline">
+            <input
+              checked={state.neuralMap.enabled}
+              type="checkbox"
+              onChange={(event) =>
+                applyStateChange(
+                  (current) => ({
+                    ...current,
+                    neuralMap: {
+                      ...current.neuralMap,
+                      enabled: event.target.checked
+                    }
+                  }),
+                  event.target.checked ? "NeuralMap 연동이 활성화되었습니다." : "NeuralMap 연동이 비활성화되었습니다."
+                )
               }
-            }))
-          }
-          onBlur={() => notifyApplied("NeuralMap 기본 URL이 적용되었습니다.")}
-        />
-      </label>
-      <label>
-        검색 문맥 토큰 예산
-        <input
-          min="800"
-          max="12000"
-          step="200"
-          type="number"
-          value={state.neuralMap.tokenBudget}
-          onChange={(event) =>
-            onStateChange((current) => ({
-              ...current,
-              neuralMap: {
-                ...current.neuralMap,
-                tokenBudget: Number(event.target.value)
+            />
+            API 연동 사용
+          </label>
+          <label>
+            기본 URL
+            <input
+              value={state.neuralMap.baseUrl}
+              onChange={(event) =>
+                onStateChange((current) => ({
+                  ...current,
+                  neuralMap: {
+                    ...current.neuralMap,
+                    baseUrl: event.target.value
+                  }
+                }))
               }
-            }))
-          }
-          onBlur={() => notifyApplied("NeuralMap token budget이 적용되었습니다.")}
-        />
-      </label>
-      <div className="danger-zone">
-        <strong>위험 구역</strong>
-        <p>이 브라우저에 저장된 모든 시뮬레이션과 생성 이미지를 삭제하고 기본 데모 상태로 되돌립니다.</p>
-        <button className="icon-text-button full danger-action" type="button" onClick={onResetDemo}>
-          <Trash2 size={16} />
-          모든 로컬 데이터 삭제
-        </button>
-      </div>
+              onBlur={() => notifyApplied("NeuralMap 기본 URL이 적용되었습니다.")}
+            />
+          </label>
+          <label>
+            검색 문맥 토큰 예산
+            <input
+              min="800"
+              max="12000"
+              step="200"
+              type="number"
+              value={state.neuralMap.tokenBudget}
+              onChange={(event) =>
+                onStateChange((current) => ({
+                  ...current,
+                  neuralMap: {
+                    ...current.neuralMap,
+                    tokenBudget: Number(event.target.value)
+                  }
+                }))
+              }
+              onBlur={() => notifyApplied("NeuralMap token budget이 적용되었습니다.")}
+            />
+          </label>
+          <div className="danger-zone">
+            <strong>위험 구역</strong>
+            <p>이 브라우저에 저장된 모든 시뮬레이션과 생성 이미지를 삭제하고 기본 데모 상태로 되돌립니다.</p>
+            <button className="icon-text-button full danger-action" type="button" onClick={onResetDemo}>
+              <Trash2 size={16} />
+              모든 로컬 데이터 삭제
+            </button>
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }
@@ -18999,6 +19347,7 @@ function PhotorealRuntimeSettings({
   const customWorkflowStatusId = `photoreal-workflow-status-${state.simulation.id}`;
   // From useId rather than the simulation id: the rail and the mobile drawer can both hold this panel at once.
   const styleScreenId = useId();
+  const appearanceScreenId = useId();
   const cfgStatusId = useId();
   // Why the last CFG typed was not applied. Set when the field commits (blur / Enter), never per keystroke, cleared by
   // the next value that is applied, and shown only for the simulation it was typed in (the panel can switch).
@@ -19019,10 +19368,38 @@ function PhotorealRuntimeSettings({
   // A probe describes one ComfyUI address for one simulation; after a switch of either it would describe the wrong one.
   const visibleProbe =
     probe && probe.simulationId === state.simulation.id && probe.baseUrl === photoreal.baseUrl.trim() ? probe : undefined;
-  const probedPresetIds = Array.from(new Set([photoreal.workflowPreset, photoreal.referenceWorkflowPreset]));
+  // The face-lock preset is only used while face lock is on, so it is only checked then (see collectProbeNodes).
+  const probedPresetIds = Array.from(
+    new Set(photoreal.faceReferenceEnabled ? [photoreal.workflowPreset, photoreal.referenceWorkflowPreset] : [photoreal.workflowPreset])
+  );
   const fileChecks = visibleProbe
     ? probedPresetIds.map((presetId) => ({ presetId, checks: checkPhotorealPresetFiles(photoreal, presetId, visibleProbe.result) }))
     : [];
+  // Every file in place and no probed node missing. Nodes of presets that were not probed count as present: the core
+  // nodes a built-in preset needs ship with ComfyUI, and only the configured presets' nodes are asked about.
+  const presetRunsHere = (presetId: PhotorealWorkflowPresetId): boolean =>
+    Boolean(visibleProbe?.result.ok) &&
+    presetId !== "custom" &&
+    checkPhotorealPresetFiles(photoreal, presetId, visibleProbe!.result).every((check) => check.status === "installed") &&
+    PHOTOREAL_WORKFLOW_PRESETS[presetId].requiredNodes.every((node) => visibleProbe?.result.nodes?.[node] !== false);
+  // The chosen preset cannot run on this ComfyUI but another built-in one can: offer that one in a click instead of
+  // leaving the person with a list of downloads (the default preset needs files and nodes a typical install lacks).
+  const installedPresetId =
+    visibleProbe?.result.ok && !presetRunsHere(photoreal.workflowPreset)
+      ? photorealWorkflowPresetOrder.find((presetId) => presetId !== photoreal.workflowPreset && presetRunsHere(presetId))
+      : undefined;
+  const [reprobeRequested, setReprobeRequested] = useState(false);
+  const switchToInstalledPreset = (presetId: PhotorealWorkflowPresetId) => {
+    // Face lock runs the face-lock preset; if that one cannot run here either, a locked cut would fail, so it goes off.
+    const keepFaceLock = photoreal.faceReferenceEnabled && presetRunsHere(photoreal.referenceWorkflowPreset);
+    onChange(
+      { workflowPreset: presetId, ...(keepFaceLock ? {} : { faceReferenceEnabled: false }) },
+      `생성용 워크플로를 ${PHOTOREAL_WORKFLOW_PRESETS[presetId].label}(으)로 바꿨습니다.${
+        photoreal.faceReferenceEnabled && !keepFaceLock ? " 얼굴 고정용 워크플로가 이 PC에 없어 얼굴 고정은 껐습니다." : ""
+      }`
+    );
+    setReprobeRequested(true);
+  };
 
   const runProbe = async () => {
     // Settings are per simulation and the probe result is written back into them, so it carries the same ownership
@@ -19058,6 +19435,17 @@ function PhotorealRuntimeSettings({
       setIsProbing(false);
     }
   };
+
+  // After a one-click preset switch, check again on the render that carries the new settings, so the warning about
+  // the old preset does not stay on screen describing a choice that is no longer made.
+  useEffect(() => {
+    if (!reprobeRequested) {
+      return;
+    }
+    setReprobeRequested(false);
+    void runProbe();
+    // runProbe is recreated every render; the switch is what this answers to.
+  }, [reprobeRequested]);
 
   const setModelFile = (presetId: PhotorealWorkflowPresetId, field: PhotorealModelFileField, value: string) => {
     onChange({
@@ -19197,6 +19585,20 @@ function PhotorealRuntimeSettings({
                 ) : null}
               </dl>
             ) : null}
+            {installedPresetId ? (
+              <div className="photoreal-probe-suggestion">
+                <p className="runtime-hint">
+                  {generationPreset.label}은(는) 이 ComfyUI에서 실행할 수 없습니다. {PHOTOREAL_WORKFLOW_PRESETS[installedPresetId].label}은(는) 필요한
+                  파일이 모두 설치되어 있습니다.
+                </p>
+                <button className="icon-text-button full" type="button" onClick={() => switchToInstalledPreset(installedPresetId)}>
+                  <Check size={15} />
+                  {/* The label's parenthetical ("가장 빠름, 얼굴 고정 없음") is in the hint above; on the button it made the
+                      rail scroll sideways. */}
+                  {PHOTOREAL_WORKFLOW_PRESETS[installedPresetId].label.replace(/\s*\(.*\)\s*$/u, "")}(으)로 바꾸기
+                </button>
+              </div>
+            ) : null}
             {visibleProbe.result.ok
               ? fileChecks.map(({ presetId, checks }) =>
                   checks.length > 0 ? (
@@ -19284,6 +19686,23 @@ function PhotorealRuntimeSettings({
             </select>
           </label>
         </div>
+        {/* The run screen only showed the state ("켜짐"); turning it off meant a trip to the builder. */}
+        <label className="checkline">
+          <input
+            checked={photoreal.faceReferenceEnabled}
+            type="checkbox"
+            onChange={(event) =>
+              onChange(
+                { faceReferenceEnabled: event.target.checked },
+                event.target.checked ? "실사 프로필 얼굴 고정을 켰습니다." : "실사 프로필 얼굴 고정을 껐습니다."
+              )
+            }
+          />
+          캐릭터 실사 프로필로 얼굴 고정
+        </label>
+        <p className="runtime-hint">
+          켜면 프로필 사진의 얼굴만 이어지고, 머리 모양·메이크업·의상·배경은 컷 설명을 따릅니다. 끄면 컷마다 외형 설명대로 새로 그립니다.
+        </p>
         {[generationPreset, ...(referencePreset.id !== generationPreset.id ? [referencePreset] : [])].map((preset) => (
           <div className="photoreal-preset-note" key={preset.id}>
             <PhotorealLicenseTag preset={preset} />
@@ -19488,6 +19907,26 @@ function PhotorealRuntimeSettings({
         </label>
         {/* Keyed by simulation: the note reads the text once typing settles, and the panel can switch simulations. */}
         <PhotorealTextScreenNote id={styleScreenId} key={state.simulation.id} scope="style" state={state} text={photoreal.stylePrompt} />
+        <label>
+          여성 인물 공통 외모 (실사 전용, 영어)
+          <textarea
+            value={photoreal.appearancePrompt}
+            placeholder={PHOTOREAL_SHARED_APPEARANCE_PLACEHOLDER}
+            aria-describedby={appearanceScreenId}
+            onChange={(event) => onChange({ appearancePrompt: event.target.value })}
+            onBlur={() => onNotify("실사 공통 외모가 적용되었습니다.")}
+          />
+        </label>
+        <PhotorealTextScreenNote
+          id={appearanceScreenId}
+          key={`${state.simulation.id}-appearance`}
+          scope="appearance"
+          state={state}
+          text={photoreal.appearancePrompt}
+        />
+        <p className="runtime-hint">
+          실사 컷의 모든 여성 인물에게 붙습니다. 캐릭터마다 다른 외형은 캐릭터의 실사 외형 칸에 씁니다. NovelAI 식 강조(2.5::…::)는 기호를 빼고 단어만 씁니다.
+        </p>
         <label>
           네거티브 추가 (영어, 선택)
           <textarea

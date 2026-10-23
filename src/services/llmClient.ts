@@ -12,6 +12,7 @@ import type {
 import { cliAgentKindForProvider, isCliAgentLlmProvider } from "../types";
 import { getLlmChatProxyUrl, getLlmCliAgentProxyUrl } from "./dynamicChatApi";
 import {
+  acceptsTemperature,
   clampProviderTemperature,
   getLlmProviderPreset,
   isReasoningModel,
@@ -264,6 +265,30 @@ const PROVIDER_BOILERPLATE_PATTERNS = [
   /safety\s+policy/iu,
   /blocked\s+by\s+(?:the\s+)?(?:safety|policy)/iu
 ] as const;
+// A model declining in its own voice ("요청하신 프롬프트는 … 수행할 수 없습니다. 제 안전 가이드라인…") rather than
+// through an error envelope. It arrives as an ordinary 200 with text, so none of the patterns above caught it
+// (observed: Antigravity/Gemini on an adult beat) and it was committed as the turn's narrative — then read back
+// through the recent transcript, priming the next turn to refuse too. A refusal needs BOTH halves, outside quoted
+// dialogue: the declining verb in the polite register a model answers in, and talk about the request or the
+// model's own rules. "그 명령은 수행할 수 없습니다" from a soldier is story; so is narration that "진행할 수 없었다".
+const MODEL_REFUSAL_PHRASE_PATTERNS = [
+  /(?:수행|생성|작성|제공|묘사|진행|처리|응답|도와|도움을\s*드리|응해)\S{0,6}\s*(?:드릴\s*)?수\s*(?:가\s*)?없(?:습니다|어요)/u,
+  /엄격(?:히|하게)\s*금지/u,
+  /허용되지\s*않(?:습니다|아요)/u,
+  /\bI\s*(?:can(?:no|['’])t|cannot|won['’]t|am\s+(?:not\s+able|unable)|['’]m\s+(?:not\s+able|unable))\s+(?:to\s+)?(?:help|assist|write|create|generate|continue|fulfil|comply|produce|provide|engage)/iu,
+  /\bI\s+(?:must|have\s+to)\s+decline\b/iu
+] as const;
+const MODEL_REFUSAL_META_PATTERNS = [
+  /요청하신\s*(?:프롬프트|내용|장면|요청|시나리오|글)/u,
+  /(?:제|저의|저희)\s*(?:안전\s*)?(?:가이드라인|정책)/u,
+  /(?:안전|콘텐츠|이용|사용)\s*(?:가이드라인|정책)/u,
+  /(?:콘텐츠|묘사|내용)(?:를|을)?\s*생성/u,
+  /롤플레(?:잉|이)|프롬프트/u,
+  /(?:AI|인공지능)\s*(?:로서|으로서|모델|어시스턴트)|언어\s*모델/u,
+  /\b(?:as\s+an\s+AI|language\s+model|content\s+(?:policy|guidelines)|(?:my|safety|usage)\s+(?:guidelines|polic(?:y|ies)))\b/iu
+] as const;
+// Refusals lead the reply. Looking only at the opening keeps a long narrative from tripping on a stray pair.
+const MODEL_REFUSAL_SCAN_CHARS = 1200;
 const MALFORMED_SIDECAR_RECOVERY_MARKER = "Recovered assistant sidecar from malformed JSON.";
 
 export interface PlannedImageCueDraft extends AssistantImageCueDraft {
@@ -381,6 +406,7 @@ export async function generateAssistantText(input: {
     }
 
     let parsed = parseAssistantSidecar(rawContent);
+    throwIfModelRefusal(state, parsed, rawContent);
     if (parsed.sidecar && looksLikeProviderBoilerplateText(parsed.sidecar.assistantText) && !isLlmProviderCoolingDown(state)) {
       rawContent = await requestProviderRecoveryText(
         state,
@@ -393,6 +419,7 @@ export async function generateAssistantText(input: {
         throw new Error("LLM response did not include content after scene-continuation retry.");
       }
       parsed = parseAssistantSidecar(rawContent);
+      throwIfModelRefusal(state, parsed, rawContent);
       if (parsed.sidecar && looksLikeProviderBoilerplateText(parsed.sidecar.assistantText)) {
         throw new Error("LLM returned provider boilerplate instead of a scene continuation.");
       }
@@ -822,7 +849,8 @@ export async function generateAssistantText(input: {
     // A cancelled turn is NOT a provider failure. Falling through to the fallback path here would commit a
     // synthetic "LLM 실패" assistant message as if it were the turn the user just asked to stop, so the abort
     // propagates to runTurnFromText, which reports it as 취소됨 and commits nothing.
-    if (isLlmAbortedError(error)) {
+    // A refusal propagates the same way: as fallback content it would be committed as an assistant turn.
+    if (isLlmAbortedError(error) || isLlmRefusalError(error)) {
       throw error;
     }
     const errorMessage = error instanceof Error ? error.message : "Unknown LLM error";
@@ -2290,6 +2318,11 @@ function looksLikeProviderBoilerplateText(value: string): boolean {
   if (!compact) {
     return false;
   }
+  // A refusal is not narrative either: every caller that filters boilerplate out of the transcript or rejects it
+  // as a repair candidate must drop it too.
+  if (looksLikeModelRefusalText(compact)) {
+    return true;
+  }
 
   const hasBoilerplateSignal = PROVIDER_BOILERPLATE_PATTERNS.some((pattern) => pattern.test(compact));
   if (!hasBoilerplateSignal) {
@@ -2297,6 +2330,42 @@ function looksLikeProviderBoilerplateText(value: string): boolean {
   }
 
   return compact.length < 900 || /죄송|다시\s*시도|조정|생성|정책|policy|model|provider/iu.test(compact);
+}
+
+export function looksLikeModelRefusalText(value: string): boolean {
+  const opening = value
+    .slice(0, MODEL_REFUSAL_SCAN_CHARS)
+    // Quoted dialogue is the characters talking. Single quotes only when they hold Korean, so an English
+    // apostrophe ("can't … I'm") is not read as a quote and swallowed.
+    .replace(/“[^”]*”|"[^"\n]*"|「[^」]*」|『[^』]*』|‘[^’]*’|'[^'\n]*[가-힣][^'\n]*'/gu, " ")
+    .replace(/\s+/gu, " ");
+  return (
+    MODEL_REFUSAL_PHRASE_PATTERNS.some((pattern) => pattern.test(opening)) &&
+    MODEL_REFUSAL_META_PATTERNS.some((pattern) => pattern.test(opening))
+  );
+}
+
+function throwIfModelRefusal(state: AppState, parsed: { sidecar?: AssistantSidecar }, rawContent: string): void {
+  // The JSON envelope when there is one; a model that refuses usually drops the envelope and answers in plain text.
+  const visibleText = parsed.sidecar?.assistantText ?? createDisplayFallbackText(rawContent, "");
+  if (visibleText && looksLikeModelRefusalText(visibleText)) {
+    console.warn("[narrative] the model refused the turn", {
+      provider: state.llm.provider,
+      model: state.llm.model,
+      opening: visibleText.slice(0, 160)
+    });
+    throw new LlmRefusalError(createModelRefusalMessage(state));
+  }
+}
+
+function createModelRefusalMessage(state: AppState): string {
+  const backend = `${getLlmProviderPreset(state.llm.provider).label}${state.llm.model ? ` · ${state.llm.model}` : ""}`;
+  return [
+    `서사 모델(${backend})이 이 장면 작성을 거절했습니다.`,
+    "DynamicChat 이 막은 것이 아니라 모델 자체의 콘텐츠 정책이라, 시뮬레이션의 연령 등급 설정으로는 바뀌지 않습니다.",
+    "거절문은 서사로 저장하지 않았고 입력은 그대로 남아 있습니다.",
+    "이 장면은 성인 콘텐츠를 허용하는 백엔드(예: 로컬 모델)로 바꿔 진행하세요."
+  ].join(" ");
 }
 
 function sanitizeProviderRetryText(value: string, maxChars: number): string {
@@ -3760,6 +3829,10 @@ ${contextBlock}` },
 
     if (!response.ok) {
       const errorBody = await response.text().catch(() => "");
+      // The preset lists recommended models that may not be installed yet; say how to get one instead of a bare 404.
+      if (response.status === 404 && /not found/iu.test(errorBody)) {
+        throw new Error(`Ollama에 ${model} 모델이 설치되어 있지 않습니다. 터미널에서 \`ollama pull ${model}\` 을 실행한 뒤 다시 시도하세요.`);
+      }
       throwProviderHttpError(state, response, "Ollama", errorBody);
     }
 
@@ -3859,7 +3932,7 @@ ${contextBlock}` },
       },
       body: JSON.stringify({
         model,
-        temperature,
+        ...(acceptsTemperature({ provider: state.llm.provider, model }) ? { temperature } : {}),
         max_tokens: providerOutputTokenBudget,
         stream: Boolean(options.onRawText),
         system: `${runtimeInstruction}\n\n${contextBlock}`,
@@ -5205,7 +5278,8 @@ function createAnnotationLlmInstruction(
   state: AppState,
   outputTokenBudget: number,
   includeImageCues: boolean,
-  tier: PromptDetailTier = "full"
+  tier: PromptDetailTier = "full",
+  stateEventsFirst = false
 ): string {
   return [
     includeImageCues
@@ -5217,7 +5291,13 @@ function createAnnotationLlmInstruction(
           // Field order is load-bearing, not cosmetic. The cue array is the part that gets truncated when the
           // model runs out of budget, and a truncated cue arrives with no character_prompts — which is what
           // renders the wrong cast. Emitting it first means state_events, not the images, absorb any overflow.
-          "Write the JSON fields in this exact order: image_cues first, then state_events. The image tags must never be the part that gets cut off at the end.",
+          // When the cue list streams to the image pipeline, each cut is dispatched the moment its object
+          // closes — and it must already see this turn's outfit/pose changes, or the early image shows the
+          // previous turn's state. So state_events come first there, and a cut cut off by the budget is
+          // refilled by the top-up rounds rather than rendered half-written (only closed objects dispatch).
+          stateEventsFirst
+            ? "Write the JSON fields in this exact order: state_events first (keep them compact), then image_cues. Each image is generated the moment its cue is complete, so this turn's state changes must already be written before the first cue."
+            : "Write the JSON fields in this exact order: image_cues first, then state_events. The image tags must never be the part that gets cut off at the end.",
           isImageProgressionCadence(state)
             ? `Image progression mode: output exactly ${IMAGE_PROGRESSION_CUE_TARGET} ordered should_generate=true image_cues.`
             : "For image_cues: place a cut at every major visual beat of the narrative INCLUDING the opening beat — dialogue lines, action/interaction beats, body-detail beats, pose/outfit/state changes, and camera/location changes each deserve their own cue. Set should_generate=false (with a short suppression_reason) only for a genuinely non-visual beat; use [] only if the whole turn is non-visual.",
@@ -5243,7 +5323,8 @@ function createAnnotationLlmContext(
   state: AppState,
   input: { userText: string; assistantText: string; manualImage?: boolean; outputTokenBudget?: number },
   includeImageCues: boolean,
-  tier: PromptDetailTier = "full"
+  tier: PromptDetailTier = "full",
+  stateEventsFirst = false
 ): string {
   // Every derived block below scopes itself by matching character names / preset keywords against a "current
   // text" string. Passing only the user's action made all of them blind to the very narrative they are meant
@@ -5329,7 +5410,11 @@ function createAnnotationLlmContext(
     includeImageCues ? (createImageCueCurrentStateBlock(state, cueScopeText) || "(none)") : undefined,
     "Return JSON only. The JSON schema is:",
     includeImageCues
-      ? JSON.stringify({ image_cues: [tier === "full" ? imageCueShape : COMPACT_IMAGE_CUE_SHAPE], state_events: [stateEventShape] })
+      ? JSON.stringify(
+          stateEventsFirst
+            ? { state_events: [stateEventShape], image_cues: [tier === "full" ? imageCueShape : COMPACT_IMAGE_CUE_SHAPE] }
+            : { image_cues: [tier === "full" ? imageCueShape : COMPACT_IMAGE_CUE_SHAPE], state_events: [stateEventShape] }
+        )
       : JSON.stringify({ state_events: [stateEventShape] })
   ]
     .filter((item): item is string => Boolean(item))
@@ -5347,6 +5432,92 @@ function createAnnotationLlmContext(
  */
 function isAnnotationStateEvent(item: AssistantMemoryEventDraft): boolean {
   return item.memoryKind === "state" || Boolean(item.stateType?.trim());
+}
+
+/**
+ * Watches a streaming annotation reply and reports the cue list each time another cue object closes.
+ *
+ * Nothing is reported until the state_events array has closed: an image dispatched before this turn's
+ * Wearing/pose deltas are known renders the previous turn's outfit, which is the grounding regression the
+ * synchronous annotation contract exists to prevent. Only closed objects count, so a cue cut off mid-write is
+ * never dispatched. Callback errors are swallowed — the stream, not the early images, decides the turn.
+ */
+function createStreamedAnnotationCueEmitter(onCues: (update: StreamedAnnotationCues) => void): (rawText: string) => void {
+  let reportedCueCount = 0;
+  let scannedLength = 0;
+  return (rawText: string) => {
+    // Rescan only when the new text could have closed something; the reply is re-sent whole on every delta.
+    const fresh = rawText.slice(scannedLength);
+    scannedLength = rawText.length;
+    if (!/[}\]]/u.test(fresh)) {
+      return;
+    }
+    try {
+      const text = stripLikelyJsonFence(rawText);
+      const stateStart = findJsonFieldValueStart(text, ["state_events", "stateEvents"]);
+      if (stateStart === undefined || !isJsonArrayValueClosed(text.slice(stateStart))) {
+        return;
+      }
+      const cueStart = findJsonFieldValueStart(text, ["image_cues", "imageCues"]);
+      if (cueStart === undefined) {
+        return;
+      }
+      const errors: string[] = [];
+      const cues = extractJsonObjectFragmentsFromFieldValue(text.slice(cueStart))
+        .map((fragment) => parseJsonObjectFragment(fragment))
+        .filter((item): item is Record<string, unknown> => Boolean(item))
+        .map((item) => normalizeImageCueDraft(item, errors))
+        .filter((item): item is PlannedImageCueDraft => Boolean(item));
+      if (cues.length <= reportedCueCount) {
+        return;
+      }
+      reportedCueCount = cues.length;
+      const stateEvents = extractJsonObjectFragmentsFromFieldValue(text.slice(stateStart))
+        .map((fragment) => parseJsonObjectFragment(fragment))
+        .filter((item): item is Record<string, unknown> => Boolean(item))
+        .map((item) => normalizeMemoryEventDraft(item, errors))
+        .filter((item): item is AssistantMemoryEventDraft => Boolean(item))
+        .filter(isAnnotationStateEvent);
+      onCues({ cues, stateEvents });
+    } catch (error) {
+      console.warn("[annotation] streamed cue dispatch skipped", { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+}
+
+/** Whether the JSON array starting at the head of `valueText` has reached its closing bracket. */
+function isJsonArrayValueClosed(valueText: string): boolean {
+  const start = valueText.search(/\S/u);
+  if (start < 0 || valueText[start] !== "[") {
+    return false;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < valueText.length; index += 1) {
+    const char = valueText[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+    } else if (char === "[" || char === "{") {
+      depth += 1;
+    } else if (char === "]" || char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function parseAnnotationResponse(raw: string, includeImageCues: boolean): TurnAnnotationResult {
@@ -5442,9 +5613,24 @@ export function __buildNarrativePromptForTest(
   };
 }
 
+export interface StreamedAnnotationCues {
+  /** Every cue closed so far, in output order — index i here is cue i of the final first-pass list. */
+  cues: AssistantImageCueDraft[];
+  /** This turn's state deltas; complete, because cues are only reported once the state_events array has closed. */
+  stateEvents: AssistantMemoryEventDraft[];
+}
+
 export async function requestTurnAnnotations(
   state: AppState,
-  input: { userText: string; assistantText: string; manualImage?: boolean }
+  input: { userText: string; assistantText: string; manualImage?: boolean },
+  options: {
+    /**
+     * Called each time another cue of the first pass closes in the streamed reply, so its image can start
+     * while the rest of the cut list is still being written. Never called before this turn's state_events are
+     * complete. The returned result still carries the full list; the caller dedupes by cue index.
+     */
+    onStreamedImageCues?: (update: StreamedAnnotationCues) => void;
+  } = {}
 ): Promise<TurnAnnotationResult> {
   const llmState = resolveImageTagLlmState(state);
   const requiresApiKey = getLlmProviderPreset(llmState.llm.provider).requiresApiKey;
@@ -5481,11 +5667,12 @@ export async function requestTurnAnnotations(
   // Measure, do not assume. The prompt's real size depends on how many characters, presets and state
   // events the creator's simulation carries, so the tier is chosen by building and checking rather than
   // from a constant that cannot know any of that.
+  const streamCues = Boolean(options.onStreamedImageCues) && includeImageCues;
   const fitted = buildWithinBudget(
     budget,
     (tier) => ({
-      instruction: createAnnotationLlmInstruction(state, outputTokenBudget, includeImageCues, tier),
-      context: createAnnotationLlmContext(state, { ...input, outputTokenBudget }, includeImageCues, tier)
+      instruction: createAnnotationLlmInstruction(state, outputTokenBudget, includeImageCues, tier, streamCues),
+      context: createAnnotationLlmContext(state, { ...input, outputTokenBudget }, includeImageCues, tier, streamCues)
     }),
     (built) => `${built.instruction}
 ${built.context}
@@ -5501,7 +5688,7 @@ ${input.userText}`
       contextTokens: budget.contextTokens
     });
   }
-  try {
+  const runAnnotationPass = async (): Promise<TurnAnnotationResult> => {
     const raw = await requestProviderText(
       llmState,
       { userText: input.userText, modules: [], evidence: [] },
@@ -5511,7 +5698,11 @@ ${input.userText}`
       // The annotation/image-cue reply is parsed as strict JSON, so ask the backend to guarantee it where
       // it can. Open-weight models are markedly less disciplined about unprompted JSON than the hosted tier,
       // and a malformed reply degrades into cues with missing character prompts.
-      { temperature: llmState.llm.temperature, jsonResponse: supportsJsonResponseFormat(llmState.llm.provider) }
+      {
+        temperature: llmState.llm.temperature,
+        jsonResponse: supportsJsonResponseFormat(llmState.llm.provider),
+        onRawText: streamCues && options.onStreamedImageCues ? createStreamedAnnotationCueEmitter(options.onStreamedImageCues) : undefined
+      }
     );
     if (!raw?.trim()) {
       console.warn("[annotation] LLM returned empty content", { provider: llmState.llm.provider, model: llmState.llm.model });
@@ -5546,16 +5737,64 @@ ${input.userText}`
       console.warn("[annotation] no image cues after top-up and fallback", { reason: imageCueFailureReason });
     }
     return imageCueFailureReason ? { ...recovered, imageCueFailureReason } : recovered;
-  } catch (error) {
-    // Same reasoning as the narrative pass: a cancelled turn must abort, not degrade into an empty
-    // annotation that the caller would treat as a completed (image-less, state-less) turn.
-    if (isLlmAbortedError(error)) {
-      throw error;
+  };
+
+  // A failed call is not a judgement on the turn. It used to end the pass on the spot — no retry, and none of
+  // the top-up / main-LLM recovery below the first call — so one rate limit on the tag model (seen on
+  // claude_cli right after a long opus narrative) cost the whole turn its images, and the engine's tagless
+  // paragraph placeholders then read as "the tag LLM emptied the tags".
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await runAnnotationPass();
+    } catch (error) {
+      // Same reasoning as the narrative pass: a cancelled turn must abort, not degrade into an empty
+      // annotation that the caller would treat as a completed (image-less, state-less) turn.
+      if (isLlmAbortedError(error)) {
+        throw error;
+      }
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[annotation] LLM call failed", { provider: llmState.llm.provider, model: llmState.llm.model, attempt, error: message });
+      const retryDelayMs = attempt === 1 ? resolveAnnotationRetryDelayMs(error, message) : undefined;
+      if (retryDelayMs === undefined) {
+        break;
+      }
+      await sleepMs(retryDelayMs);
     }
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn("[annotation] LLM call failed", { provider: llmState.llm.provider, model: llmState.llm.model, error: message });
-    return { stateEvents: [], imageCues: [], failureReason: summarizeAnnotationFailure(message) };
   }
+  const failureReason = summarizeAnnotationFailure(lastError instanceof Error ? lastError.message : String(lastError));
+  if (!includeImageCues) {
+    return { stateEvents: [], imageCues: [], failureReason };
+  }
+  // The state deltas are lost with the call, but the cut list need not be: the main model can still tag the
+  // narrative it wrote. authorImageCuesWithMainLlm skips itself when the main backend is the same one.
+  const recovered = await authorImageCuesWithMainLlm(llmState, state, input, { stateEvents: [], imageCues: [] });
+  if (recovered.imageCues.some((cue) => cue.shouldGenerate)) {
+    return {
+      ...recovered,
+      failureReason: `${failureReason} 메인 LLM(${state.llm.provider}/${state.llm.model || "(default)"})이 대신 이미지 컷을 작성했지만, 이 턴의 상태 변화(의상·포즈 등)는 기록되지 않았습니다.`
+    };
+  }
+  return { stateEvents: [], imageCues: [], failureReason };
+}
+
+const ANNOTATION_RETRY_MAX_WAIT_MS = 30_000;
+
+/**
+ * How long to wait before the one retry of a failed annotation call, or undefined when a retry cannot help.
+ * Only transient failures qualify: a rate limit (whose own retry-after is honoured, up to a bound the turn can
+ * afford to wait), an overloaded/5xx upstream, or a dropped connection. A context overflow or an auth error
+ * would fail the same way again.
+ */
+function resolveAnnotationRetryDelayMs(error: unknown, message: string): number | undefined {
+  if (isLlmRateLimitError(error)) {
+    return error.retryAfterMs <= ANNOTATION_RETRY_MAX_WAIT_MS ? Math.max(3_000, error.retryAfterMs) : undefined;
+  }
+  if (/\b429\b|rate.?limit|usage limit|overloaded|\b5(?:00|02|03|04|29)\b|timed? ?out|ECONNRESET|fetch failed|network/iu.test(message)) {
+    return 8_000;
+  }
+  return undefined;
 }
 
 /**
@@ -5567,8 +5806,11 @@ function summarizeAnnotationFailure(message: string): string {
   if (/context size|context length|exceeds the available context|maximum context|too many tokens/iu.test(message)) {
     return "이미지 태그 LLM의 컨텍스트 한도를 초과했습니다. 컨텍스트가 더 큰 모델을 쓰거나 프롬프트 모듈/프리셋을 줄이세요.";
   }
-  if (/\b429\b|rate limit/iu.test(message)) {
-    return "이미지 태그 LLM이 요청 제한에 걸렸습니다. 잠시 후 다시 진행하세요.";
+  if (/\b429\b|rate.?limit|usage limit/iu.test(message)) {
+    // The upstream text says WHOSE limit it was — the model vendor's, the subscription CLI's usage cap, or the
+    // DynamicChat API server's own per-minute limit ("DynamicChat API rate limit exceeded") — and each has a
+    // different fix, so keep it.
+    return `이미지 태그 LLM이 요청 제한에 걸렸습니다 (${message.replace(/\s+/gu, " ").slice(0, 160)}). 한 번 재시도한 뒤에도 실패했습니다.`;
   }
   if (/\b401\b|\b403\b|unauthor|invalid api key/iu.test(message)) {
     return "이미지 태그 LLM 인증에 실패했습니다. API 키를 확인하세요.";
@@ -6234,6 +6476,22 @@ export class LlmAbortedError extends Error {
 
 export function isLlmAbortedError(error: unknown): error is LlmAbortedError {
   return error instanceof LlmAbortedError;
+}
+
+/**
+ * The narrative model answered with a refusal instead of the scene. Thrown, not turned into fallback content:
+ * the turn fails with nothing committed, like an unconfigured backend. Retrying is not attempted either — the
+ * same model on the same context refuses again, and on a CLI backend each retry is another minute-long call.
+ */
+export class LlmRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LlmRefusalError";
+  }
+}
+
+export function isLlmRefusalError(error: unknown): error is LlmRefusalError {
+  return error instanceof LlmRefusalError;
 }
 
 /**

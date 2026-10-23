@@ -1,7 +1,7 @@
 import type { LlmApiSettings, NovelAiApiSettings } from "../types";
 import { cliAgentKindForProvider } from "../types";
 import { getLlmChatProxyUrl, getLlmCliAgentProxyUrl, getNovelAiSubscriptionProxyUrl } from "./dynamicChatApi";
-import { getLlmProviderPreset, type LlmProviderPreset } from "./llmProviders";
+import { acceptsTemperature, getLlmProviderPreset, type LlmProviderPreset } from "./llmProviders";
 
 export interface ApiValidationResult {
   ok: boolean;
@@ -37,6 +37,26 @@ export async function listLocalLlmModels(settings: Pick<LlmApiSettings, "baseUrl
       .map((entry) => (typeof entry.id === "string" ? entry.id.trim() : ""))
       .filter(Boolean)
       .sort((left, right) => left.localeCompare(right));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Lists the model ids the installed Antigravity CLI (agy) currently accepts, via the API server.
+ *
+ * agy retires model ids without warning and then refuses them outright, so the preset list goes stale; the
+ * CLI itself is the only list that cannot. Returns [] on any failure (server down, agy missing or signed
+ * out) so the settings panel falls back to the preset list instead of blocking.
+ */
+export async function listCliAgentModels(agent: "antigravity"): Promise<string[]> {
+  try {
+    const response = await fetchWithTimeout(`${getLlmCliAgentProxyUrl()}/models?agent=${agent}`, { method: "GET" }, 40_000);
+    if (!response.ok) {
+      return [];
+    }
+    const data = (await response.json()) as { models?: Array<{ id?: unknown }> };
+    return (data.models ?? []).map((entry) => (typeof entry.id === "string" ? entry.id.trim() : "")).filter(Boolean);
   } catch {
     return [];
   }
@@ -129,7 +149,7 @@ export async function validateLlmApi(settings: LlmApiSettings): Promise<ApiValid
         body: JSON.stringify({
           model: settings.model,
           max_tokens: 8,
-          temperature: 0,
+          ...(acceptsTemperature(settings) ? { temperature: 0 } : {}),
           system: "Reply with OK only.",
           messages: [{ role: "user", content: "Connection test." }]
         })

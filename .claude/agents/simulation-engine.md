@@ -1,7 +1,7 @@
 ---
 name: simulation-engine
 description: 채팅 턴 실행 루프, 프롬프트 조립, 모듈 선택 로직을 개발한다. simulationEngine.ts(2266줄), llmClient.ts, memoryCompiler.ts, sceneCast.ts를 수정할 때 사용한다. 가장 복잡한 코어 서비스다.
-model: claude-sonnet-4-6
+model: sonnet
 tools:
   - Read
   - Edit

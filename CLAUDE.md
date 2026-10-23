@@ -26,12 +26,28 @@ pnpm dev:web
 기본 URL: `http://127.0.0.1:8788`  
 데이터 디렉토리: `.dynamicchat-data/` (또는 `DYNAMICCHAT_DATA_DIR` 환경변수)
 
-실사 이미지(ComfyUI)도 같이 띄우려면 portable 설치 폴더를 지정한다. 이미 떠 있는 ComfyUI 가 있으면 그것을 쓴다:
+실사 이미지(ComfyUI)와 Ollama 는 **자동으로 발견되고 시작된다** — 환경변수 없이 `pnpm api` 또는 `pnpm dev`
+만 실행하면 된다. 이미 떠 있는 프로세스가 있으면 그것을 쓰고, 직접 띄운 것만 종료 시 내린다.
+
+**ComfyUI 발견 순서**: `DYNAMICCHAT_COMFYUI_DIR` 환경변수 → `<dataDir>/local-services.json` (이전 탐색
+결과 기억) → C–Z 드라이브 + 사용자 홈의 공통 경로를 얕게 스캔.
 
 ```powershell
-$env:DYNAMICCHAT_COMFYUI_DIR="D:\ComfyUI\app\ComfyUI_windows_portable"
+# 수동 지정이 필요하면 (자동 탐색 실패 시)
+$env:DYNAMICCHAT_COMFYUI_DIR="D:\ComfyUI\app\ComfyUI_windows_portable"   # 또는 "S:\Tools\ComfyUI"
 pnpm dev
 ```
+
+- 로그: `<dataDir>/logs/comfyui.log`
+- 자동 시작 비활성화: `DYNAMICCHAT_START_COMFYUI=0`, `DYNAMICCHAT_START_OLLAMA=0`
+- 상태 확인: `GET /local-services/status` (로컬 전용 — `rejectNonLocalSecretRequest` 보호)
+- 꺼진 ComfyUI(창을 닫았거나 죽었거나, 원래 떠 있던 것이 내려갔거나)는 **다음 생성·연결 확인이 다시 띄운다.**
+  `ensureComfyUiRunning` 은 기록된 상태가 아니라 **포트를 먼저 본다** — 상태를 믿던 첫 구현은 "running" 으로 남은
+  죽은 ComfyUI 를 끝내 다시 띄우지 않았다. 또 앱은 생성 요청에 **항상 `baseUrl` 을 보내므로** 자동 시작 여부는
+  주소(`isComfyUiManagedUrl`)로 판단한다 — `baseUrl` 이 없을 때만 띄우던 구현은 실제 앱에서 한 번도 동작하지 않았다.
+
+기본 프리셋 Qwen-Image 2.1 은 ComfyUI 에 `QwenImage21Cache` / `TextEncodeQwenImage21` 노드가 있어야 한다(0.40.0 에서
+측정, 0.28.0 에는 없다). Z-Image Turbo 는 0.28.0 에서도 노드가 다 있다.
 
 ## 핵심 아키텍처
 
@@ -93,6 +109,9 @@ DynamicChat Web (React/Vite)
 ## 코드 규칙
 
 - **타입**: `src/types.ts`에 집중. 새 도메인 타입은 여기에만 추가.
+- **타입 검사는 `npx tsc --noEmit -p tsconfig.app.json`** (서버 쪽은 `tsconfig.node.json`). 루트 `tsconfig.json` 은
+  `"files": []` + references 라서 `tsc --noEmit -p .` 는 **아무것도 검사하지 않고 0 으로 끝난다** — 그 "통과" 를 믿고
+  App.tsx 에 같은 이름의 상수를 두 번 선언했고, 실행 중인 앱이 Vite 오류 화면으로 바뀌었다(`vite build` 도 타입을 안 본다).
 - **서비스**: `src/services/` — 각 파일이 단일 관심사를 담당.
 - **서버 라우트**: `server/dynamicchat-server.mjs` — 라우트를 추가할 때 `matchRoute()` 배열에 등록.
 - **ID 생성**: `createId()` (`src/lib/id.ts`) 사용. `crypto.randomUUID()` 직접 호출 금지.
@@ -110,6 +129,17 @@ DynamicChat Web (React/Vite)
   `requiresProxy: true` 프리셋은 `POST /llm/chat`(서버 릴레이, 호스트 allow-list)을 경유한다.
   allow-list 추가는 `DYNAMICCHAT_LLM_PROXY_HOSTS` 환경변수.
 - **구독 CLI 브릿지**: `POST /llm/cli-agent` 사용 가능 (API 키 불필요).
+  agy 는 모델 id 를 예고 없이 퇴역시키고(3.7 flash → 3.8, 3.1 pro → gemini-4-argon) 퇴역 id 는 즉시 거부한다. 브릿지는
+  `agy models`(10분 캐시)에 없는 id 를 같은 계열·등급·effort 의 현재 모델로 대신 실행하고(`pickAntigravityReplacement`,
+  클라이언트 `pickAntigravityReplacementModel` 과 같은 규칙), 설정 화면이 그 id 를 경고 + 한 번 클릭 교체로 띄운다.
+  NDJSON 에이전트(agy·claude 스트림)는 **본문 텍스트가 나와야** 200 을 연다 — 첫 stdout 줄에 열던 때는 2초 만의
+  "모델 없음" 실패가 빈 200 이 되어 "차단된 턴" 으로 보였다.
+- **모델 거절은 DynamicChat 이 고칠 수 없다**: 19+ 등급은 DynamicChat *자신의* 필터와 지시만 바꾼다. 호스티드 모델
+  (agy·Gemini, Claude 등)은 자체 정책으로 노골적 장면을 거절하고, 그 거절은 오류가 아니라 **200 + 평문**으로 온다.
+  `looksLikeModelRefusalText`(따옴표 밖에서 합쇼체 거절 동사 + 요청·정책 언급이 함께 있을 때)가 이를 잡아
+  `LlmRefusalError` 로 턴을 실패시킨다 — 저장하지 않고, 재시도하지 않는다(같은 모델은 같은 맥락에서 또 거절하고, CLI 는
+  한 번에 1분이다). 이 감지가 없을 때 state.json 에 거절문 9건이 서사로 저장되어 있었고, 최근 전사로 다시 들어가 다음 턴의
+  거절을 부추겼다. 실제 서사 462건에서 오탐은 0건이었다. **우회 프롬프트는 넣지 않는다.** 성인 장면이 필요하면 그것을 허용하는 백엔드를 고르는 것이 답이다.
 - **실사 이미지 백엔드**: 로컬 ComfyUI 를 `POST /photoreal/comfyui/{generate,status,free,interrupt}` 서버 릴레이로
   쓴다(ComfyUI 는 브라우저 교차 출처 요청을 거부한다). 설계와 실측은 `docs/photoreal-image-pipeline.md`.
 
@@ -482,6 +512,19 @@ NAI 는 역동적 동작·다양한 상황에, 로컬 실사 모델(ComfyUI 의 
 - **얼굴 레퍼런스는 머리·어깨로 잘라서 넣는다**(`computeReferenceHeadCrop` → `ImageCrop`). 프로필 전체를 넣으면
   일부 시드가 레퍼런스를 편집 대상으로 보고 프로필의 방·옷을 다시 그렸다. 그래서 프로필 기록에 width/height 가
   꼭 있어야 한다.
+- **얼굴 고정은 기본 꺼짐이고, 켜도 얼굴만 잇는다.** 프로필을 고르면 자동으로 레퍼런스가 되고 머리 모양까지
+  붙잡던 때는 "외형이 프로필 사진에 고정된다" 는 불만이 됐다. 레퍼런스 문장은 얼굴·이목구비만 유지하고 머리
+  모양·메이크업은 컷 설명을 따르라고 한다. 실행 화면 설정 → 실사 탭에 스위치가 있다.
+- **룩은 설정이 정하고 외모는 사용자가 정한다.** 새 시뮬레이션의 스타일 기본값은 `instagram`(풀프레임 85mm,
+  화사한 인물광, 선명한 디테일 — `daily_look` 의 폰 노이즈·저대비가 "화질이 낮다" 로 읽혔다). 시뮬레이션 단위
+  `photoreal.appearancePrompt`(여성 인물 공통 외모)는 모든 여성의 주어 **바로 뒤**에 붙는다(꼬리에 두면 가장 약하고
+  가장 먼저 잘린다). 캐릭터별 외형·나이는 사용자 몫이다 — 엔진이 나이를 박아 넣으면 원작 고증을 해친다. 미성년
+  코드는 지금처럼 하한이 NovelAI 로 보낸다. 공통 외모도 하한이 스타일과 함께 읽는다.
+- **NovelAI 식 강조는 실사에서 단어만 남긴다**(`stripEmphasisSyntax`, `+2.5:: … ::`, `{…}`, `(…:1.2)`; 0 이하
+  가중치 묶음은 뺀다). 사용자는 실사 외형도 NAI 태그처럼 쓰고, 그대로 두면 "+2.5::" 가 인코더에 글자로 갔다.
+- **배경이 빈약해지던 이유 셋**: `PLACE_PATTERN` 이 장소 단어를 태그 끝에만 인정해서 "cafe interior" 가 장소가 아니었고
+  (그래서 프리셋 기본 방이 덧붙었다), 밤 컷에도 낮빛 기본값이 붙었고, 1600자 상한에서 배경 태그가 가장 먼저 잘렸다.
+  지금은 interior/exterior/area 같은 수식어와 군사·SF 장소를 인정하고, 밤·저녁 시간은 기본 조명을 막고, 상한은 2400자다.
 - **16GB 에서는 GPU 를 교대로 쓴다**(`localGpuCoordinator.ts`, `vramHandoff: "auto"`): 이미지 전 Ollama 언로드,
   LLM 턴 전 ComfyUI `/free`. 실측 — ComfyUI 가 VRAM 을 쥔 채 LLM 첫 호출 34.6s(12.4 tok/s) vs 교대 후 5.7s(63 tok/s),
   LLM 이 쥔 채 이미지 10.8s vs 교대 후 3.1s. VRAM 은 기계의 것이라 **이 카드에 모델을 올리는 작업은 시뮬레이션의 실사

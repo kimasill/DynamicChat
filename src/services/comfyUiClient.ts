@@ -717,7 +717,10 @@ function composeProbeMessage(result: ComfyUiProbeResult): string {
 /** The node types the configured presets need, so the probe can say "update ComfyUI" before a cut fails on it. */
 function collectProbeNodes(settings: PhotorealApiSettings): string[] {
   const nodes = new Set<string>();
-  for (const presetId of new Set([settings.workflowPreset, settings.referenceWorkflowPreset])) {
+  // The face-lock preset only runs while face lock is on (resolvePhotorealPresetForCut). Probing it regardless told a
+  // Z-Image-only machine that Qwen-Image 2.1's nodes were missing, with face lock switched off.
+  const presetIds = settings.faceReferenceEnabled ? [settings.workflowPreset, settings.referenceWorkflowPreset] : [settings.workflowPreset];
+  for (const presetId of new Set(presetIds)) {
     if (!isPhotorealPresetId(presetId)) {
       continue;
     }

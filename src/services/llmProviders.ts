@@ -66,6 +66,8 @@ export interface LlmProviderPreset {
    * Used to widen the key-verification probe and to explain an empty completion instead of retrying it.
    */
   reasoningModelPattern?: RegExp;
+  /** Models that 400 on an explicit temperature although the backend otherwise takes one. */
+  fixedSamplingModelPattern?: RegExp;
 }
 
 const OPEN_MODEL_DEFAULTS = {
@@ -158,14 +160,8 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
     label: "Claude",
     group: "hosted",
     baseUrl: "https://api.anthropic.com/v1",
-    defaultModel: "claude-sonnet-4-6",
-    models: [
-      "claude-opus-4-7",
-      "claude-sonnet-4-6",
-      "claude-haiku-4-5-20251001",
-      "claude-3-7-sonnet-latest",
-      "claude-3-5-haiku-latest"
-    ],
+    defaultModel: "claude-sonnet-5-5",
+    models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"],
     keyPlaceholder: "sk-ant-...",
     advancedBaseUrl: false,
     transport: "claude",
@@ -178,7 +174,10 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
     requiresApiKey: true,
     contextTokens: 200_000,
     // Without this Anthropic refuses requests whose Origin is a browser page.
-    extraHeaders: { "anthropic-dangerous-direct-browser-access": "true" }
+    extraHeaders: { "anthropic-dangerous-direct-browser-access": "true" },
+    // Anthropic removed sampling parameters from Opus 4.7 on, and the 5-generation Sonnet / Haiku reject any
+    // non-default value — an explicit temperature is a 400 on every model this list offers.
+    fixedSamplingModelPattern: /^claude-(?:fable|mythos|opus-4-[78]|(?:opus|sonnet|haiku)-[5-9])/iu
   },
 
   // ─── Open-weight / open-source model providers ────────────────────────────────────────────────
@@ -293,13 +292,19 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
     value: "ollama",
     label: "Ollama (로컬)",
     group: "local",
-    hint: "ollama serve 실행 후 사용. 키 불필요. 설치된 모델을 자동으로 불러옵니다.",
+    hint: "ollama serve 실행 후 사용. 키 불필요. 설치된 모델을 자동으로 불러와 첫 모델을 선택합니다. 12GB VRAM 권장: gemma4:12b-it-qat. qwen3:14b 는 16GB 이상에서.",
     baseUrl: "http://127.0.0.1:11434/v1",
     // Empty, not "custom": that string is the UI's free-text sentinel, and shipping it as the default meant
     // an untouched field POSTed {"model":"custom"} and got an opaque upstream 404 instead of the
     // "모델 이름이 비어 있습니다" guidance the empty-model guard exists to give.
     defaultModel: "",
-    models: ["custom"],
+    // Recommendations, listed after whatever the local server reports as installed. What decides it is fitting the
+    // card whole (VRAM spill made a larger model 600x slower — see CLAUDE.md). Measured on a 12GB RTX 5070 with a normal
+    // desktop holding ~3.8GB: gemma4:12b-it-qat at 16k sits 100% in VRAM at 72 tok/s; qwen3:14b spills 1.9GB at 16k
+    // (30 tok/s) and only fits at 8k, which forces the smallest annotation tier — so it leads only on 16GB+, where it
+    // is this app's measured best. qwen3.5:9b loops on the NIKKE sim. A pick that is not installed fails with an
+    // `ollama pull` hint rather than a bare 404.
+    models: ["gemma4:12b-it-qat", "qwen3:14b", "custom"],
     keyPlaceholder: "로컬 서버 — 키 불필요",
     advancedBaseUrl: true,
     // Ollama's OpenAI-compatible endpoint silently IGNORES num_ctx and serves every model with a
@@ -362,7 +367,10 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
     group: "cli",
     baseUrl: "",
     defaultModel: "sonnet",
-    models: ["sonnet", "opus", "haiku", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    // Aliases first: the claude CLI resolves them to the newest model of the family on every run, so a saved
+    // "opus" never goes stale. The full ids pin a version and age like any pinned id — this list offered
+    // claude-opus-4-7 long after Opus 5.5 shipped.
+    models: ["sonnet", "opus", "haiku", "fable", "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1"],
     keyPlaceholder: "구독 CLI — API 키 불필요",
     advancedBaseUrl: false,
     transport: "cli",
@@ -426,24 +434,21 @@ export const LLM_PROVIDER_PRESETS: LlmProviderPreset[] = [
     label: "Antigravity CLI (agy)",
     group: "cli",
     baseUrl: "",
-    defaultModel: "gemini-3.7-flash-high",
-    // Must match `agy models`. agy retires model ids without warning, and a retired one here is not a
-    // graceful degradation: agy refuses the run outright ("model X is not recognized"), so the turn loses
-    // whichever pass was pointed at it. gemini-3.5-* was offered by this list long after agy dropped it.
+    defaultModel: "gemini-3.8-flash-high",
+    // Fallback only. The settings panel asks the installed agy (GET /llm/cli-agent/models) and, when that
+    // answers, shows its list INSTEAD of this one. agy retires ids without warning and then refuses them
+    // outright ("model X is not recognized"): by agy 1.3.2 every gemini-3.7/3.6 flash id and gemini-3.1-pro
+    // were gone while this list still offered them. Keep it matching `agy models` when you touch it.
     models: [
       "gemini-3.8-flash-high",
       "gemini-3.8-flash-medium",
       "gemini-3.8-flash-low",
-      "gemini-3.7-flash-high",
-      "gemini-3.7-flash-medium",
-      "gemini-3.7-flash-low",
-      "gemini-3.6-flash-high",
-      "gemini-3.6-flash-medium",
-      "gemini-3.6-flash-low",
-      "gemini-3.1-pro-high",
-      "gemini-3.1-pro-low",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
+      "claude-opus-5-5-high",
+      "claude-opus-5-5-medium",
+      "claude-opus-5-5-low",
+      "claude-sonnet-5-5-high",
+      "claude-sonnet-5-5-medium",
+      "claude-sonnet-5-5-low",
       "gpt-oss-120b-medium"
     ],
     keyPlaceholder: "구독 CLI — API 키 불필요 (agy 로그인)",
@@ -479,6 +484,15 @@ export function isReasoningModel(settings: Pick<LlmApiSettings, "provider" | "mo
   return Boolean(pattern && pattern.test(settings.model.trim()));
 }
 
+/** Whether the request may carry an explicit temperature for this backend and model. */
+export function acceptsTemperature(settings: Pick<LlmApiSettings, "provider" | "model">): boolean {
+  const preset = getLlmProviderPreset(settings.provider);
+  if (!preset.sendTemperature || isReasoningModel(settings)) {
+    return false;
+  }
+  return !preset.fixedSamplingModelPattern?.test(settings.model.trim());
+}
+
 /** Clamp a user-configured temperature into what the selected backend actually accepts. */
 export function clampProviderTemperature(provider: LlmProvider, temperature: number): number {
   const { maxTemperature } = getLlmProviderPreset(provider);
@@ -495,4 +509,31 @@ export function clampProviderTemperature(provider: LlmProvider, temperature: num
  */
 export function supportsJsonResponseFormat(provider: LlmProvider): boolean {
   return getLlmProviderPreset(provider).jsonMode === "json_object";
+}
+
+/**
+ * The model agy will actually run for a stored id it no longer offers — the same rule the API bridge applies
+ * (pickAntigravityReplacement in server/dynamicchat-server.mjs; keep the two in step): same vendor, same tier
+ * (flash/lite or not), same Claude family, same effort suffix, in agy's own order. Undefined when the id is still
+ * offered or nothing of that vendor is left.
+ */
+export function pickAntigravityReplacementModel(requested: string, availableIds: readonly string[]): string | undefined {
+  const model = requested.trim();
+  if (!model || availableIds.length === 0 || availableIds.includes(model)) {
+    return undefined;
+  }
+  const vendor = model.split("-")[0];
+  const isLight = /flash|lite/u.test(model);
+  const family = model.match(/^claude-(opus|sonnet|haiku)/u)?.[1];
+  const effort = model.match(/-(high|medium|low)$/u)?.[1];
+  const filters: Array<(id: string) => boolean> = [
+    (id) => (family ? id.startsWith(`claude-${family}`) : true),
+    (id) => /flash|lite/u.test(id) === isLight,
+    (id) => (effort ? id.endsWith(`-${effort}`) : true)
+  ];
+  const narrowed = filters.reduce<string[]>((pool, keep) => {
+    const kept = pool.filter(keep);
+    return kept.length > 0 ? kept : pool;
+  }, availableIds.filter((id) => id.split("-")[0] === vendor));
+  return narrowed[0];
 }

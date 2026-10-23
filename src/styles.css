@@ -4937,6 +4937,121 @@ body.resizing-ops-rail {
   background: var(--crack-panel);
 }
 
+/* The rail is a head (the group tabs) over one scroller (.ops-rail-panel), so the group tabs and the sub-tabs
+   pinned at the top of the scroller stay on screen however far a section runs. The display sits in :where() —
+   zero specificity — because the narrow-screen rules that hide the rail come earlier in this file too, and a
+   plain `.crack-ops-rail { display: flex }` here would win over them by source order. */
+:where(.crack-ops-rail) {
+  display: flex;
+  flex-direction: column;
+}
+
+.crack-ops-rail {
+  overflow: hidden;
+}
+
+.crack-ops-rail > .tabs {
+  flex: none;
+}
+
+.ops-rail-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+
+/* Second row of tabs inside 기억 / 설정: a segmented control, quieter than the group tabs above it. */
+.rail-subtabs {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  gap: 2px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  scrollbar-width: none;
+}
+
+.rail-subtabs button {
+  flex: 1 0 auto;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.rail-subtabs button:hover {
+  color: var(--ink);
+}
+
+.rail-subtabs button.active {
+  border-color: var(--line);
+  color: var(--ink);
+  background: var(--crack-panel);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 8%);
+}
+
+.rail-subtabs button:focus-visible {
+  outline: 2px solid var(--line-strong);
+  outline-offset: 1px;
+}
+
+/* A stored agy model id agy no longer offers, and the one-click fix (StaleAgyModelNote). */
+.stale-model-note {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.stale-model-note code {
+  overflow-wrap: anywhere;
+}
+
+.stale-model-note .icon-text-button {
+  white-space: normal;
+}
+
+/* The builder's version: the page scrolls, so it is not pinned; a compact pill row above the grid instead of a
+   full-width bar. */
+.rail-subtabs.builder-subtabs {
+  position: static;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 0 14px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.rail-subtabs.builder-subtabs button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 0 16px;
+  font-size: 13px;
+}
+
+/* Sits in half of a two-column row in a rail that can be 280px wide; it must shrink with the column rather
+   than push past the rail's edge. */
+.model-discovery-button {
+  min-width: 0;
+}
+
+.model-discovery-button > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .crack-ops-rail .panel-stack,
 .crack-ops-rail .settings-panel {
   gap: 14px;
@@ -10798,6 +10913,18 @@ textarea:focus {
   font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+/* One-click switch to a preset this ComfyUI can run. The rail can be 280px wide, so the button wraps rather than
+   widening the panel. */
+.photoreal-probe-suggestion {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.photoreal-probe-suggestion .icon-text-button {
+  white-space: normal;
 }
 
 .photoreal-probe-facts {

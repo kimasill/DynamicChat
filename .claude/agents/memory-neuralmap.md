@@ -1,7 +1,7 @@
 ---
 name: memory-neuralmap
 description: NeuralMap 연동, 메모리 컴파일러, 세션 연속성 구현을 개발한다. neuralMapClient.ts, memoryCompiler.ts, 세션 reset 흐름을 수정할 때 사용한다.
-model: claude-sonnet-4-6
+model: sonnet
 tools:
   - Read
   - Edit

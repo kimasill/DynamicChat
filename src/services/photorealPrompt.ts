@@ -66,6 +66,8 @@ export interface PhotorealPromptInput {
   style: PhotorealStyle;
   /** photoreal.negativePrompt + per-character photorealNegativePrompt. */
   extraNegative?: string;
+  /** photoreal.appearancePrompt: added to every woman in the cut, right after who she is. */
+  womanAppearance?: string;
   /** qwen21 → "<image1>", edit_plus → "image 1", none → references are not named in the prompt. */
   referenceSyntax: "qwen21" | "edit_plus" | "none";
 }
@@ -90,9 +92,11 @@ export interface PhotorealPromptPlan {
 /**
  * Hard ceiling for the positive prompt. Both encoders accept more, but past roughly this length the last
  * sentences stop steering the picture and only dilute the subject — and the style tail and the reference
- * sentence sit at the end, where they would be the first casualties of a silent truncation.
+ * sentence sit at the end, where they would be the first casualties of a silent truncation. Raised from 1600: a
+ * creator's own appearance text and the shared appearance are never trimmed, so on a detailed cut the old ceiling
+ * was paid for with the background, whose leftovers are the first thing the trim removes.
  */
-export const PHOTOREAL_PROMPT_MAX_CHARS = 1600;
+export const PHOTOREAL_PROMPT_MAX_CHARS = 2400;
 
 /**
  * Appended once when any figure is tied to a reference image. Measured against Qwen-Image 2.1 on the live ComfyUI:
@@ -101,8 +105,11 @@ export const PHOTOREAL_PROMPT_MAX_CHARS = 1600;
  * that the reference is identity-only and that the background comes from the description replaced the room while
  * the face held. The generic form is what the builder falls back to; `createKeepIdentitySentence` names the tokens.
  */
+// The face only, not the hairstyle or makeup: holding those to the reference made every later cut a copy of the one
+// profile photo ("the look is frozen to the profile image"), while hair and makeup are exactly what the cut's own
+// description and the shared appearance are there to vary.
 export const PHOTOREAL_KEEP_IDENTITY_SENTENCE =
-  "Use each reference image only as the identity reference for that person: keep their face, facial features and hairstyle exactly the same, but take the pose, expression, outfit, background and lighting entirely from this description, not from the reference images.";
+  "Use each reference image only as the identity reference for that person: keep their face and facial features recognizably the same, but take the hairstyle, makeup, pose, expression, outfit, background and lighting entirely from this description, not from the reference images.";
 
 /** The keep-identity sentence naming the actual tokens ("<image1>", "image 1"), so the instruction is unambiguous. */
 export function createKeepIdentitySentence(tokens: string[]): string {
@@ -111,10 +118,10 @@ export function createKeepIdentitySentence(tokens: string[]): string {
     return PHOTOREAL_KEEP_IDENTITY_SENTENCE;
   }
   if (unique.length === 1) {
-    return `Use ${unique[0]} only as the identity reference: keep the person's face, facial features and hairstyle exactly the same, but take the pose, expression, outfit, background and lighting entirely from this description, not from the reference image.`;
+    return `Use ${unique[0]} only as the identity reference: keep the person's face and facial features recognizably the same, but take the hairstyle, makeup, pose, expression, outfit, background and lighting entirely from this description, not from the reference image.`;
   }
   const listed = `${unique.slice(0, -1).join(", ")} and ${unique[unique.length - 1]}`;
-  return `Use ${listed} only as identity references: keep each person's face, facial features and hairstyle exactly the same as in their own reference, but take the poses, expressions, outfits, background and lighting entirely from this description, not from the reference images.`;
+  return `Use ${listed} only as identity references: keep each person's face and facial features recognizably the same as in their own reference, but take the hairstyles, makeup, poses, expressions, outfits, background and lighting entirely from this description, not from the reference images.`;
 }
 
 /** Shared photo-model negatives: what an anime-trained caption drags in, plus the usual anatomy failures. */
@@ -125,6 +132,18 @@ export const PHOTOREAL_STYLE_PRESETS: Record<
   Exclude<PhotorealStylePresetId, "custom">,
   { label: string; description: string } & PhotorealStyle
 > = {
+  // What people mean by "like Instagram / Pinterest": a sharp, flattering, high-resolution portrait, not a phone
+  // snapshot. daily_look's lifted shadows, low contrast and phone grain read as low quality next to that feed.
+  instagram: {
+    label: "인스타 · 핀터레스트 인물",
+    description:
+      "인플루언서 피드 같은 고화질 인물 사진. 풀프레임 카메라와 85mm 렌즈, 얼굴을 살리는 화사한 조명, 선명한 디테일과 자연스러운 피부 결, 장면이 살아 있는 배경.",
+    lead: "A high-resolution Instagram influencer photograph, shot on a full-frame camera with an 85mm f/1.4 lens",
+    tail:
+      "Flattering soft light on the face, crisp fine detail, natural skin texture with a healthy glow, rich true-to-life colors, professional color grading, a detailed and realistic background with natural depth of field, photorealistic, realistic proportions",
+    ambientLight: "Soft, flattering natural light",
+    negative: `${PHOTO_NEGATIVE_BASE}, doll, airbrushed skin, lowres, blurry, jpeg artifacts, grainy, washed out, flat lighting`
+  },
   daily_look: {
     label: "데일리룩 · 핀터레스트/샤오홍슈",
     description:
@@ -210,10 +229,13 @@ export function selectPhotoTextForScreening(text: string | undefined): string[] 
  * The ambient defaults are listed although a cut that names its own light or place does not render them: reading
  * more than is sent costs nothing, reading less is how a style slipped past the floor.
  */
-export function describePhotorealStyleForScreening(settings: Pick<PhotorealApiSettings, "stylePreset" | "stylePrompt">): string[] {
+export function describePhotorealStyleForScreening(
+  settings: Pick<PhotorealApiSettings, "stylePreset" | "stylePrompt"> & { appearancePrompt?: string }
+): string[] {
   const preset = settings.stylePreset === "custom" ? undefined : resolveStylePreset(settings.stylePreset);
   const presetTexts = preset ? [preset.lead, preset.tail, preset.ambientLight, preset.ambientSetting] : [];
-  return [...presetTexts, settings.stylePrompt].flatMap((text) => selectPhotoTextForScreening(text));
+  // The shared appearance goes into every woman's sentence, so the floor reads it with the style.
+  return [...presetTexts, settings.stylePrompt, settings.appearancePrompt].flatMap((text) => selectPhotoTextForScreening(text));
 }
 
 /**
@@ -223,7 +245,7 @@ export function describePhotorealStyleForScreening(settings: Pick<PhotorealApiSe
 function resolveStylePreset(stylePreset: PhotorealApiSettings["stylePreset"]): PhotorealStyle {
   return Object.prototype.hasOwnProperty.call(PHOTOREAL_STYLE_PRESETS, stylePreset)
     ? PHOTOREAL_STYLE_PRESETS[stylePreset as Exclude<PhotorealStylePresetId, "custom">]
-    : PHOTOREAL_STYLE_PRESETS.daily_look;
+    : PHOTOREAL_STYLE_PRESETS.instagram;
 }
 
 export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealPromptPlan {
@@ -253,6 +275,19 @@ export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealProm
   }
   for (const figure of [...figures, contextFigure]) {
     finalizeFigure(figure, order);
+  }
+
+  // The shared look rides on each single woman, right after the noun or her own appearance, so it is read as who she
+  // is; in the style tail at the end it was the weakest words in the prompt and the first a clamp removed. A group
+  // noun ("two adult women") keeps its own wording.
+  const womanAppearance = sanitizePhotoSentences(input.womanAppearance, sink.dropped).join(", ");
+  if (womanAppearance) {
+    // The context figure is a subject only when no registered figure is (otherwise it is a "both of them" sentence).
+    for (const figure of figures.length > 0 ? figures : [contextFigure]) {
+      if (!isPluralSubject(figure) && dominantGender(figure) === "female") {
+        figure.sharedAppearance = womanAppearance;
+      }
+    }
   }
 
   const groupFigure = figures.length >= 2 && figureHasDetail(contextFigure) ? contextFigure : undefined;
@@ -290,7 +325,11 @@ export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealProm
   const lead = stripTerminalPunctuation(sanitizePhotoText(input.style?.lead, sink.dropped));
   // The preset's default light and surroundings only fill what the cut left unsaid: a cut that names its own
   // lighting or place keeps it, instead of being told it is also in a cream-white room in soft daylight.
-  const lightingKnown = keptPhrases(setting.lighting).length > 0;
+  // A time of day that is not daylight sets the light too: a night street with no lighting tag of its own was still
+  // told "Soft diffused natural daylight".
+  const lightingKnown =
+    keptPhrases(setting.lighting).length > 0 ||
+    keptPhrases(setting.times).some((phrase) => /\b(?:night|midnight|evening|sunset|sunrise|dusk|dawn|twilight|golden hour|blue hour)\b/u.test(phrase));
   const placeKnown =
     keptPhrases(setting.places).length > 0 ||
     keptPhrases(setting.backgrounds).length > 0 ||
@@ -484,7 +523,9 @@ function expandWeightedTag(raw: string): WeightedPart[] {
   // counted the ones that mean something (stripPictographs).
   let body = stripPictographs(source);
   let weight: number | undefined;
-  const weighted = body.match(/^(-?\d+(?:\.\d+)?)\s*::/u);
+  // A leading "+" ("+2.5::") is how some creators write a positive weight; without it here the marker stayed glued
+  // to the tag and reached the photo prompt as text.
+  const weighted = body.match(/^([+-]?\d+(?:\.\d+)?)\s*::/u);
   if (weighted) {
     weight = Number(weighted[1]);
     body = body.slice(weighted[0].length);
@@ -909,10 +950,15 @@ const BODY_ARTICLE_PATTERN = /\b(?:build|figure|physique|face|body|frame|tattoo|
 const BODY_ADJECTIVE_PATTERN =
   /^(?:slim|slender|skinny|petite|curvy|plump|chubby|muscular|toned|athletic|tall|thin|fit|willowy|voluptuous|lean|stocky|lanky)$/u;
 
+// The place noun ends the tag, optionally followed by a qualifier: "cafe interior", "military base exterior" and
+// "station entrance" are places too. Without the qualifier they fell through to leftovers ("The scene includes cafe
+// interior"), and with no place on record the preset's default room was added on top of the cut's own. The military
+// and sci-fi nouns are there because stories set in them (a front-line outpost, a hangar) read as "no place" before.
 const PLACE_PATTERN =
-  /\b(?:bedroom|living room|kitchen|bathroom|dining room|classroom|library|office|cafe|café|coffee shop|restaurant|bar|izakaya|street|alley|alleyway|park|beach|forest|woods|rooftop|train interior|train|subway|bus interior|car interior|convenience store|store|shop|boutique|shopping mall|mall|hallway|corridor|staircase|elevator|gym|swimming pool|pool|school|campus|hospital|hotel room|hotel|fitting room|dressing room|changing room|studio|photo studio|balcony|garden|city|cityscape|town|village|countryside|field|meadow|mountains?|lake|riverside|seaside|ocean|harbor|pier|bridge|station|train station|platform|airport|apartment|room|house|home|shrine|temple|church|museum|aquarium|amusement park|stage|nightclub|club|karaoke|laundromat|bookstore|bakery|market|parking lot|crosswalk|sidewalk|road|highway|desert|courtyard|terrace|porch|veranda|attic|basement|closet|locker room|infirmary|cafeteria|workplace|lobby|lounge|onsen|hot spring|sauna|bathhouse)$/u;
+  /\b(?:bedroom|living room|kitchen|bathroom|dining room|classroom|library|office|cafe|café|coffee shop|restaurant|bar|izakaya|street|alley|alleyway|park|beach|forest|woods|rooftop|train interior|train|subway|bus interior|car interior|convenience store|store|shop|boutique|shopping mall|mall|hallway|corridor|staircase|elevator|gym|swimming pool|pool|school|campus|hospital|hotel room|hotel|fitting room|dressing room|changing room|studio|photo studio|balcony|garden|city|cityscape|town|village|countryside|field|meadow|mountains?|lake|riverside|seaside|ocean|harbor|pier|bridge|station|train station|platform|airport|apartment|room|house|home|shrine|temple|church|museum|aquarium|amusement park|stage|nightclub|club|karaoke|laundromat|bookstore|bakery|market|parking lot|crosswalk|sidewalk|road|highway|desert|courtyard|terrace|porch|veranda|attic|basement|closet|locker room|infirmary|cafeteria|workplace|lobby|lounge|onsen|hot spring|sauna|bathhouse|base|military base|outpost|headquarters|command center|control center|barracks|bunker|hangar|ruins|battlefield|trench|laboratory|lab|facility|cockpit|warehouse|factory|plaza|arcade|casino|penthouse|mansion|palace|castle|ballroom|spa|salon|dormitory|ward|wasteland|tunnel|dock|docks|shipyard|space station|spaceship|underground city|downtown)(?: (?:interior|exterior|area|zone|district|entrance|grounds|inside|outside))?$/u;
 /** Places one is ON rather than IN. */
-const PLACE_ON_PATTERN = /\b(?:street|rooftop|beach|train|subway|balcony|stage|bridge|road|sidewalk|crosswalk|highway|platform|pier|terrace|porch|veranda|campus)$/u;
+const PLACE_ON_PATTERN =
+  /\b(?:street|rooftop|beach|train|subway|balcony|stage|bridge|road|sidewalk|crosswalk|highway|platform|pier|terrace|porch|veranda|campus|battlefield)$/u;
 
 const TIME_PHRASES: Record<string, string> = {
   night: "at night",
@@ -1034,6 +1080,8 @@ interface FigureModel {
   appearanceSentences?: string[];
   /** Registered identity, filtered out of every tag source when the creator's appearance text replaces it. */
   identityKeys?: Set<string>;
+  /** The simulation's shared look for women (photoreal.appearancePrompt), sanitized; set on single women only. */
+  sharedAppearance?: string;
   referenceToken?: string;
   center?: { x: number; y: number };
   hair: HairParts;
@@ -1129,10 +1177,13 @@ function buildFigureModel(
   // list of features with no subject, so the whole appearance drops out and the registered identity tags describe
   // the person instead — which is also what a wholly Korean appearance does, as the builder screen tells the creator.
   const appearanceDropped: string[] = [];
-  const sanitizedAppearance = sanitizePhotoSentences(character.appearance, appearanceDropped);
-  const subjectDropped = appearanceDropped.includes(splitSceneSentences(character.appearance)[0]?.[0] ?? "");
+  // Emphasis syntax out first, here as in sanitizePhotoSentences, so the first-segment check below compares the
+  // same segments the sanitizer produced.
+  const appearanceText = stripEmphasisSyntax(character.appearance);
+  const sanitizedAppearance = sanitizePhotoSentences(appearanceText, appearanceDropped);
+  const subjectDropped = appearanceDropped.includes(splitSceneSentences(appearanceText)[0]?.[0] ?? "");
   const appearanceSentences = subjectDropped ? [] : sanitizedAppearance;
-  sink.dropped.push(...(subjectDropped ? splitSceneSentences(character.appearance).flat() : appearanceDropped));
+  sink.dropped.push(...(subjectDropped ? splitSceneSentences(appearanceText).flat() : appearanceDropped));
   if (appearanceSentences.length > 0) {
     figure.appearanceSentences = appearanceSentences;
     figure.appearance = appearanceSentences
@@ -1637,7 +1688,10 @@ function renderStandaloneFigure(figure: FigureModel): string {
   }
   const pronoun = dominantGender(figure);
   const [subject, be, have] = pronoun === "female" ? ["She", "is", "has"] : pronoun === "male" ? ["He", "is", "has"] : ["They", "are", "have"];
-  const first = figure.referenceToken ? `${renderReferencePhrase(figure)}, ${lowercaseLeadingArticle(sentences[0])}` : sentences[0];
+  const first = withSharedAppearance(
+    figure.referenceToken ? `${renderReferencePhrase(figure)}, ${lowercaseLeadingArticle(sentences[0])}` : sentences[0],
+    figure
+  );
   const parts = [first, ...sentences.slice(1)].map((sentence) => `${capitalizeFirst(sentence)}.`);
   const features = keptPhrases(figure.features);
   const groups = renderFigureGroups(figure, pronoun, false);
@@ -1682,12 +1736,19 @@ function renderReferencePhrase(figure: FigureModel): string {
 
 function renderSubjectPhrase(figure: FigureModel): string {
   if (figure.referenceToken) {
-    return `${renderReferencePhrase(figure)}${figure.appearance ? `, ${lowercaseLeadingArticle(figure.appearance)}` : ""}`;
+    return withSharedAppearance(`${renderReferencePhrase(figure)}${figure.appearance ? `, ${lowercaseLeadingArticle(figure.appearance)}` : ""}`, figure);
   }
   if (figure.appearance) {
-    return figure.appearance;
+    return withSharedAppearance(figure.appearance, figure);
   }
-  return describeSubjectCounts(figure.counts, figure.modifier) ?? singularAdultNoun(figure.gender ?? "other", figure.modifier);
+  return withSharedAppearance(
+    describeSubjectCounts(figure.counts, figure.modifier) ?? singularAdultNoun(figure.gender ?? "other", figure.modifier),
+    figure
+  );
+}
+
+function withSharedAppearance(subject: string, figure: FigureModel): string {
+  return figure.sharedAppearance ? `${subject}, ${lowercaseLeadingArticle(figure.sharedAppearance)}` : subject;
 }
 
 function describeSubjectCounts(counts: SubjectCounts, modifier?: string): string | undefined {
@@ -2072,7 +2133,7 @@ function splitLeadSentence(text: string): { lead: string; tail: string } {
  */
 function sanitizePhotoSentences(text: string | undefined, dropped: string[]): string[] {
   const sentences: string[] = [];
-  for (const segments of splitSceneSentences(text)) {
+  for (const segments of splitSceneSentences(stripEmphasisSyntax(text))) {
     const kept: string[] = [];
     for (const written of segments) {
       const segment = stripPictographs(written);
@@ -2096,6 +2157,24 @@ function sanitizePhotoSentences(text: string | undefined, dropped: string[]): st
     }
   }
   return sentences;
+}
+
+/**
+ * NovelAI-style emphasis in free text, as the words a photo encoder can use: "+2.5:: beautiful Korean woman, soft
+ * makeup ::", "1.3::smile::", "{glossy lips}", "(freckles:1.2)". Creators write their photo appearance the way they
+ * write NovelAI tags; the photo encoders take no weights, and the markers reached the sampler as a literal "+2.5::".
+ * A group weighted zero or below means "less of this" and goes. The safety floor reads the text before this runs.
+ */
+export function stripEmphasisSyntax(text: string | undefined): string {
+  if (!text) {
+    return "";
+  }
+  return text
+    .replace(/([+-]?\d+(?:\.\d+)?)\s*::([\s\S]*?)::/gu, (_match, weight: string, body: string) => (Number(weight) > 0 ? body : ""))
+    .replace(/[+-]?\d+(?:\.\d+)?\s*::/gu, "")
+    .replace(/::/gu, "")
+    .replace(/\(([^()]*?):\s*[+-]?\d+(?:\.\d+)?\)/gu, "$1")
+    .replace(/[{}[\]]/gu, "");
 }
 
 /** sanitizePhotoSentences as one line, for the style's lead, tail and ambient defaults. */

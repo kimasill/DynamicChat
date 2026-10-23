@@ -116,9 +116,24 @@ NAI 정체성 태그 대신 그 문장이 쓰인다.
 가리는 구도가 많아서, 명시하지 않으면 스토리 컷에서도 얼굴이 잘렸다. 한 태그에 동작 전체를 쓴 경우("trembling
 hands reaching toward a brown leather handle")는 소재 단어가 있어도 옷이 아니라 동작 절로 둔다.
 
-스타일 프리셋의 기본값 `daily_look` 은 사용자의 핀터레스트 저장 핀(샤오홍슈·핀터레스트 데일리룩: 스마트폰
+스타일 프리셋 `daily_look` 은 사용자의 핀터레스트 저장 핀(샤오홍슈·핀터레스트 데일리룩: 스마트폰
 일상 사진, 부드러운 자연광, 크림·화이트 실내, 낮은 대비의 파스텔 보정)에서 왔다. 프리셋의 조명·공간은
 **기본값일 뿐** 컷이 말하지 않을 때만 들어간다 — 처음엔 항상 "창가 낮빛"을 붙여서 네온 밤거리 컷과 충돌했다.
+
+새 시뮬레이션의 기본값은 `instagram`(인스타 · 핀터레스트 인물)이다. `daily_look` 의 폰 노이즈·들뜬 암부·저대비가
+실제로는 "화질이 낮고 핀터레스트 같지 않다" 로 읽혔다. 같은 시드·같은 컷(Qwen-Image 2.1 Turbo, 832x1248)에서
+`instagram` + 공통 외모는 메이크업·피부 광·대비가 살아난 인플루언서 사진이 됐고, 1056x1584 로 올리면 머리카락·니트 결이
+더 살아난다(12GB 기준 18s → 26.5s).
+
+**여성 인물 공통 외모**(`photoreal.appearancePrompt`)는 실사 전용 시뮬레이션 설정이다. 모든 여성 인물의 주어 바로
+뒤("An adult woman, beautiful realistic Korean woman, soft korean makeup, … with long black hair, …")에 붙고, 캐릭터의
+`photorealPrompt` 가 있으면 그 뒤에 붙는다. 남성·복수 주어("two adult women")에는 붙지 않는다. 하한이 스타일과 함께
+읽고(`describePhotorealStyleForScreening`), 다른 자유 텍스트처럼 미성년·학생 코드 조각은 빠진다. NovelAI 식 강조
+(`+2.5:: … ::`, `{…}`, `(…:1.2)`)는 `stripEmphasisSyntax` 가 단어만 남긴다.
+
+배경: 장소 단어 뒤의 interior/exterior/area/zone/district/entrance 를 인정하고(`cafe interior`), 군사·SF 장소(base,
+outpost, hangar, bunker, command center …)를 장소로 읽는다. 밤·저녁·노을 같은 시간이 있으면 기본 조명을 붙이지 않는다.
+프롬프트 상한은 2400자다 — 사용자 외형과 공통 외모는 잘리지 않으므로, 1600자에서는 배경이 그 값을 치렀다.
 
 ## 얼굴 고정 (프로필 이미지 = 레퍼런스)
 
@@ -126,7 +141,9 @@ hands reaching toward a brown leather handle")는 소재 단어가 있어도 옷
 `CharacterVisualProfile.profileImages[backend]` 에 저장된다(바이트는 객체 저장소, 상태에는 키만).
 
 - **실사**: Qwen-Image 2.1 은 생성과 다중 레퍼런스 편집을 한 모델로 한다. 프롬프트에서 `<image1>` 로 부르고,
-  끝에 "레퍼런스는 정체성만, 배경·의상·포즈·조명은 이 설명에서" 문장을 붙인다.
+  끝에 "레퍼런스는 얼굴·이목구비만, 머리 모양·메이크업·배경·의상·포즈·조명은 이 설명에서" 문장을 붙인다.
+- **얼굴 고정은 기본 꺼짐이다.** 프로필을 고르는 것만으로 레퍼런스가 되고 머리 모양까지 붙잡던 때는 모든 컷이
+  그 한 장의 사진을 따라가서 "외형이 프로필에 고정된다" 가 됐다. 켜면 얼굴만 잇는다(실행 화면 설정 → 실사 탭 스위치).
 - **레퍼런스는 머리·어깨로 잘라서 넣는다** (`computeReferenceHeadCrop`, ComfyUI `ImageCrop`). 실측: 프로필
   전체를 넣으면 일부 시드에서 모델이 레퍼런스를 **편집 대상**으로 취급해 프로필의 방과 옷을 그대로 다시 그렸다
   (출력 캔버스가 레퍼런스 크기와 같을 때 가장 심했다). 머리 크롭으로 바꾸자 실패하던 시드 포함 9/9 가 새 장면·
@@ -160,6 +177,23 @@ hands reaching toward a brown leather handle")는 소재 단어가 있어도 옷
 
 ComfyUI 는 브라우저의 교차 출처 요청을 거부하므로(Origin/Host 검사) 서버 릴레이를 쓴다. `--enable-cors-header`
 를 켜라고 안내하지 않는다 — ComfyUI 의 유일한 CSRF 방어를 끄는 것이다.
+
+### 자동 시작 (`server/local-services.mjs`)
+
+API 서버(`pnpm api` / `pnpm dev`)가 시작될 때 ComfyUI 와 Ollama 를 자동으로 발견하고 시작한다. 환경변수
+없이도 동작한다.
+
+- **발견 순서**: `DYNAMICCHAT_COMFYUI_DIR` → `<dataDir>/local-services.json` (이전 탐색 결과 기억) →
+  C–Z 드라이브 + 홈 디렉토리 얕은 스캔. 발견한 경로는 `local-services.json` 에 저장해 다음 실행부터
+  스캔을 건너뛴다.
+- **이미 실행 중인 프로세스는 그대로 쓴다.** 직접 띄운 프로세스만 서버 종료 시 같이 내린다.
+- **ComfyUI 설치 형식**: portable (`python_embeded/python.exe` + `ComfyUI/main.py`) 또는
+  git 클론 (`venv/Scripts/python.exe` + `main.py`) 둘 다 자동 감지.
+- **릴레이 대기**: `/photoreal/comfyui/generate` 는 시작 중인 ComfyUI 를 최대 90초 기다린다.
+  `/photoreal/comfyui/status` 는 15초 기다리거나, 설치 자체가 없으면 즉시 설치 안내를 반환한다.
+- **로그**: `<dataDir>/logs/comfyui.log`
+- **자동 시작 비활성화**: `DYNAMICCHAT_START_COMFYUI=0`, `DYNAMICCHAT_START_OLLAMA=0`
+- **상태 API**: `GET /local-services/status` (로컬 전용), `POST /local-services/comfyui/start` (수동 시작)
 
 | 프리셋 | 파일 (models/…) | 라이선스 | 비고 |
 |---|---|---|---|

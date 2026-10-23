@@ -12,10 +12,17 @@ import type { SceneClassification } from "./imageSceneClassifier";
 // Per-cut backend routing: which renderer draws a cut, given its scene category and the simulation's routing
 // mode.
 //
-// The safety floor lives here and nowhere else, so every caller inherits it: explicit cuts, minor-coded cuts,
-// school-coded cuts with suggestive content and cuts carrying text the classifier cannot read are planned on
-// NovelAI in every mode, including a manual regeneration that names the photoreal backend. When NovelAI is off such a cut stays on NovelAI and is
-// setup-blocked like any other NovelAI cut; it is never promoted to photoreal to "make it work".
+// What renders photoreal is the user's setting, not the program's: every category — sexual scenes and nudity, dynamic
+// action, hips-visible and full-body cuts — goes where the routing mode and the ticked categories send it. This is a
+// local app whose owner sets the content rating, and an adult scene drawn as a photograph is theirs to choose.
+//
+// One line is not a setting: a sexual or suggestive cut whose subject reads as a minor — minor-coded, school-coded
+// (a student, a school uniform), or carrying text the classifier cannot read, so its age cannot be checked — is never
+// rendered photoreal (photorealFloorLock). It lives here and nowhere else, so every caller inherits it: the planner,
+// a manual regeneration that names the photoreal backend, the finished-prompt, custom-workflow, built-graph and
+// face-reference screens, the profile studio and the dispatch. When NovelAI is off such a cut stays on NovelAI and is
+// setup-blocked like any other NovelAI cut; it is never promoted to photoreal to "make it work". Either half alone
+// follows the routing: a child at a family dinner, or an adult in a sex scene.
 //
 // Deliberately free of runtime imports from imageOrchestrator.ts: the orchestrator imports this module, and the
 // reverse edge would make a cycle that vite's SSR loader (used by every eval) resolves to undefined.
@@ -29,10 +36,21 @@ export const DEFAULT_PHOTOREAL_CATEGORIES: ImageSceneCategory[] = Object.freeze(
   "object"
 ] as ImageSceneCategory[]) as ImageSceneCategory[];
 
+/**
+ * The one line photoreal never crosses, in the settings screen's words. Not a category and not a setting: it applies
+ * in every mode and to every category (photorealFloorLock).
+ */
+export const PHOTOREAL_FLOOR_DESCRIPTION =
+  "미성년으로 읽히는 인물(학생·교복 포함)이 성적·노출 장면에 있으면 실사로 생성하지 않습니다 (NovelAI)";
+
 export const IMAGE_SCENE_CATEGORY_OPTIONS: Array<{
   id: ImageSceneCategory;
   label: string;
   description: string;
+  /**
+   * A row the user cannot tick. No category is locked: every one is the user's choice. Kept optional so a screen that
+   * still reads it keeps compiling and simply shows every row as selectable.
+   */
   locked?: boolean;
 }> = [
   {
@@ -68,7 +86,8 @@ export const IMAGE_SCENE_CATEGORY_OPTIONS: Array<{
   {
     id: "action",
     label: "액션 · 역동적 동작",
-    description: "싸움 · 달리기 · 점프 · 추락 · 스포츠처럼 움직임이 큰 컷"
+    description:
+      "싸움 · 달리기 · 점프 · 추락 · 스포츠처럼 움직임이 큰 컷. 실사 모델은 역동적인 동작에 약해 팔다리·자세가 무너지기 쉬워 기본으로는 NovelAI가 그립니다. 실사로 보고 싶으면 체크하세요."
   },
   {
     id: "fantasy",
@@ -77,9 +96,9 @@ export const IMAGE_SCENE_CATEGORY_OPTIONS: Array<{
   },
   {
     id: "explicit",
-    label: "성적 장면 — 항상 NovelAI",
-    description: "노출이나 성적 묘사가 있는 컷. 안전 정책상 어떤 모드에서도 실사로 생성하지 않습니다.",
-    locked: true
+    label: "성적 장면 · 노출",
+    description:
+      "성인 캐릭터의 노출이나 성적 묘사가 있는 컷 (목욕·온천처럼 노출이 암시된 컷과 노출 목적 의상 포함). 체크하면 실사로 그립니다. 미성년으로 읽히는 인물(학생·교복 포함)이 있는 컷은 체크와 상관없이 NovelAI로 그립니다."
   }
 ];
 
@@ -104,9 +123,9 @@ const PHOTOREAL_SETUP_BLOCK = "실사 이미지(ComfyUI) 연동이 꺼져 있습
 
 /**
  * The profile's routing, made safe to act on. A simulation saved before photoreal existed has none and keeps
- * its old behaviour (`novelai`). Unknown categories are dropped, `explicit` is stripped (it can never be
- * photoreal, so a stored tick on it would only mislead the settings screen), and the order is canonical.
- * An explicitly empty category list is kept: unticking everything is a legitimate choice.
+ * its old behaviour (`novelai`). Unknown categories are dropped and the order is canonical; every known category is
+ * kept, `explicit` included — it is the user's choice like the rest. An explicitly empty category list is kept:
+ * unticking everything is a legitimate choice.
  */
 export function resolveImageBackendRouting(
   profile: Pick<ImageGenerationProfile, "backendRouting"> | null | undefined
@@ -135,8 +154,8 @@ export function isNovelAiBackendConfigured(state: AppState): boolean {
 /**
  * Routes one classified cut.
  *
- * 1. Safety floor: explicit, minor-coded, school-coded + suggestive, or unverifiable text → NovelAI, `locked`.
- *    Beats the forced backend, the mode and availability.
+ * 1. The floor (photorealFloorLock): a sexual or suggestive cut whose subject reads as a minor, or whose age cannot
+ *    be read → NovelAI, `locked`. Beats the forced backend, the mode and availability. Nothing else is locked.
  * 2. Preference: the forced backend (manual "regenerate with the other backend"), else the mode.
  * 3. Availability: a preference for a backend that is off falls back to the other one when that one is on.
  *    Not for a forced backend (the user asked for that renderer; a setup block says why it is waiting), and
@@ -155,7 +174,7 @@ export function decideImageBackend(
   const photorealOn = isPhotorealBackendConfigured(state);
   const novelAiOn = isNovelAiBackendConfigured(state);
 
-  const lockReason = describeSafetyLock(classification);
+  const lockReason = photorealFloorLock(classification);
   if (lockReason) {
     const notes = [
       forcedBackend === "photoreal" ? "실사로 직접 지정해도 바뀌지 않습니다" : undefined,
@@ -213,22 +232,69 @@ export function describeImageBackendSetupBlock(state: AppState, backend: ImageBa
   return isNovelAiBackendConfigured(state) ? undefined : NOVELAI_SETUP_BLOCK;
 }
 
-function describeSafetyLock(classification: SceneClassification): string | undefined {
-  if (classification.category === "explicit") {
-    return "성적 장면은 실사로 생성하지 않습니다 (NovelAI 고정)";
+/** What the floor reads of a classification: what the picture shows, and who it shows. */
+export type PhotorealFloorReading = Pick<SceneClassification, "category" | "suggestive" | "minorCoded" | "schoolCoded" | "unverifiable">;
+
+/**
+ * Why a cut may never render photoreal, or undefined when the user's routing decides. The floor is a conjunction:
+ * - the picture is sexual or suggestive — an `explicit` cut, or suggestive wardrobe and framing (lingerie, a bikini,
+ *   an upskirt);
+ * - and its subject reads as a minor (minorCoded), as a pupil (schoolCoded: a student, a school uniform written out or
+ *   as its parts), or cannot be read at all (unverifiable: kana, Cyrillic, CJK — the photo encoders read them, no
+ *   lexicon here can, so nothing can say the subject is an adult).
+ * Each half alone is the user's to route: an adult in a sex scene renders photoreal if the routing says so, and so
+ * does a child at a family dinner (the photo builder still words every subject as an adult). The flags are read as
+ * `=== true`, so a classification built before a flag existed reads it as absent.
+ */
+export function photorealFloorLock(reading: PhotorealFloorReading): string | undefined {
+  const sexual = reading.category === "explicit" || reading.suggestive === true;
+  if (!sexual) {
+    return undefined;
   }
-  if (classification.minorCoded) {
-    return "미성년자로 보일 수 있는 장면은 실사로 생성하지 않습니다 (NovelAI 고정)";
+  if (reading.minorCoded === true) {
+    return "미성년으로 읽히는 인물이 성적·노출 장면에 있어 실사로 생성하지 않습니다 (NovelAI 고정)";
   }
-  if (classification.schoolCoded && classification.suggestive) {
-    return "학생 · 교복 요소와 노출 요소가 함께 있는 장면은 실사로 생성하지 않습니다 (NovelAI 고정)";
+  if (reading.schoolCoded === true) {
+    return "학생 · 교복 요소가 성적·노출 장면에 있어 실사로 생성하지 않습니다 (NovelAI 고정)";
   }
-  // Kana, Cyrillic, CJK and the like cannot be checked by any lexicon, while the photo encoders read them. Read as
-  // `=== true` so a classification built before the flag existed still routes as it did.
-  if (classification.unverifiable === true) {
-    return "확인할 수 없는 문자(영문 외 문자)가 있는 장면은 실사로 생성하지 않습니다 (NovelAI 고정)";
+  if (reading.unverifiable === true) {
+    // Also reached by text that goes to the encoder as written (readVerbatimFloorText): there the scene itself is
+    // unknown, so the reason names what is unknown rather than claiming the cut is sexual.
+    return "확인할 수 없는 문자(영문 외 문자)가 있어 장면과 인물의 나이를 확인할 수 없으므로 실사로 생성하지 않습니다 — 그 글(사용자 워크플로 문구 등)을 영어로 바꾸면 실사로 생성됩니다 (NovelAI 고정)";
   }
   return undefined;
+}
+
+/**
+ * The reading of text that reaches the photo encoder AS WRITTEN — a finished photo prompt, a custom workflow's own
+ * literals, a built graph's strings. Everything the builder writes has had what it cannot read dropped, which is why
+ * unreadable text alone does not lock a cut. Nothing drops it from these, and text no lexicon can read cannot be shown
+ * to be anything but sexual: the encoders read "裸の少女" as a naked girl. So here it counts as sexual as well as
+ * age-unknown, and trips the floor on its own.
+ */
+export function readVerbatimFloorText<T extends PhotorealFloorReading>(reading: T): T {
+  return reading.unverifiable === true ? { ...reading, suggestive: true } : reading;
+}
+
+/**
+ * Two readings of what ends up in ONE picture, as one: a text the photo model receives and the cut it is rendered
+ * with, a face reference's record and the cut it is attached to. The floor's halves can sit in different texts — a
+ * custom workflow that says "a 14-year-old girl" around a cut that is a sex scene, a profile image drawn from a
+ * minor-coded prompt attached to a suggestive cut — and neither text alone trips it. The result keeps the first
+ * reading's other fields; the category is explicit when either is.
+ */
+export function joinFloorReadings<T extends PhotorealFloorReading>(reading: T, other: PhotorealFloorReading | undefined): T {
+  if (!other) {
+    return reading;
+  }
+  return {
+    ...reading,
+    category: other.category === "explicit" ? "explicit" : reading.category,
+    suggestive: reading.suggestive === true || other.suggestive === true || other.category === "explicit",
+    minorCoded: reading.minorCoded === true || other.minorCoded === true,
+    schoolCoded: reading.schoolCoded === true || other.schoolCoded === true,
+    unverifiable: reading.unverifiable === true || other.unverifiable === true
+  };
 }
 
 function describeImageSceneCategory(category: ImageSceneCategory): string {
@@ -237,7 +303,6 @@ function describeImageSceneCategory(category: ImageSceneCategory): string {
 
 function sanitizePhotorealCategories(values: unknown[]): ImageSceneCategory[] {
   const wanted = new Set(values.map(readCategoryId).filter((value): value is ImageSceneCategory => Boolean(value)));
-  wanted.delete("explicit");
   return CATEGORY_ORDER.filter((category) => wanted.has(category));
 }
 

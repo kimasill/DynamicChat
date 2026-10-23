@@ -9,18 +9,20 @@ import { inferImageCueFrameFromTags, isGarmentTag } from "./imageFrame";
 // wrote as a plain face close-up, and fantasy traits (animal ears, horns) usually live in the saved identity
 // rather than in the cut.
 //
-// Part of the output is a safety floor rather than a preference: explicit content, minor-coded subjects and
-// school-coded subjects in a suggestive cut never render photoreal (imageBackendRouting.ts enforces it). The
-// lexicons therefore lean toward false positives. A cut wrongly kept on NovelAI costs a style mismatch; a cut
-// wrongly sent to a photo model cannot be taken back.
+// The category is a preference the user routes — explicit included: an adult sex scene renders photoreal when the
+// routing says so. Part of the output feeds a floor instead: a sexual or suggestive cut whose subject is minor-coded,
+// school-coded or written in text no lexicon here can read never renders photoreal (imageBackendRouting.ts enforces
+// it). The floor lexicons (explicit, suggestive, minor, school) therefore lean toward false positives. A cut wrongly
+// kept on NovelAI costs a style mismatch; a minor wrongly sent to a photo model in a sexual picture cannot be taken
+// back.
 //
 // Everything is matched on CANONICAL text (canonicalizeSceneText): NFKC, invisible code points and every combining
 // mark removed, accents and the Latin letters without a decomposition folded, letter-like symbols read as letters —
 // and, for matching only, hyphens read as spaces. A photo encoder reads "ｎｕｄｅ", "nu​de", "🅽🅰🅺🅴🅳" and
 // "school-uniform" as the plain words; lexicons that only knew the plain spelling could be walked past without
 // trying. Letters still outside a–z after that (kana, Cyrillic look-alikes, Greek, CJK, Hangul, IPA small capitals)
-// cannot be checked by any lexicon here, so they are reported as unverifiable, which locks the cut like the other
-// floor flags.
+// cannot be checked by any lexicon here, so they are reported as unverifiable, which the floor treats like a
+// minor-coded subject: nothing can say the person is an adult.
 //
 // The floor lexicons also read each term a second way (readFloorVariants): leetspeak and punctuation inside a
 // word folded away, a symbol read as the letter it looks like or as a masked letter, masked letters filled in, a word
@@ -42,10 +44,11 @@ export interface SceneClassificationInput {
   contextTags: string[];
   /**
    * Free text the photo prompt carries besides the cut itself: the photoreal style's lead, tail and ambient
-   * defaults, or a whole finished photo prompt. Prose or comma lists. Read by the safety floor only (explicit,
-   * minor-coded, school + suggestive, unverifiable script) and never for the category: style vocabulary ("a
-   * smartphone photograph", "phone-camera grain", "a minimal room") is the same in every cut, and read as tags it
-   * turned an empty street into an object shot.
+   * defaults, or a whole finished photo prompt. Prose or comma lists. Read for the floor flags (minor-coded,
+   * school-coded, suggestive, unverifiable script) and for explicit content — a style that says "a nude boudoir
+   * photograph" makes every cut it is laid over an explicit one — but never for the other categories: style
+   * vocabulary ("a smartphone photograph", "phone-camera grain", "a minimal room") is the same in every cut, and read
+   * as tags it turned an empty street into an object shot.
    */
   safetyTexts?: string[];
   /** The cut's crop, when known. */
@@ -64,8 +67,9 @@ export interface SceneClassification {
   suggestive: boolean;
   /**
    * Some text in the cut has letters no lexicon here can read, even after canonicalisation (kana, Cyrillic, Greek,
-   * CJK, Hangul, IPA). Nothing can check what it says, so the router locks the cut like the other floor flags.
-   * Reported as `unverifiable-script:<word>` signals.
+   * CJK, Hangul, IPA). Nothing can check what it says — nor that its subject is an adult — so the router locks a
+   * sexual or suggestive cut that carries it, as it would a minor-coded one. Reported as `unverifiable-script:<word>`
+   * signals.
    */
   unverifiable: boolean;
   /** max(figure count, subject-count tags, registered character count). */
@@ -104,8 +108,9 @@ function wordAlternation(fragments: readonly string[]): RegExp {
  * them as explicit locked every single cut of a simulation whose cast carries one, clothed cafe portraits included
  * (measured on the shipped adult seed: 16/16 cuts of a real turn pinned to NovelAI). What a cut SHOWS is decided by
  * the explicit lexicon below — nudity, genitals, acts — which still catches any cut where the trait would be
- * visible. The trait itself never reaches a photo prompt (photorealPrompt drops it), so a photo can only render
- * the clothed person the rest of the caption describes.
+ * visible. A photo prompt carries the trait only in a cut routed as explicit, where it is part of the scene the user
+ * chose to render (photorealPrompt drops it from every other cut, which then shows the clothed person the rest of the
+ * caption describes).
  */
 export const IDENTITY_ANATOMY_TRAIT_PATTERN = /\b(?:futanari|futa|dickgirl|newhalf|intersex|hermaphrodite)\b/u;
 
@@ -336,7 +341,8 @@ const EXPLICIT_RULES: TermRule[] = [
 // showering" as exactly that. Only activities, not places: an empty onsen is scenery, and "a hot spring in Hakone"
 // names the place. Being IN the water is the activity, whatever the determiner or adjective in between ("soaking in
 // a bathtub", "relaxing in her bath", "in an outdoor onsen") — the rule once knew only "in the bath" and missed the
-// rest. "A weekend in Bath" locks too; that costs a NovelAI render.
+// rest. "A weekend in Bath" reads as explicit too; under a routing that keeps explicit cuts on NovelAI that costs a
+// NovelAI render.
 const BATHING_PLACE = String.raw`(?:bath ?tubs?|tubs?(?! (?:of|chairs?)\b)|baths?(?! (?:towels?|mats?|robes?|bombs?|salts?|toys?|products?|time|tiles?|sheets?|caddy|caddies|pillows?|brushes|museums?|ruins|site|complex|exhibits?)\b)|bubble ?baths?|(?<!(?:rain|light|april|spring|summer|scattered|heavy|passing|meteor|baby|bridal|wedding) )showers?(?! (?:curtains?|caps?|heads?|gel|rooms?|stalls?|doors?|screens?|tiles?|caddy|caddies|rails?|trays?|of)\b)|hot ?springs?|onsens?|rotenburo|saunas?|jacuzzis?|hot ?tubs?|whirlpools?|steam ?rooms?|bath ?houses?|sentos?|thermal (?:baths?|pools?|springs?)|spa (?:pools?|baths?))`;
 const IMPLIED_NUDITY_RULE: TermRule = {
   pattern: new RegExp(
@@ -394,8 +400,8 @@ const AMBIGUOUS_POSTURE_RULE: TermRule = {
     /^(?:lying )?on (?:her |his |their )?(?:back|stomach)$|^(?:cowgirl|afterglow)$|\blying on (?:her|his|their) (?:back|stomach)\b|\b(?:on all fours|all fours|spread legs|legs spread|spread thighs|legs apart|bent over|bending over|legs up|legs held open|lap pillow|spooning|straddling|girl on top|boy on top|lap sitting|sitting on (?:another's |someone's )?lap|grinding|leg lock|full nelson|piledriver|thrusting|kneeling over|top down bottom up|jack o'? challenge)\b|(?<!horseback )\briding\b(?! (?:a |the |her |his )?(?:horses?|pony|ponies|bicycles?|bikes?|motorcycles?|motorbikes?|scooters?|trains?|bus|buses|cars?|vehicles?|skateboards?|surfboards?|waves?|elevators?|escalators?|brooms?|jet ?skis?|waverunners?|camels?|elephants?|roller ?coasters?|ferris wheels?|subway|trams?|ski lifts?|chairlifts?|boats?|ferr(?:y|ies)))/u
 };
 
-// Wardrobe and framing that sexualise a cut without being explicit. Adults may render photoreal with these;
-// combined with a school-coded subject or an ambiguous posture they may not.
+// Wardrobe and framing that sexualise a cut without being explicit. With an ambiguous posture they make the cut
+// explicit; with a minor- or school-coded subject they trip the floor. On an adult they are an ordinary cut.
 const SUGGESTIVE_RULE: TermRule = {
   pattern: wordAlternation([
     String.raw`lingerie|underwear|bras?|brassiere|bralettes?|panties|panty|pantsu|thong|g ?strings?|cleavage(?: cutout)?|swim ?suits?|swim ?wear|bathing suits?|bikinis?`,
@@ -414,35 +420,70 @@ const SUGGESTIVE_RULE: TermRule = {
 
 /**
  * Garments that cover the body, as the HEAD noun of a term ("white shirt", not "shirt collar"). A negative NovelAI
- * weight on one of them (`-2::clothing::`, `-1::apparel::`, `-1::shirt, skirt::`) is NovelAI's undressing idiom;
- * the classifier reads it as undressed, and the photo builder never turns one into a photo negative, which would
- * steer a photo model the same way. Accessories (hat, glasses, shoes, a jacket over a shirt) are not on the list:
- * "-1::hat::" only means no hat.
+ * weight on one of them (`-2::clothing::`, `-1::apparel::`, `-1::shirt, skirt::`) is NovelAI's undressing idiom, so
+ * the classifier reads it as undressed: the cut is explicit, and routed like any explicit cut. Accessories (hat,
+ * glasses, shoes, a jacket over a shirt) are not on the list: "-1::hat::" only means no hat.
  */
 const COVERING_GARMENT_PATTERN =
   /\b(?:clothes|clothing|clothed|outfits?|attire|apparel|wardrobe|garments?|fabric|cloth|textiles?|dressed|shirts?|t shirts?|tops?|blouses?|sweaters?|hoodies?|skirts?|pants|trousers|jeans|shorts|dress(?:es)?|sundress(?:es)?|gowns?|uniforms?|kimonos?|yukatas?|robes?|bathrobes?|pajamas|pyjamas|jumpsuits?|bras?|panties|underwear|lingerie|swim ?suits?|swimwear|bikinis?|bodysuits?|leotards?)$/u;
 
 /**
  * Words that keep a picture covered, censored or safe. Weighted down on NovelAI (`-1::sfw::`, `-2::censored::`) they
- * ask for the opposite; as a photo negative they steer the sampler there at any CFG above 1.
+ * ask for the opposite, so the classifier reads the cut as uncensored.
  */
 const SAFEGUARD_WORD_PATTERN =
   /\b(?:sfw|safe for work|family friendly|censor(?:ed|ing|ship)?|mosaic(?: censoring)?|bar censor|modest(?:y|ly)?|decent|decency|covered|covering|coverage|cover up|fully clothed|conservative (?:clothing|outfit|dress)|pg(?: 13)?|rating:?\s*(?:safe|general))\b/u;
 
 /**
  * Words that make a figure an adult. Weighted down on NovelAI (`-1::adult::`, `-1::mature female::`) they are its
- * age-down idiom; as a photo negative they steer the sampler toward a younger subject.
+ * age-down idiom; as a photo negative they steer the sampler toward a younger subject
+ * (isPhotoNegativeYouthSteeringTerm).
  */
 const ADULTHOOD_WORD_PATTERN =
-  /\b(?:adults?|adult (?:woman|man|female|male|body|face|figure|proportions)|mature(?: (?:female|male|woman|man|body|face|figure|lady))?|grown(?: up| woman| man)?|grownup|old(?:er)?(?: (?:woman|man|lady|person|people|face|skin))?|aged|ageing|aging|elderly|middle aged|milf|wom[ae]n|lad(?:y|ies)|gentlem[ae]n|mothers?|wi(?:fe|ves)|wrinkles?|wrinkled(?: skin)?|crow's feet)\b/u;
+  /\b(?:adults?|adulthood|adult (?:woman|man|female|male|body|face|figure|proportions)|mature(?: (?:female|male|woman|man|body|face|figure|lady))?|grown(?: up| woman| man)?|grownup|old(?:er)?(?: (?:woman|man|lady|person|people|face|skin))?|aged|ageing|aging|elderly|middle aged|milf|wom[ae]n|womanhood|manhood|maturity|lad(?:y|ies)|gentlem[ae]n|mothers?|moms?|mums?|wi(?:fe|ves)|housewi(?:fe|ves)|matrons?|cougars?|office lad(?:y|ies)|businesswom[ae]n|wrinkles?|wrinkled(?: skin)?|crow's feet)\b/u;
 
 /** Body words that read as an adult build; a photo negative of them steers toward a child's. Not a lock on their own. */
 const ADULT_BUILD_WORD_PATTERN =
-  /\b(?:tall|curvy|busty|voluptuous|thick thighs|wide hips|hourglass(?: figure)?|full figured?|(?:large|big|huge|giant|gigantic|medium|full|ample) (?:breasts|boobs|bust|chest)|broad shoulders)\b/u;
+  /\b(?:tall|curvy|busty|buxom|thicc|thick|plus size|voluptuous|thick thighs|wide hips|hourglass(?: figure)?|full figured?|(?:large|big|huge|giant|gigantic|medium|full|ample) (?:breasts|boobs|bust|chest)|broad shoulders)\b/u;
 
-/** Anything worn on the body or wrapped around it. A photo negative of any of them undresses whoever is in frame. */
-const WORN_CLOTHING_PATTERN =
-  /\b(?:clothes|clothing|clothed|outfits?|attire|apparel|garments?|wardrobe|fabric|cloth|textiles?|costumes?|uniforms?|shirts?|t shirts?|tops?|blouses?|sweaters?|sweatshirts?|hoodies?|cardigans?|jackets?|coats?|blazers?|vests?|tunics?|camisoles?|corsets?|skirts?|pants|trousers|jeans|shorts|leggings|tights|stockings|pantyhose|thigh ?highs?|socks|dress(?:es)?|sundress(?:es)?|gowns?|nightdress(?:es)?|nightgowns?|nightwear|sleepwear|pajamas|pyjamas|robes?|bathrobes?|kimonos?|yukatas?|hanbok|jumpsuits?|overalls|aprons?|bras?|panties|underwear|lingerie|swim ?suits?|swimwear|bikinis?|bodysuits?|leotards?|towels?|blankets?|bed ?sheets?|sheets?|shawls?|wraps?)\b/u;
+/**
+ * The body an adult has and a child does not, in the languages the floor reads (accents folded). A photo negative of
+ * any of them — "breasts", "curves", "hips", "pubic hair", "fully developed" — asks for the body without it.
+ */
+const ADULT_BODY_WORD_PATTERN = wordAlternation([
+  String.raw`breasts?|boobs?|boobies|tits|titties|bust|busts|bosoms?|cleavage|curves|hips|(?:pubic|body|armpit|underarm|leg|chest) hair|pubes|bush`,
+  String.raw`(?:fully |physically |sexually )?(?:developed|matured?)(?: (?:body|figure|chest|breasts?|bust|hips))?|post ?pub(?:erty|escen(?:t|ce))|after puberty|womanly(?: (?:body|figure|curves|shape))?|feminine (?:curves|figure)`,
+  String.raw`pechos?|senos?|tetas|caderas|curvas|seins|poitrine|hanches|courbes|brust|bruste|busen|hufte|huften|kurven|seno|seni|tette|fianchi|borsten|heupen|rondingen|piersi|biodra|prsa|boky|gogus\w*|memeler|kalca|brost|bryst|bryster|hofter|rinnat|lantiot|sani|solduri|mellek|csipo|grudi|bokovi|payudara|pinggul|dibdib|balakang|oppai|kyonyuu?|naizi|rufang|xiongbu|gaseum`
+]);
+
+/**
+ * Words that make a figure an adult in the other languages the floor reads, accents folded as canonical text has them
+ * ("mujer", "Frau", "adulte", "erwachsen", "dorosła"). The English ones are ADULTHOOD_WORD_PATTERN.
+ */
+const FOREIGN_ADULTHOOD_WORD_PATTERN = wordAlternation([
+  String.raw`adult[aeos]?|adultas|adultes|adulti|mujer(?:es)?|senora|senoras|madur[ao]s?|mayor(?:es)? de edad|mulher(?:es)?|senhora|maior(?:es)? de idade`,
+  String.raw`femmes?|dame|mure|majeure?s?|erwachsen\w*|frau|frauen|reif|reife|reifen|volljahrig\w*|donna|donne|matur[aeio]|maggiorenni?|signora`,
+  String.raw`volwassen\w*|vrouw|vrouwen|rijpe?|meerderjarig\w*|dorosl[aeiy]|kobiet[aey]|dojrzal[aey]|pelnoletni\w*|dospel[aeiy]|zen[ay]|zral[aey]|plnolet\w*`,
+  String.raw`yetiskin\w*|kadin\w*|olgun|resit|vuxna?|voksne?|kvinn(?:a|or|e|er)|kvind(?:e|er)|mogna?|moden|modne|myndig|aikuinen|aikuis\w*|nainen|naiset|kypsa`,
+  String.raw`femei(?:e|a)?|felnott\w*|erett|odrasl[aeio]|zrel[aeo]|punoljetn\w*|dewasa|wanita|matanda|nguoi lon|phu nu|truong thanh`,
+  String.raw`otona|josei|jukujo|hitozuma|chengren|chengnian|n[uv]ren|shun[uv]|shaofu|seongin|yeoja|ajumma|eoreun`
+]);
+
+/**
+ * An adult age, said any way a negative might: a decade ("in her twenties", "30s", "mid-thirties", "treinta", "Mitte
+ * zwanzig"), an age of 18 or over with its unit in any language the floor reads ("25 años", "30 Jahre", "25 tuoi"),
+ * "over 18", "18+", "of age". Numeric English ages ("25yo", "aged 30", "a 40-year-old") are read by readStatedAges.
+ */
+const ADULT_AGE_PATTERN = new RegExp(
+  [
+    String.raw`\b(?:twenties|thirties|forties|fifties|sixties|seventies|eighties|nineties|(?:[2-9]0) ?'?s)\b|\b(?:[2-9]0|twenty|thirty|forty|fifty) ?somethings?\b`,
+    String.raw`\b(?:eighteen|nineteen|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?: ?(?:one|two|three|four|five|six|seven|eight|nine))?) ?(?:years?|yrs?|yo|y o)\b`,
+    String.raw`\b(?:1[89]|[2-9]\d) ?(?:anos|ans|jahre|jahren|jahrig\w*|anni|jaar|jarig\w*|lat|lata|letni\w*|let|leta|yas\w*|ar|aar|arig\w*|vuotias\w*|ani|eves|godin\w*|tahun|taon|sai|sui|sal|tuoi)\b`,
+    String.raw`\b(?:veinte|treinta|cuarenta|cincuenta|vinte|trinta|quarenta|cinquenta|vingt|trente|quarante|cinquante|zwanzig|dreissig|vierzig|funfzig|venti|trenta|quaranta|cinquanta|twintig|dertig|veertig|vijftig|dwadziescia|trzydziesci|czterdziesci|dvacet|tricet|ctyricet|yirmi|otuz|kirk|tjugo|trettio|fyrtio|tyve|tredive|fyrre|kaksikymmenta|kolmekymmenta|douazeci|treizeci|patruzeci|husz|harminc|negyven|dvadeset|trideset|cetrdeset|dua puluh|tiga puluh|empat puluh|dalawampu|tatlumpu|nijuu|sanjuu|yonjuu|ershi|sanshi|sishi|seumul|seoreun|maheun)\w*\b`,
+    String.raw`\b(?:over|above|older than|at least|uber|ueber|ab|plus de|mas de|mayor(?:es)? de|piu di|acima de|mais de|boven(?: de)?|powyzej|uzeri|yli) (?:1[89]|[2-9]\d|eighteen|nineteen|twenty\w*|thirty\w*)\b|\b(?:1[89]|[2-9]\d) ?(?:\+|plus|and (?:over|up|older))|\b(?:of (?:legal |full )?age|legal age|age of majority|adult age)\b`
+  ].join("|"),
+  "u"
+);
 
 // "bare shoulders + lying on bed" is suggestive as a combination; each half alone is an ordinary portrait.
 const BARE_SHOULDERS_PATTERN = /\bbare shoulders?\b/u;
@@ -478,9 +519,10 @@ const SCHOOL_STAFF_GUARD = String.raw`(?! (?:teachers?|principals?|vice principa
 // and "baby oil on a baby" stay minor-coded.
 const BABY_GUARD = String.raw`(?!'s breath| (?:pink|blue|yellow|green|purple|lavender|bangs|hairs?|tee|t ?shirt|powder|carrots?|spinach|corn|potato(?:es)?|back ribs|ribs|octopus|squid|grapes?|tomato(?:es)?|kale|arugula|greens|bok choy|zucchini|grand(?: piano)?|shower|showers|bump|oil|boomers?|animals?|birds?|chicks?|ducks?|elephants?|goats?|deer|seals?|turtles?|penguins?|bunn(?:y|ies)|rabbits?|cats?|dogs?|kittens?|pupp(?:y|ies)|foxes|bears?|pandas?|lions?|tigers?|monitor|wipes|food|formula|bottle|stroller|carriage|crib)\b)`;
 
-// Any of these anywhere in the cut keeps it off the photo model, whatever the category. jk / jc / js are the
-// Japanese tag shorthand for high-, middle- and elementary-school girls; with word boundaries they only ever match
-// the standalone token, and never the ".js" of a code library.
+// Any of these anywhere in a sexual or suggestive cut keeps it off the photo model, and in any cut the photo builder
+// never words its subject with them. jk / jc / js are the Japanese tag shorthand for high-, middle- and
+// elementary-school girls; with word boundaries they only ever match the standalone token, and never the ".js" of a
+// code library.
 const MINOR_RULE: TermRule = {
   pattern: wordAlternation([
     String.raw`lolis?|lolicon|lolli|rori|shotas?|shotacon|shouta|toddlercon|mesugaki|nymphets?|nymphettes?`,
@@ -500,6 +542,9 @@ const MINOR_RULE: TermRule = {
     String.raw`junior high|j\.?r\.? high|jhs|(?:first|1st|second|2nd) years? (?:high|middle) school|high school (?:freshm[ae]n|sophomores?|first years?|1st years?)`,
     String.raw`school ?kids?|school ?child(?:ren)?|schoolchild(?:ren)?|school ?aged?|schoolage`,
     String.raw`under ?aged?|underage|aged down|age regression|jailbait|barely legal`,
+    // The same person shown younger, and the sibling and look words a sexual cut uses for a child. Read only where it
+    // matters: the floor locks them in a sexual or suggestive cut, and elsewhere the builder leaves them out.
+    String.raw`de ?aged|younger (?:version|self) of (?:her|him|them)sel(?:f|ves)|younger (?:her|him)self|(?:young|youthful|childlike|child) ?looking|looks? (?:very |so |too )?young|(?:flashback|memor(?:y|ies)) (?:to|of) (?:her|his|their) childhood|childhood (?:flashbacks?|memor(?:y|ies)|photos?|self)|first (?:holy )?communion|imoutos?|(?:little|younger|baby|kid) sisters?`,
     String.raw`(?:girl|boy|cub|brownie|daisy) scouts?(?! (?:cookies?|leaders?|troop leaders?|moms?|mothers?|dads?)\b)`,
     String.raw`diapers?|nappies|nappy|pacifiers?|sweet (?:sixteen|16)|quincea(?:n|ny)eras?|(?:bat|bar|bas|b'nai) mitzvahs?`,
     String.raw`p(?:a)?edophil\w*|pedos?`,
@@ -548,9 +593,10 @@ const NOT_OF_AGE_PATTERN = new RegExp(
 /**
  * Emoji are neither letters nor digits, so no lexicon and no unverifiable-script check ever saw them, while the Qwen
  * encoders read "A 🧒 in a 👙 on a 🛏️" as a child in a bikini on a bed. The photo builder strips every pictograph
- * (stripPictographs); the floor counts the ones with a sexual, child or school meaning first, so a typed emoji prompt
- * locks or is refused rather than being quietly cleaned into something else. Each set is the symbol's common sexual
- * or childhood use: 🔞 🍆 🍑 💦 🍒 👅 🫦 🥵, a garment crossed out ("👙❌"), 🧒 👶 👧 👦 🚸 🍼 👼, 👙 🩲 🩱 💋 👄, 🏫 🎒.
+ * (stripPictographs); the classifier counts the ones with a sexual, child or school meaning first, so a typed emoji
+ * prompt is routed for what it says (and a child emoji in a sexual one locks) rather than being quietly cleaned into
+ * something else. Each set is the symbol's common sexual or childhood use: 🔞 🍆 🍑 💦 🍒 👅 🫦 🥵, a garment crossed out
+ * ("👙❌"), 🧒 👶 👧 👦 🚸 🍼 👼, 👙 🩲 🩱 💋 👄, 🏫 🎒.
  */
 const NEGATION_EMOJI = String.raw`[\u{274C}\u{274E}\u{1F6AB}\u{26D4}\u{2716}]`;
 const GARMENT_EMOJI = String.raw`[\u{1F459}\u{1F457}\u{1F455}\u{1F456}\u{1FA72}\u{1FA71}\u{1F45A}\u{1F9E5}\u{1F97B}\u{1F458}\u{1F459}]`;
@@ -665,7 +711,7 @@ const STUDENT_IDENTITY_RULE: TermRule = {
     `${STUDENT_COLLEGE_GUARD}students?`,
     `${STUDENT_COLLEGE_GUARD}(?:freshm[ae]n|sophomores?)`,
     // The randoseru is the bag only an elementary schooler carries; it names the wearer as surely as the noun.
-    String.raw`school ?girls?|school ?boys?|high ?schoolers?|high school (?:girls?|boys?|pupils?|kids?|seniors?|juniors?)|(?:school|secondary) pupils?|kogals?|joshi ?kou?sei|joshikou?sei|randoseru`,
+    String.raw`school ?girls?|school ?boys?|high ?schoolers?|high school (?:girls?|boys?|pupils?|kids?|seniors?|juniors?)|hs (?:girls?|boys?|students?|seniors?|juniors?)|(?:school|secondary) pupils?|kogals?|joshi ?kou?sei|joshikou?sei|randoseru|nu sinh`,
     String.raw`colegial(?:a|as|es)?|lyceen(?:ne)?s?|schulerin(?:nen)?|schuler|estudiantes?|eleves?|eleva|siswa|siswi|murid|haksaeng|gakusei|xuesheng|uczen|uczniowie|zakyne|ogrenci|oppilas`
   ])
 };
@@ -677,7 +723,7 @@ const SCHOOL_RULE: TermRule = {
   pattern: wordAlternation([
     String.raw`school uniforms?|serafuku|seifuku|sailor (?:school )?uniforms?|sailor fuku|sailor suits?|sailor collars?|sailor dress(?:es)?|gakuran|academy uniforms?`,
     String.raw`(?:school|academy|prep school|student council) (?:blazers?|vests?|jackets?|cardigans?|sweaters?|skirts?|ties?|ribbons?|shoes|socks|swim ?suits?|bags?|hats?|desks?|chairs?|lockers?|hallways?|corridors?|rooftops?|gyms?|grounds|gates?|bus(?:es)?|trips?|festivals?|infirmary|library|cafeteria|courtyard|buildings?|classrooms?|pools?|clubs?|life|days?)`,
-    String.raw`(?:gym|pe|p e|physical education) (?:uniforms?|clothes|class(?:es)?|shorts|kit)|bloomers|buruma|school swim ?suits?|sukumizu|randoseru|uwabaki|kogal`,
+    String.raw`(?:gym|pe|p e|physical education) (?:uniforms?|clothes|class(?:es)?|shorts|kit)|bloomers|buruma|school swim ?suits?|sukumizu|randoseru|uwabaki|kogal|school ?(?:backpacks?|bags?|satchels?|rucksacks?)|book ?bags?`,
     String.raw`class ?rooms?|home ?rooms?|school ?yards?|cram school|juku|(?:at|after|before|to|in|from|skipping) school`,
     String.raw`high ?school(?:ers?)?`,
     String.raw`(?:uniforme|seragam) (?:escolar|scolaire|scolastica|sekolah)|schuluniform|escuela|colegio|escolar(?:es)?|ecole|schule|scuola|escola|sekolah|gakkou?|liseli`,
@@ -1162,21 +1208,34 @@ export function isCoveringGarmentTerm(tag: string): boolean {
 }
 
 /**
- * True for a term that must never become a photo negative: anything worn on or wrapped around the body, a word
- * that keeps a picture covered, censored or safe, a word that makes the subject an adult, or an adult build. A
- * negative of any of them steers the sampler toward the undressed or younger figure the positive prompt was never
- * allowed to describe. Accessories (hat, glasses, shoes) and quality terms (blurry, lowres, watermark) are not.
+ * True for a term that must never become a photo negative because it steers toward a YOUNGER subject: a word that
+ * makes a figure an adult ("adult", "mature", "grown woman", "wrinkles"), an adult age ("in her twenties", "25yo",
+ * "over 18"), or the body only an adult has ("breasts", "curves", "hips", "pubic hair", "fully developed") — in any
+ * language the floor reads and in every disguise it reads (readFloorVariants: "4dult", "m4ture", "a-d-u-l-t"). At any
+ * CFG above 1 a negative pushes the sampler away from what it names, so these pull the picture toward a child whatever
+ * the positive prompt says.
+ *
+ * Everything else a creator puts in a negative is theirs: clothing, modesty and safety words ("clothing", "censored",
+ * "sfw") steer toward an undressed adult, which is the routing's business, not this rule's. A term that steers AWAY
+ * from youth ("child", "loli") is kept too — it is a push toward the adult the positive prompt describes. So is an
+ * adulthood or build word about a thing ("old photo", "aged paper", "tall grass"): it names no one's age.
  */
-export function isPhotoNegativeSafeguardTerm(tag: string): boolean {
-  const term = normalizeSceneTag(tag);
-  return (
-    COVERING_GARMENT_PATTERN.test(term) ||
-    WORN_CLOTHING_PATTERN.test(term) ||
-    SAFEGUARD_WORD_PATTERN.test(term) ||
-    ADULTHOOD_WORD_PATTERN.test(term) ||
-    ADULT_BUILD_WORD_PATTERN.test(term)
+export function isPhotoNegativeYouthSteeringTerm(tag: string): boolean {
+  return withFloorVariants(toTerms([tag])).some(
+    (term) =>
+      (!NEGATIVE_THING_TERM_PATTERN.test(term) &&
+        (ADULTHOOD_WORD_PATTERN.test(term) || FOREIGN_ADULTHOOD_WORD_PATTERN.test(term) || ADULT_BUILD_WORD_PATTERN.test(term))) ||
+      ADULT_BODY_WORD_PATTERN.test(term) ||
+      ADULT_AGE_PATTERN.test(term) ||
+      readStatedAges(term).some(({ age, limit }) => age >= limit)
   );
 }
+
+/** A negative term about a thing — its last word a thing, no person word in it ("old photo", "tall grass"). */
+const NEGATIVE_THING_TERM_PATTERN = new RegExp(
+  String.raw`^(?!.*\b(?:wom[ae]n|lad(?:y|ies)|m[ae]n|girls?|boys?|persons?|people|person|face|skin|body|figure|female|male)\b).*\b(?:${NON_PERSON_AGED_NOUN}|photos|pictures?|images?|textures?|paper|grass|weeds|plants?|walls?|furniture|wood|stone|ruins|look|effect|filter|grain|vibe)$`,
+  "u"
+);
 
 /**
  * Strips NovelAI / Stable Diffusion weight syntax, canonicalises, reads hyphens and underscores as spaces and
@@ -1623,6 +1682,31 @@ export function isMinorOrStudentCodedSceneText(text: string): boolean {
 }
 
 /**
+ * The positions of comma segments that are minor-coded only as one phrase with the segment after them — "a little,
+ * shy girl", "a young, Korean girl", "born on May 3, 2013" — joined the way classifyImageScene joins them
+ * (joinSplitPhrases). Each half passes isMinorOrStudentCodedSceneText alone, and the builder keeps or drops one segment
+ * at a time, so it drops both halves at these positions. While every minor-coded cut was locked this never reached a
+ * photo prompt; a clothed one now renders photoreal, and its subject must still read as an adult.
+ */
+export function findSplitMinorPhrases(segments: readonly string[]): Set<number> {
+  const terms = segments.map((segment) => normalizeSceneTag(segment));
+  const found = new Set<number>();
+  for (let index = 0; index + 1 < terms.length; index += 1) {
+    // An opener that is minor-coded on its own ("12 years young") is dropped on its own; joining it to the next segment
+    // would take an ordinary one ("in a beige coat") down with it.
+    if (
+      SPLIT_PHRASE_OPENER_PATTERN.test(terms[index]) &&
+      !withFloorVariants([terms[index]]).some(isMinorCodedTerm) &&
+      withFloorVariants([`${terms[index]} ${terms[index + 1]}`]).some(isMinorCodedTerm)
+    ) {
+      found.add(index);
+      found.add(index + 1);
+    }
+  }
+  return found;
+}
+
+/**
  * Puts a cut into exactly one category. Precedence:
  * explicit > action > fantasy > romance > (no humans: object | scenery) > group > portrait | full_body.
  *
@@ -1683,22 +1767,29 @@ export function classifyImageScene(input: SceneClassificationInput): SceneClassi
     { terms: contextTerms, person: textsAreGlobal || contextTerms.some(isPersonTerm), freeText: false },
     ...safetyTexts.map((text) => ({ terms: toProseTerms([text]), person: true, freeText: true }))
   ];
-  // The screens hand a style over one comma segment at a time, so "f/8" in "Shot on a Sony A7, 35mm, f/8, ISO 100"
-  // arrives without its camera words. Free texts are read as one style for this; a figure's tags still need their own.
-  const cameraInFreeText = sourceReadings.some(({ terms, freeText }) => freeText && terms.some((term) => CAMERA_CONTEXT_PATTERN.test(term)));
+  // A camera word makes "f/8" an aperture only within its own sentence. A finished photo prompt is many sentences, and
+  // its style sentence's "lens" says nothing about "A woman, F16, in a bikini." appended after it — read text-wide, a
+  // camera-worded style hid every gendered age from the dispatch screen. The screens hand a style over one comma
+  // segment at a time, though, so "f/8" in "Shot on a Sony A7, 35mm, f/8, ISO 100" arrives without its camera words:
+  // one-sentence texts are still read as one style for this. A figure's tags still need their own.
+  const hasCameraWord = (terms: string[]) => terms.some((term) => CAMERA_CONTEXT_PATTERN.test(term));
+  const freeTextSentences = safetyTexts.map((text) => splitSceneSentences(text).map((segments) => toProseTerms([segments.join(", ")])));
+  const cameraInFragments = freeTextSentences.some((sentences) => sentences.length === 1 && hasCameraWord(sentences[0]));
   const childBodyKinds = readChildBodyKinds(floorReading);
   const femaleSubject = ["female", "mixed"].includes(readSubjectGender(floorTerms));
   const minorTerms = uniqueStrings([
     ...collect(floorReading, isMinorCodedTerm),
     // Free text renders a student identity as written; see STUDENT_IDENTITY_RULE.
     ...collect(proseReading, (term) => matchesRule(term, STUDENT_IDENTITY_RULE)),
-    ...sourceReadings.flatMap(({ terms, person, freeText }) => {
-      if (!person) {
-        return [];
-      }
-      const camera = (freeText && cameraInFreeText) || terms.some((term) => CAMERA_CONTEXT_PATTERN.test(term));
-      return collect(withFloorVariants(terms), (term) => readContextualAges(term, camera).length > 0);
-    }),
+    ...sourceReadings.flatMap(({ terms, person, freeText }) =>
+      person && !freeText ? collect(withFloorVariants(terms), (term) => readContextualAges(term, hasCameraWord(terms)).length > 0) : []
+    ),
+    ...freeTextSentences.flatMap((sentences) =>
+      sentences.flatMap((terms) => {
+        const camera = hasCameraWord(terms) || (sentences.length === 1 && cameraInFragments);
+        return collect(withFloorVariants(terms), (term) => readContextualAges(term, camera).length > 0);
+      })
+    ),
     // Neighbouring segments read together where a comma split one phrase: "a little, shy girl", "born on May 3, 2013".
     // The screens hand each segment over as its own text, so the texts are also read as one run.
     ...collect(

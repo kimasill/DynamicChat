@@ -11,10 +11,11 @@ import { inferImageCueFrameFromTags, isGarmentTag, readTagBodyRegion } from "./i
 import {
   IDENTITY_ANATOMY_TRAIT_PATTERN,
   canonicalizeSceneText,
+  findSplitMinorPhrases,
   hasFloorPictograph,
   hasUnverifiableScript,
   isMinorOrStudentCodedSceneText,
-  isPhotoNegativeSafeguardTerm,
+  isPhotoNegativeYouthSteeringTerm,
   splitSceneSentences,
   stripHangul,
   stripPictographs
@@ -30,6 +31,12 @@ import {
 // already applied upstream — as one English paragraph: a sentence per person, one for the setting, one for the
 // camera. It never adds a garment, a prop or a body detail the plan did not carry; it translates, and it drops
 // what has no meaning in a photograph.
+//
+// How much of a cut it says depends on the cut's routed category. A cut routed as explicit is one the user chose to
+// render as a photograph, so its scene is described as written — nudity, the act, sheer garments, an anatomy trait.
+// Every other cut leaves out the wording that would turn a clothed picture into a nude one by accident (a sheer
+// qualifier, an anatomy trait from the saved identity), because nothing routed that cut as explicit. Two things are
+// never said in any cut: words that make the subject a minor or a pupil, and eating-disorder body words.
 
 export interface PhotorealCharacterInput {
   characterId?: Id;
@@ -70,6 +77,11 @@ export interface PhotorealPromptInput {
   womanAppearance?: string;
   /** qwen21 → "<image1>", edit_plus → "image 1", none → references are not named in the prompt. */
   referenceSyntax: "qwen21" | "edit_plus" | "none";
+  /**
+   * The cut is routed as `explicit` (the user ticked it, or routes everything photoreal): describe the scene as
+   * written. Absent or false for every other cut, which keeps the sheer and anatomy-trait stripping.
+   */
+  explicitScene?: boolean;
 }
 
 export interface PhotorealPromptPlan {
@@ -147,14 +159,14 @@ export const PHOTOREAL_STYLE_PRESETS: Record<
   daily_look: {
     label: "데일리룩 · 핀터레스트/샤오홍슈",
     description:
-      "스마트폰으로 찍은 듯한 일상 패션 사진. 부드러운 자연광, 크림·화이트 톤 실내, 대비가 낮은 파스텔 보정, 결이 살아 있는 피부.",
+      "스마트폰으로 찍은 듯한 일상 패션·인스타 감성 사진. 리얼한 폰카 질감과 센서 노이즈, 은근하고 매혹적인 순욕(Pure Desire) 무드, 촉촉하고 결이 살아 있는 피부.",
     lead: "A candid, true-to-life smartphone photograph in the style of a Korean and Chinese daily-look fashion post",
     tail:
-      "Gentle pastel color grade with lifted shadows and low contrast, natural skin texture with visible pores, subtle phone-camera grain, sharp focus on the subject, realistic proportions",
+      "Raw unedited smartphone camera optics with realistic phone-sensor grain and slight low-light lens softness, dewy porcelain skin texture with visible pores and soft rose blush, intimate POV framing, alluring and sultry pure-desire Korean Instagram and Pinterest aesthetic, subtle body-hugging tension and natural feminine curves, candid off-duty mood, gentle pastel color grade with lifted shadows, realistic proportions",
     ambientLight: "Soft diffused natural daylight",
     ambientSetting: "a clean, minimal room with cream and white tones",
     negative:
-      "anime, cartoon, illustration, 3d render, cgi, painting, doll, plastic skin, airbrushed skin, oversaturated, harsh flash, heavy hdr, watermark, text, logo, extra fingers, deformed hands, distorted face"
+      "anime, cartoon, illustration, 3d render, cgi, painting, doll, plastic skin, airbrushed skin, oversaturated, heavy hdr, studio lighting, professional dslr, overly sterile, stiff posture, watermark, text, logo, extra fingers, deformed hands, distorted face"
   },
   film_portrait: {
     label: "필름 인물 사진",
@@ -186,7 +198,9 @@ export const PHOTOREAL_STYLE_PRESETS: Record<
 export function resolvePhotorealStyle(
   settings: Pick<PhotorealApiSettings, "stylePreset" | "stylePrompt" | "negativePrompt">
 ): PhotorealStyle {
-  const extraStyle = sanitizePhotoText(settings.stylePrompt);
+  // Cleaned of what no cut may carry; the wording only an explicit cut may carry is left for buildPhotorealPrompt to
+  // keep or strip once it knows the cut.
+  const extraStyle = sanitizePhotoText(settings.stylePrompt, [], true);
   if (settings.stylePreset === "custom") {
     // A custom style is the creator's whole description of the medium. Its first sentence leads the prompt (the
     // encoder weighs the opening most, and that is where a preset says "a smartphone photograph"); anything after
@@ -206,15 +220,15 @@ export function resolvePhotorealStyle(
 
 /**
  * The segments of a creator's free text (a photoreal appearance, a style, the prompt a profile image was made
- * from) as the safety floor must read them: every segment, with its Korean taken out. The builder drops Korean, and
- * the settings and builder screens tell the creator so ("한글은 프롬프트에서 빠집니다"), so a Korean appearance keeps
- * that documented fallback to the saved tags instead of locking every cut. Whatever else a segment carries is read:
- * skipping a segment because it held Hangul let one Hangul mark carry "A naked woman" past the floor. Every other
- * script stays in for the classifier to lock on: the builder drops it too, but nothing in an English-only field
- * should be written in kana or Cyrillic, and nothing here can check what it says. Segmentation is the builder's own
- * (splitSceneSentences), so whatever the builder keeps is a segment that was read. A segment of emoji alone is kept
- * when one of them is a pictograph the floor reads ("🍆💦"): the builder strips pictographs, but a typed one says what
- * the creator asked for. Any other symbol-only segment is not text, and still yields no segment.
+ * from) as the floor must read them: every segment, with its Korean taken out. The builder drops Korean, and the
+ * settings and builder screens tell the creator so ("한글은 프롬프트에서 빠집니다"), so a Korean appearance keeps that documented
+ * fallback to the saved tags. Whatever else a segment carries is read: skipping a segment because it held Hangul let
+ * one Hangul mark carry "A 14-year-old girl, naked" past the floor. Every other script stays in for the classifier: the
+ * builder drops it too, but nothing in an English-only field should be written in kana or Cyrillic, and nothing here
+ * can check what it says — so in a sexual or suggestive cut it locks, as an age nobody can read. Segmentation is the
+ * builder's own (splitSceneSentences), so whatever the builder keeps is a segment that was read. A segment of emoji
+ * alone is kept when one of them is a pictograph the floor reads ("🍆💦"): the builder strips pictographs, but a typed
+ * one says what the creator asked for. Any other symbol-only segment is not text, and still yields no segment.
  */
 export function selectPhotoTextForScreening(text: string | undefined): string[] {
   return splitSceneSentences(text)
@@ -250,6 +264,7 @@ function resolveStylePreset(stylePreset: PhotorealApiSettings["stylePreset"]): P
 
 export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealPromptPlan {
   const sink: TagSink = { dropped: [], negative: [] };
+  const explicitScene = input.explicitScene === true;
   const referenceSyntax = input.referenceSyntax === "qwen21" || input.referenceSyntax === "edit_plus" ? input.referenceSyntax : "none";
   const order = { next: 0 };
   const setting = createSettingModel();
@@ -257,7 +272,7 @@ export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealProm
 
   const figures = (Array.isArray(input.characters) ? input.characters : [])
     .filter((character): character is PhotorealCharacterInput => Boolean(character) && typeof character === "object")
-    .map((character) => buildFigureModel(character, referenceSyntax, setting, camera, sink, order));
+    .map((character) => buildFigureModel(character, referenceSyntax, setting, camera, sink, order, explicitScene));
 
   // Character-level tags the model left in the shared caption. With exactly one person they can only be about
   // that person, so they join that person's sentence. With several they cannot be attributed, and gluing them onto
@@ -265,7 +280,7 @@ export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealProm
   const contextFigure = createFigureModel(undefined);
   const detailTarget = figures.length === 1 ? figures[0] : contextFigure;
   let contextNoHumans = false;
-  for (const tag of cleanTagList(input.contextTags, sink)) {
+  for (const tag of cleanTagList(input.contextTags, sink, explicitScene)) {
     if (detailTarget.identityKeys?.has(tag.key)) {
       continue;
     }
@@ -322,7 +337,15 @@ export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealProm
     }
   }
   const cameraPhrases = describeCamera(frame, hasHumans);
-  const lead = stripTerminalPunctuation(sanitizePhotoText(input.style?.lead, sink.dropped));
+  if (
+    frame?.angle &&
+    frame.angle !== "dutch_angle" &&
+    camera.compositionTags.some((tag) => /\bdutch angle\b/u.test(tag)) &&
+    !cameraPhrases.includes(ANGLE_PHRASES.dutch_angle)
+  ) {
+    cameraPhrases.push(ANGLE_PHRASES.dutch_angle);
+  }
+  const lead = stripTerminalPunctuation(sanitizePhotoText(input.style?.lead, sink.dropped, explicitScene));
   // The preset's default light and surroundings only fill what the cut left unsaid: a cut that names its own
   // lighting or place keeps it, instead of being told it is also in a cream-white room in soft daylight.
   // A time of day that is not daylight sets the light too: a night street with no lighting tag of its own was still
@@ -333,11 +356,12 @@ export function buildPhotorealPrompt(input: PhotorealPromptInput): PhotorealProm
   const placeKnown =
     keptPhrases(setting.places).length > 0 ||
     keptPhrases(setting.backgrounds).length > 0 ||
-    keptPhrases(setting.indoorOutdoor).some((phrase) => phrase !== "indoors");
-  const ambientLight = lightingKnown ? "" : stripTerminalPunctuation(sanitizePhotoText(input.style?.ambientLight, sink.dropped));
+    keptPhrases(setting.indoorOutdoor).some((phrase) => phrase !== "indoors") ||
+    figures.some((figure) => keptPhrases(figure.pose).some((phrase) => PLACE_PATTERN.test(phrase)));
+  const ambientLight = lightingKnown ? "" : stripTerminalPunctuation(sanitizePhotoText(input.style?.ambientLight, sink.dropped, explicitScene));
   const ambientSetting =
-    placeKnown || !hasHumans ? "" : stripTerminalPunctuation(sanitizePhotoText(input.style?.ambientSetting, sink.dropped));
-  const tail = stripTerminalPunctuation(sanitizePhotoText(input.style?.tail, sink.dropped));
+    placeKnown || !hasHumans ? "" : stripTerminalPunctuation(sanitizePhotoText(input.style?.ambientSetting, sink.dropped, explicitScene));
+  const tail = stripTerminalPunctuation(sanitizePhotoText(input.style?.tail, sink.dropped, explicitScene));
   const layout = orderFiguresForLayout(figures);
   const referenceTokens = referenceSyntax !== "none" ? figures.map((figure) => figure.referenceToken ?? "").filter(Boolean) : [];
   const referenceSentence = referenceTokens.length > 0 ? createKeepIdentitySentence(referenceTokens) : "";
@@ -421,7 +445,7 @@ const KOREAN_SCRIPT_PATTERN = /\p{Script=Hangul}/u;
 
 /** Tokens that only mean something to an anime tag model, or to Danbooru's bookkeeping. */
 const NAI_ONLY_TAG_PATTERNS: RegExp[] = [
-  /^(?:masterpiece|best quality|amazing quality|great quality|good quality|normal quality|high quality|top quality|very aesthetic|aesthetic|top aesthetic|absurdres|incredibly absurdres|highres|newest|recent|very awa)$/u,
+  /^(?:masterpiece|best\s*quality|amazing\s*quality|great\s*quality|good\s*quality|normal\s*quality|high\s*quality|top\s*quality|very\s*aesthetic|aesthetic|top\s*aesthetic|absurdres|incredibly\s*absurdres|highres|ultra-?detailed|highly\s*detailed|extremely\s*detailed|finely\s*detailed(?:\s+\w+)?|intricate(?:\s+details?)?|high\s*complexity|vibrant\s*colors?|vivid\s*colors?|newest|recent|very\s*awa)$/u,
   /^year \d{4}$/u,
   /^rating\s*[:_ ]/u,
   /^score[ _]?\d/u,
@@ -429,9 +453,27 @@ const NAI_ONLY_TAG_PATTERNS: RegExp[] = [
   /^artist\s*:/u,
   /^anime\b/u,
   /\b(?:anime|manga|cartoon)\s+(?:style|coloring|colouring|screencap|screenshot|art|aesthetic|illustration)\b/u,
+  /\b(?:cel+\s*shad(?:ing|ed)|cel+-shad(?:ing|ed)|line\s*art|lineart|flat\s*color(?:ing|s)?|digital\s*illustration|simple\s*illustration|draw\s+hair\b.*|artist\s+collaboration|official\s+style|official\s+art)\b/u,
   /^(?:manga|illustration|2d|3d|cel shading|cel-shading|cel shaded|flat color|lineart|line art|sketch|comic|chibi|oekaki|pixel art|cartoon|toon|digital art|concept art|official art|game cg|key visual|promotional art|cover art)$/u,
+  /^(?:realistic|photo\s*realistic|photorealistic|photo|photograph|raw photo|detailed skin texture|skin texture|skin detail|highly detailed|ultra detailed|8k|4k|uhd|hdr|cinematic|neat)$/u,
   /\((?:medium|style)\)$/u,
   /^(?:commentary|commentary request|english commentary|translated|translation request|bad id|bad pixiv id|md5 mismatch|third-party edit|scan|dated|copyright name|character name|speech bubble|english text|censored|mosaic censoring|bar censor|border|letterboxed|sfw|nsfw|solo|solo focus|male focus|female focus|sweatdrop|multiple views|split screen|spoken heart|musical note)$/u
+];
+
+/**
+ * Common Korean action/gesture phrases that users sometimes mix into NovelAI character tags (e.g.,
+ * `2::입에 손을 올리고 속삭이듯 말한다::`). The original Hangul tag is still recorded in `droppedTags` per contract,
+ * while its safe English gesture equivalent is emitted into the character pose.
+ */
+const KOREAN_GESTURE_TRANSLATIONS: Array<{ pattern: RegExp; english: string }> = [
+  { pattern: /입에\s*손을?\s*올리고\s*속삭이듯/u, english: "holding a hand to own mouth as if whispering" },
+  { pattern: /입에\s*손을?\s*대고\s*속삭이듯/u, english: "holding a hand to own mouth as if whispering" },
+  { pattern: /손으로\s*입을?\s*가리고/u, english: "covering own mouth with a hand" },
+  { pattern: /입술에\s*손가락을?\s*대고/u, english: "touching own lips with a finger" },
+  { pattern: /머리카락을?\s*귀\s*뒤로\s*넘기/u, english: "tucking hair behind own ear" },
+  { pattern: /고개를?\s*갸웃/u, english: "head tilt" },
+  { pattern: /뒤돌아보/u, english: "looking back" },
+  { pattern: /거울을?\s*통해\s*바라보/u, english: "looking at camera through mirror" }
 ];
 
 /** Technical defects a tag caption sometimes leaks into the positive side; in a photo prompt they belong in the negative. */
@@ -441,18 +483,21 @@ const NEGATED_TECHNICAL_PATTERN = /^no (text|watermarks?|logos?|signatures?|arti
 
 // Words the photoreal side never renders — anything that codes the person as a minor, and student identities that
 // would put the subject back into a school-age frame — are the classifier's own (isMinorOrStudentCodedSceneText).
-// The router already locks minor-coded cuts to NovelAI; this is the same floor applied to the words themselves, so a
-// photo prompt can only ever describe an adult whatever reached it. School GARMENTS are not affected — "school
-// uniform" is clothing, and the subject stays an adult.
+// The router locks a minor-coded cut that is sexual or suggestive to NovelAI; any other minor-coded cut may render
+// photoreal, and this keeps the words themselves out of every photo prompt, so a photo prompt can only ever describe
+// an adult whatever reached it. School GARMENTS are not affected — "school uniform" is clothing, and the subject
+// stays an adult.
 //
-// Body-identity traits (futanari and synonyms) are routed as identity, not as explicit content, which is only safe
-// because the photo prompt never carries them: the photo shows the clothed person the rest of the caption describes.
+// Body-identity traits (futanari and synonyms) are routed as identity, not as explicit content: they are injected
+// into every cut the character is in, clothed ones included. So only a cut routed as explicit carries one into its
+// photo prompt; every other cut shows the clothed person the rest of the caption describes.
 
 /**
  * Garment qualifiers a photo model renders literally. An anime model stylises a "translucent bodysuit"; a photo
- * model shows the body through it — nudity the router never classified, because the cut is a clothed portrait. The
- * garment stays, opaque: "translucent tactical bodysuit" → "tactical bodysuit". A bare "see-through" tag with no
- * garment is dropped. (Found on the shipped adult seed's default outfits during QA.)
+ * model shows the body through it — nudity the router never classified, because the cut is a clothed portrait. Outside
+ * a cut routed as explicit the garment stays, opaque: "translucent tactical bodysuit" → "tactical bodysuit", and a
+ * bare "see-through" tag with no garment is dropped. (Found on the shipped adult seed's default outfits during QA.)
+ * In an explicit cut the qualifier is part of the scene the user chose to render, and stays.
  */
 const SHEER_QUALIFIER_PATTERN = /\b(?:see-?through|see through|translucent|transparent|sheer)\s+/u;
 const BARE_SHEER_TAG_PATTERN = /^(?:see-?through|see through|translucent|transparent|sheer)(?: (?:clothes|clothing|fabric|material))?$/u;
@@ -461,7 +506,8 @@ const SHEER_QUALIFIER_IN_TEXT_PATTERN = /\b(?:(a|an)\s+)?(?:see-?through|see thr
 
 /**
  * Body descriptors that a photograph turns into a realistic depiction of an eating disorder. Stylised in anime;
- * not something the photo side should ever render. The rest of the build ("slender", "skinny") is untouched.
+ * not something the photo side should ever render, in any cut — explicit ones included: this is a health line, not a
+ * content setting. The rest of the build ("slender", "skinny") is untouched.
  */
 const EATING_DISORDER_BODY_PATTERN = /\b(?:anorexic|anorexia|bulimic|bulimia|emaciated|skeletal|skin and bones|underweight)\b/u;
 
@@ -481,24 +527,32 @@ const EMOTICON_TAGS: Record<string, string> = {
   v: "peace sign"
 };
 
-function cleanTagList(raw: readonly unknown[] | undefined, sink: TagSink): CleanTag[] {
+function cleanTagList(raw: readonly unknown[] | undefined, sink: TagSink, explicitScene = false): CleanTag[] {
   const kept: CleanTag[] = [];
   const seen = new Set<string>();
+  const parts: WeightedPart[] = [];
   for (const value of Array.isArray(raw) ? raw : []) {
     if (typeof value !== "string") {
       continue;
     }
-    const parts = expandWeightedTag(value);
-    if (parts.length === 0 && value.trim()) {
+    const expanded = expandWeightedTag(value);
+    if (expanded.length === 0 && value.trim()) {
       // Nothing but pictographs: stripped, and reported like any other tag the photo prompt leaves out.
       sink.dropped.push(canonicalizeSceneText(value).trim());
     }
-    for (const part of parts) {
-      const tag = cleanSingleTag(part, sink);
-      if (tag && !seen.has(tag.key)) {
-        seen.add(tag.key);
-        kept.push(tag);
-      }
+    parts.push(...expanded);
+  }
+  // A minor-coded phrase a comma split in two ("a little, shy girl") goes whole: each half passes on its own.
+  const splitMinor = findSplitMinorPhrases(parts.map((part) => part.body));
+  for (const [index, part] of parts.entries()) {
+    if (splitMinor.has(index)) {
+      sink.dropped.push(part.source);
+      continue;
+    }
+    const tag = cleanSingleTag(part, sink, explicitScene);
+    if (tag && !seen.has(tag.key)) {
+      seen.add(tag.key);
+      kept.push(tag);
     }
   }
   return kept;
@@ -518,29 +572,37 @@ interface WeightedPart {
 function expandWeightedTag(raw: string): WeightedPart[] {
   // Canonical first (NFKC, invisible characters out, accents folded), as the classifier read it: a fullwidth
   // "ｎｕｄｅ" or a zero-width-split "nu\u200bde" is the plain word to the encoder, so it is the plain word here too.
-  const source = canonicalizeSceneText(raw).trim();
-  // Pictographs never reach a photo prompt: the encoders read "👙" as a bikini, and the floor has already read and
-  // counted the ones that mean something (stripPictographs).
-  let body = stripPictographs(source);
-  let weight: number | undefined;
-  // A leading "+" ("+2.5::") is how some creators write a positive weight; without it here the marker stayed glued
-  // to the tag and reached the photo prompt as text.
-  const weighted = body.match(/^([+-]?\d+(?:\.\d+)?)\s*::/u);
-  if (weighted) {
-    weight = Number(weighted[1]);
-    body = body.slice(weighted[0].length);
-  } else if (body.startsWith("::")) {
-    body = body.slice(2);
+  const fullSource = canonicalizeSceneText(raw).trim();
+  const segments =
+    fullSource.match(/((?:[+-]?\d+(?:\.\d+)?\s*)?::(?:(?!::)[^\n])*?::|[^,;\n|]+)/gu)?.map((s) => s.trim()).filter(Boolean) ??
+    [fullSource];
+  const parts: WeightedPart[] = [];
+  for (const segment of segments) {
+    // Pictographs never reach a photo prompt: the encoders read "👙" as a bikini, and the floor has already read and
+    // counted the ones that mean something (stripPictographs).
+    let body = stripPictographs(segment);
+    let weight: number | undefined;
+    // A leading "+" ("+2.5::") is how some creators write a positive weight; without it here the marker stayed glued
+    // to the tag and reached the photo prompt as text.
+    const weighted = body.match(/^([+-]?\d+(?:\.\d+)?)\s*::/u);
+    if (weighted) {
+      weight = Number(weighted[1]);
+      body = body.slice(weighted[0].length);
+    } else if (body.startsWith("::")) {
+      body = body.slice(2);
+    }
+    body = body.replace(/\s*::\s*$/u, "");
+    for (const piece of body.split(/[,;\n|]/u)) {
+      const cleaned = piece.trim();
+      if (cleaned) {
+        parts.push({ body: cleaned, source: segment, weight });
+      }
+    }
   }
-  body = body.replace(/\s*::\s*$/u, "");
-  return body
-    .split(/[,;\n|]/u)
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => ({ body: part, source, weight }));
+  return parts;
 }
 
-function cleanSingleTag(part: WeightedPart, sink: TagSink): CleanTag | undefined {
+function cleanSingleTag(part: WeightedPart, sink: TagSink, explicitScene: boolean): CleanTag | undefined {
   const text = normalizeTagText(part.body);
   const key = text.toLowerCase();
   const source = part.source;
@@ -549,18 +611,24 @@ function cleanSingleTag(part: WeightedPart, sink: TagSink): CleanTag | undefined
   }
   if (hasUnverifiableScript(text)) {
     // Letters outside a–z: Korean, kana, CJK, Cyrillic or Greek look-alikes. The encoders read most of them, and
-    // nothing here can check what such a tag would add to the picture (the router locks a cut that carries one;
-    // this keeps it out of any prompt regardless). Korean, the common case, is noise to them at best.
+    // nothing here can check what such a tag would add to the picture (the router locks a sexual or suggestive cut that
+    // carries one; this keeps it out of any prompt regardless). Korean, the common case, is noise to them at best.
     sink.dropped.push(source);
+    if (KOREAN_SCRIPT_PATTERN.test(text) && (part.weight === undefined || part.weight > 0)) {
+      const gesture = KOREAN_GESTURE_TRANSLATIONS.find((entry) => entry.pattern.test(text));
+      if (gesture) {
+        return { text: gesture.english, key: gesture.english.toLowerCase(), source: gesture.english };
+      }
+    }
     return undefined;
   }
   if (part.weight !== undefined && part.weight <= 0) {
     sink.dropped.push(source);
-    // "Less of this" is unwanted in a photo too, except for what keeps the subject covered, safe and adult: a
-    // negative weight on clothing, on "sfw" or on "adult" is NovelAI's undressing or age-down idiom (`-2::apparel::`,
-    // `-1::adult::`), and the same photo negative steers the sampler there at any CFG above 1. The classifier locks
-    // such a cut; the term just goes.
-    if (part.weight < 0 && !isPhotoNegativeSafeguardTerm(text)) {
+    // "Less of this" is unwanted in a photo too — clothing and "sfw" included: `-2::apparel::` asks NovelAI for an
+    // undressed figure, the classifier reads the cut as explicit, and the user's routing decides where it renders.
+    // What steers toward a younger subject never becomes a photo negative: `-1::adult::` is NovelAI's age-down idiom,
+    // and the same photo negative steers the sampler there at any CFG above 1.
+    if (part.weight < 0 && !isPhotoNegativeYouthSteeringTerm(text)) {
       sink.negative.push(text);
     }
     return undefined;
@@ -580,17 +648,23 @@ function cleanSingleTag(part: WeightedPart, sink: TagSink): CleanTag | undefined
     sink.dropped.push(source);
     return undefined;
   }
-  // The floor locks a minor-coded cut before it gets here, and whatever still arrives is never worded as a minor or
-  // a student.
+  // The floor locks a minor-coded cut that is sexual or suggestive before it gets here, and whatever still arrives is
+  // never worded as a minor or a student.
   if (isMinorOrStudentCodedSceneText(key)) {
     sink.dropped.push(source);
     return undefined;
   }
-  if (IDENTITY_ANATOMY_TRAIT_PATTERN.test(key) || EATING_DISORDER_BODY_PATTERN.test(key) || BARE_SHEER_TAG_PATTERN.test(key)) {
+  if (EATING_DISORDER_BODY_PATTERN.test(key)) {
     sink.dropped.push(source);
     return undefined;
   }
-  if (SHEER_QUALIFIER_PATTERN.test(key)) {
+  // Outside an explicit scene an anatomy trait and a bare sheer tag go, and a sheer qualifier leaves its garment opaque.
+  // In one they are the scene the user routed to the photo model, and stay as written.
+  if (!explicitScene && (IDENTITY_ANATOMY_TRAIT_PATTERN.test(key) || BARE_SHEER_TAG_PATTERN.test(key))) {
+    sink.dropped.push(source);
+    return undefined;
+  }
+  if (!explicitScene && SHEER_QUALIFIER_PATTERN.test(key)) {
     const opaque = text.replace(new RegExp(SHEER_QUALIFIER_PATTERN.source, "giu"), "").trim();
     if (!/\p{L}{2,}/u.test(opaque)) {
       sink.dropped.push(source);
@@ -740,8 +814,11 @@ const EXPRESSION_PHRASES: Record<string, string> = {
   frowning: "frowning",
   "furrowed brow": "with a furrowed brow",
   "open mouth": "with {pron} mouth open",
+  "slightly open mouth": "with {pron} mouth slightly open",
+  "mouth slightly open": "with {pron} mouth slightly open",
   "closed mouth": "with {pron} mouth closed",
   "parted lips": "with parted lips",
+  "voice lowered expression": "with a hushed, whispering expression",
   "closed eyes": "with {pron} eyes closed",
   "eyes closed": "with {pron} eyes closed",
   "half-closed eyes": "with half-closed eyes",
@@ -825,6 +902,8 @@ const POSE_PHRASES: Record<string, string> = {
   contrapposto: "standing in contrapposto",
   "all fours": "on all fours",
   "bent over": "bending over",
+  "half step back": "taking a half step back",
+  "step back": "stepping back",
   "fighting stance": "in a fighting stance",
   "holding hands": "holding hands",
   hug: "hugging",
@@ -854,7 +933,7 @@ const GARMENT_ACTION_VERBS: Record<string, string> = {
 };
 
 const GARMENT_PATTERN =
-  /\b(?:shirt|t-shirt|tee|blouse|top|crop top|tank top|tube top|camisole|sweater|jumper|cardigan|hoodie|sweatshirt|turtleneck|knit|knitwear|jacket|blazer|coat|parka|vest|dress|sundress|gown|bodycon|skirt|miniskirt|shorts|hot pants|pants|trousers|jeans|leggings|tights|pantyhose|stockings|thighhighs|thigh-highs|thigh highs|kneehighs|kneehigh|socks|shoes|sneakers|boots|heels|sandals|loafers|slippers|flats|uniform|serafuku|gakuran|suit|tuxedo|kimono|yukata|hanbok|qipao|cheongsam|apron|pajamas|pyjamas|nightgown|robe|bathrobe|swimsuit|bikini|lingerie|bra|panties|underwear|overalls|jumpsuit|romper|bodysuit|leotard|cape|cloak|scarf|muffler|gloves|mittens|hat|cap|beanie|beret|headband|hairband|hair ornament|hairclip|hair clip|hairpin|hair ribbon|hair bow|hair flower|scrunchie|ribbon|bow|bowtie|necktie|tie|choker|necklace|pendant|earrings?|bracelet|ring|wristwatch|watch|glasses|eyewear|sunglasses|mask|belt|bag|handbag|purse|backpack|tote|clutch|collar|sleeves?|sleeveless|strapless|off-shoulder|off shoulder|neckline|denim|leather|lace|frills?|ruffles?|clothes|clothing|outfit|attire|costume|sportswear|loungewear|skinnies|skinny jeans|thong)\b/u;
+  /\b(?:shirt|t-shirt|tee|blouse|top|crop top|tank top|tube top|camisole|sweater|jumper|cardigan|hoodie|sweatshirt|turtleneck|knit|knitwear|jacket|blazer|coat|parka|vest|dress|sundress|gown|bodycon|skirt|miniskirt|shorts|hot pants|pants|trousers|slacks|chinos|jeans|leggings|tights|pantyhose|stockings|thighhighs|thigh-highs|thigh highs|kneehighs|kneehigh|socks|shoes|sneakers|boots|heels|sandals|loafers|slippers|flats|uniform|serafuku|gakuran|suit|tuxedo|kimono|yukata|hanbok|qipao|cheongsam|apron|pajamas|pyjamas|nightgown|robe|bathrobe|swimsuit|bikini|lingerie|bra|panties|underwear|overalls|jumpsuit|romper|bodysuit|leotard|cape|cloak|scarf|muffler|gloves|mittens|hat|cap|beanie|beret|headband|hairband|hair ornament|hairclip|hair clip|hairpin|hair ribbon|hair bow|hair flower|scrunchie|ribbon|bow|bowtie|necktie|tie|choker|necklace|pendant|earrings?|bracelet|ring|wristwatch|watch|badge|lanyard|glasses|eyewear|sunglasses|mask|belt|bag|handbag|purse|backpack|tote|clutch|collar|sleeves?|sleeveless|strapless|off-shoulder|off shoulder|neckline|denim|leather|lace|frills?|ruffles?|clothes|clothing|outfit|attire|costume|sportswear|loungewear|skinnies|skinny jeans|thong)\b/u;
 
 const NAI_GARMENT_RENAMES: Record<string, string> = {
   thighhighs: "thigh-high socks",
@@ -877,6 +956,8 @@ const BARE_PHRASES: Record<string, string> = {
   midriff: "with a bare midriff",
   navel: "with {pron} navel showing",
   collarbone: "with {pron} collarbone showing",
+  "collarbone visible": "with {pron} collarbone visible",
+  forehead: "with {pron} forehead visible",
   cleavage: "showing cleavage"
 };
 
@@ -936,12 +1017,12 @@ const HAIR_DETAIL_PHRASES: Record<string, string> = {
 const HAIR_NON_DESCRIPTIVE_WORDS = /\b(?:in|on|with|own|hand|hands|holding|touching|playing|adjusting|grabbing|pulling|tucking|brushing|fixing)\b/u;
 
 const EYE_DESCRIPTION_PATTERN =
-  /^(?:black|brown|dark brown|light brown|blue|light blue|dark blue|green|dark green|grey|gray|hazel|amber|purple|violet|golden|gold|yellow|pink|red|aqua|teal|silver|orange)$|\b(?:bright|large|big|round|almond|narrow|droopy|sharp|tsurime|tareme|sparkling|glowing|doe)\b/u;
+  /^(?:black|brown|dark brown|light brown|blue|light blue|dark blue|green|dark green|grey|gray|slate gray|slate grey|steel gray|steel grey|ash brown|honey brown|chestnut brown|emerald green|sky blue|icy blue|crimson red|ruby red|golden amber|warm brown|cool gray|cool grey|pale blue|deep brown|hazel|amber|purple|violet|golden|gold|yellow|pink|red|aqua|teal|silver|orange)$|\b(?:bright|large|big|round|almond|narrow|droopy|sharp|tsurime|tareme|sparkling|glowing|doe|dark|light|pale|deep|warm|cool)\b/u;
 
 const BODY_PATTERN =
-  /\b(?:skin|tan|tanned|tanlines|freckles|mole|moles|beauty mark|scars?|tattoos?|makeup|lipstick|eyeshadow|eyeliner|mascara|nail polish|nails|fingernails|eyelashes|eyebrows|lips|teeth|fangs?|dimples|slim|slender|skinny|petite|curvy|plump|chubby|muscular|toned|athletic|tall|short|breasts|flat chest|abs|waist|hips|legs|thighs|figure|build|physique|body|ears|horns?|tail|wings|halo|cheeks|features|face)\b/u;
+  /\b(?:skin|tan|tanned|tanlines|freckles|mole|moles|beauty mark|scars?|tattoos?|makeup|lipstick|eyeshadow|eyeliner|mascara|nail polish|nails|fingernails|eyelashes|eyebrows|lips|mouth|teeth|fangs?|dimples|slim|slender|skinny|petite|curvy|plump|chubby|muscular|toned|athletic|tall|short|breasts|flat chest|abs|waist|hips|legs|thighs|neck|collarbone|jawline|nose|chin|forehead|cheekbones?|figure|build|physique|body|ears|horns?|tail|wings|halo|cheeks|features|face)\b/u;
 /** Body descriptions that are singular countable nouns and read better with an article. */
-const BODY_ARTICLE_PATTERN = /\b(?:build|figure|physique|face|body|frame|tattoo|scar|mole|beauty mark|tail|halo|waist)$/u;
+const BODY_ARTICLE_PATTERN = /\b(?:build|figure|physique|face|body|frame|tattoo|scar|mole|beauty mark|tail|halo|waist|mouth|neck|jawline|nose|chin|forehead)$/u;
 /**
  * One-word build tags ("slender", "skinny", "tall"). NovelAI lists them as separate tags; in prose they are
  * adjectives of one noun, so they merge into "a slender and tall figure" instead of dangling after the hair.
@@ -1015,15 +1096,15 @@ const INDOOR_OUTDOOR_PHRASES: Record<string, string> = {
  * lexicons, and "twilight" is caught by the time lexicon first. Sources read "lit by ..."; effects read "with ...".
  */
 const LIGHTING_PATTERN =
-  /(?:light|lights|lighting|backlighting|backlit|sunlight|moonlight|candlelight|lamplight|daylight|firelight|shadows?|lens flare|sunbeams?|rays|glare|bloom|neon)$/u;
+  /(?:light|lights|light sources?|lighting|backlighting|backlit|sunlight|moonlight|candlelight|lamplight|daylight|firelight|shadows?|lens flare|sunbeams?|rays|glare|bloom|neon)$/u;
 const LIGHTING_EXCLUSION_PATTERN = /\b(?:hair|eyes|smile|blush|skin|highlights)\b/u;
 const LIGHT_SOURCE_PATTERN =
-  /\b(?:sunlight|moonlight|candlelight|lamplight|lamp light|window light|natural light|daylight|street ?lights?|neon lights?|fluorescent lights?|fairy lights|string lights|firelight|fire light|sunbeams?|sun rays|light rays|god rays|crepuscular rays|ring light|spotlight|stage lights?|city lights|lantern light|screen light)$/u;
+  /\b(?:sunlight|moonlight|candlelight|lamplight|lamp light|window light|natural light|daylight|lobby light|light sources?|street ?lights?|neon lights?|fluorescent lights?|fairy lights|string lights|firelight|fire light|sunbeams?|sun rays|light rays|god rays|crepuscular rays|ring light|spotlight|stage lights?|city lights|lantern light|screen light)$/u;
 
 const BACKGROUND_PATTERN = /^(?:simple|plain|white|black|grey|gray|gradient|pink|blue|beige|cream|dark|light|solid)(?: \w+)? background$/u;
 
 const PROP_PATTERN =
-  /\b(?:bed|pillows?|blanket|sheets|window|windows|curtains?|table|desk|chair|sofa|couch|mirror|door|wall|floor|carpet|rug|bookshelf|shelf|shelves|plants?|potted plant|flowers?|bouquet|vase|cup|mug|coffee|tea|teacup|glass|wine glass|bottle|book|books|notebook|laptop|computer|phone|smartphone|cellphone|tablet|lamp|candle|clock|television|tv|counter|sink|bathtub|stairs|railing|fence|tree|trees|cherry blossoms|leaves|grass|sky|clouds?|stars?|starry sky|night sky|moon|sun|sea|water|waves|river|building|buildings|skyscraper|car|bicycle|bus|umbrella|food|cake|dessert|bread|meal|plate|dish|bowl|fruit|ice cream|drink|letter|envelope|gift|present|box|shopping bag|cat|dog|teddy bear|stuffed toy|poster|painting|picture frame|sign|signboard|vending machine|bench|lockers?|blackboard|whiteboard|piano|guitar|microphone|camera|keyboard|headphones)$/u;
+  /\b(?:bed|pillows?|blanket|sheets|window|windows|curtains?|table|desk|chair|sofa|couch|mirror|reflection|indicator|door|wall|walls|floor|carpet|rug|bookshelf|shelf|shelves|plants?|potted plant|flowers?|bouquet|vase|cup|mug|coffee|tea|teacup|glass|wine glass|bottle|book|books|notebook|laptop|computer|phone|smartphone|cellphone|tablet|lamp|candle|clock|television|tv|counter|sink|bathtub|stairs|railing|fence|tree|trees|cherry blossoms|leaves|grass|sky|clouds?|stars?|starry sky|night sky|moon|sun|sea|water|waves|river|building|buildings|skyscraper|car|bicycle|bus|umbrella|food|cake|dessert|bread|meal|plate|dish|bowl|fruit|ice cream|drink|letter|envelope|gift|present|box|shopping bag|cat|dog|teddy bear|stuffed toy|poster|painting|picture frame|sign|signboard|vending machine|bench|lockers?|blackboard|whiteboard|piano|guitar|microphone|camera|keyboard|headphones)$/u;
 
 const PRONOUNS: Record<PronounKey, string> = { female: "her", male: "his", other: "their", plural: "their" };
 
@@ -1156,11 +1237,12 @@ function buildFigureModel(
   setting: SettingModel,
   camera: CameraModel,
   sink: TagSink,
-  order: { next: number }
+  order: { next: number },
+  explicitScene: boolean
 ): FigureModel {
   const figure = createFigureModel(character);
-  const tags = cleanTagList(character.tags, sink);
-  const identity = cleanTagList(character.identityTags, { dropped: [], negative: [] });
+  const tags = cleanTagList(character.tags, sink, explicitScene);
+  const identity = cleanTagList(character.identityTags, { dropped: [], negative: [] }, explicitScene);
   // Gender and head count come from every source, identity included: the identity tags are often the only place
   // "1girl" is written, and the creator's appearance prose replaces how the person LOOKS, not who they are.
   for (const tag of tags) {
@@ -1180,7 +1262,7 @@ function buildFigureModel(
   // Emphasis syntax out first, here as in sanitizePhotoSentences, so the first-segment check below compares the
   // same segments the sanitizer produced.
   const appearanceText = stripEmphasisSyntax(character.appearance);
-  const sanitizedAppearance = sanitizePhotoSentences(appearanceText, appearanceDropped);
+  const sanitizedAppearance = sanitizePhotoSentences(appearanceText, appearanceDropped, explicitScene);
   const subjectDropped = appearanceDropped.includes(splitSceneSentences(appearanceText)[0]?.[0] ?? "");
   const appearanceSentences = subjectDropped ? [] : sanitizedAppearance;
   sink.dropped.push(...(subjectDropped ? splitSceneSentences(appearanceText).flat() : appearanceDropped));
@@ -1190,12 +1272,28 @@ function buildFigureModel(
       .map((sentence, index) => (index === 0 ? sentence : sentence.replace(/^(She|He|They|Her|His|Their|The|A|An)\b/u, (word) => word.toLowerCase())))
       .join(", ");
     figure.gender = figure.gender ?? readGenderFromText(appearanceSentences.join(" "));
-    figure.identityKeys = new Set(identity.map((tag) => tag.key));
+    // An anatomy trait is not how the person looks but what an explicit scene shows, so the appearance prose does not
+    // replace it there.
+    figure.identityKeys = new Set(identity.filter((tag) => !(explicitScene && IDENTITY_ANATOMY_TRAIT_PATTERN.test(tag.key))).map((tag) => tag.key));
   }
 
   for (const tag of tags) {
     if (!figure.identityKeys?.has(tag.key)) {
       absorbFigureTag(figure, setting, camera, tag, order);
+    }
+  }
+
+  // If the cut specifies its own clothing, strip garment clauses ("wearing a cream knit cardigan", etc.) from the
+  // character's profile appearance prose so the profile outfit does not bleed into a scene with a different outfit.
+  if (figure.clothing.length > 0 && figure.appearanceSentences && figure.appearanceSentences.length > 0) {
+    const strippedSentences = figure.appearanceSentences
+      .map((sentence, index) => stripAppearanceGarmentClauses(sentence, index === 0))
+      .filter(Boolean);
+    if (strippedSentences.length > 0) {
+      figure.appearanceSentences = strippedSentences;
+      figure.appearance = strippedSentences
+        .map((sentence, index) => (index === 0 ? sentence : sentence.replace(/^(She|He|They|Her|His|Their|The|A|An)\b/u, (word) => word.toLowerCase())))
+        .join(", ");
     }
   }
 
@@ -1355,7 +1453,21 @@ function absorbPersonDetail(figure: FigureModel, tag: CleanTag, order: { next: n
     return true;
   }
   if (/^looking at\s+/u.test(key)) {
-    figure.expression.push(createItem(insertArticles(key), source, RANK_FIGURE_DETAIL, order));
+    figure.expression.push(createItem(insertArticles(key.replace(/\bviewer\b/gu, "camera")), source, RANK_FIGURE_DETAIL, order));
+    return true;
+  }
+  const adultAgeMatch = key.match(/^([2-9]\d)\s*(?:years?\s*old|yo|y\/o)$/u);
+  if (adultAgeMatch) {
+    figure.modifier = figure.modifier ?? `${adultAgeMatch[1]}-year-old`;
+    return true;
+  }
+  if (/^(?:\d+|one|two|three|top|bottom|several|few)\s+buttons?\s+(?:undone|unbuttoned|open)$/u.test(key)) {
+    figure.bare.push(createItem(`with ${key}`, source, RANK_FIGURE_DETAIL, order));
+    return true;
+  }
+  const tuckedMatch = key.match(/^tucked into\s+(.+)$/u);
+  if (tuckedMatch) {
+    figure.bare.push(createItem(`tucked into ${withArticle(tuckedMatch[1])}`, source, RANK_FIGURE_DETAIL, order));
     return true;
   }
   const pose = readPosePhrase(key);
@@ -1371,7 +1483,10 @@ function absorbPersonDetail(figure: FigureModel, tag: CleanTag, order: { next: n
     return true;
   }
   if (EXPRESSION_NOUN_PATTERN.test(key) && !GARMENT_PATTERN.test(key)) {
-    figure.expression.push(createItem(`with ${withArticle(key)}`, source, RANK_FIGURE_DETAIL, order));
+    const phrase = /^(?:with|looking|smiling|crying|frowning|staring|glancing|turning|gazing|blushing|sighing)\b/u.test(key)
+      ? insertArticles(key)
+      : `with ${withArticle(key)}`;
+    figure.expression.push(createItem(phrase, source, RANK_FIGURE_DETAIL, order));
     return true;
   }
   const bare = BARE_PHRASES[key];
@@ -1388,6 +1503,10 @@ function absorbPersonDetail(figure: FigureModel, tag: CleanTag, order: { next: n
   }
   if ((GARMENT_PATTERN.test(key) || isGarmentTag(key)) && !isActionPhraseTag(key)) {
     figure.clothing.push(createItem(readGarmentPhrase(key), source, RANK_FIGURE_DETAIL, order));
+    return true;
+  }
+  if (isActionPhraseTag(key)) {
+    figure.pose.push(createItem(insertArticles(key), source, RANK_FIGURE_DETAIL, order));
     return true;
   }
   if (!options.skipBody && BODY_PATTERN.test(key)) {
@@ -1442,6 +1561,12 @@ function readHairTag(hair: HairParts, key: string, source: string): boolean {
     hair.sources.push(source);
     return true;
   }
+  if (/^(?:loose|stray|wispy|messy)?\s*(?:hair\s+)?strands?\b/u.test(key)) {
+    const strandPhrase = insertArticles(key.replace(/\bframing\s+(?:own\s+)?face\b/gu, "framing {pron} face"));
+    hair.details.push(strandPhrase);
+    hair.sources.push(source);
+    return true;
+  }
   // "black hair", and the longer authored form "pastel silver hair with light purple tint".
   const described = key.match(/^(.+?)\s+hair(?:\s+with\s+(.+))?$/u);
   if (described && !GARMENT_PATTERN.test(key) && !HAIR_NON_DESCRIPTIVE_WORDS.test(described[1])) {
@@ -1466,21 +1591,28 @@ function readHairTag(hair: HairParts, key: string, source: string): boolean {
 /** Adds "long platinum blonde wavy" as ordered words, keeping multi-word colours together. */
 function addHairWords(hair: HairParts, prefix: string): void {
   let colour: string[] = [];
-  const push = (word: string) => {
+  const hasExistingColour = () =>
+    hair.words.some((existing) => !HAIR_LENGTH_WORDS.has(existing) && !HAIR_TEXTURE_WORDS.has(existing));
+  const push = (word: string, isColour = false) => {
+    if (isColour && hasExistingColour()) {
+      return;
+    }
     if (!hair.words.includes(word)) {
       hair.words.push(word);
     }
   };
   const flush = () => {
     if (colour.length > 0) {
-      push(colour.join(" "));
+      const joined = colour.join(" ");
+      const normalized = /^ash\s+gr[ae]y$/u.test(joined) ? "dyed ash-grey" : joined;
+      push(normalized, true);
       colour = [];
     }
   };
   for (const word of prefix.split(/\s+/u).filter(Boolean)) {
     if (HAIR_LENGTH_WORDS.has(word) || HAIR_TEXTURE_WORDS.has(word)) {
       flush();
-      push(word);
+      push(word, false);
     } else {
       colour.push(word);
     }
@@ -1537,22 +1669,47 @@ function possessivizeLimb(phrase: string): string {
  * the scene, not something worn; it stays in the sentence as a plain clause.
  */
 const ACTION_PHRASE_PATTERN =
-  /\b(?:reaching|holding|dropping|grabbing|pulling|lifting|touching|gripping|clutching|trembling|shaking|falling|carrying|adjusting|tugging|fiddling|fidgeting|waving|pointing|covering|pressing|pushing|squeezing|hugging|clinging|leaning|stretching|picking|putting|taking|opening|closing|hanging|toward|towards|into|onto|across|through)\b/u;
+  /\b(?:reaching|holding|dropping|grabbing|pulling|lifting|touching|gripping|clutching|trembling|shaking|falling|carrying|adjusting|tugging|fiddling|fidgeting|waving|pointing|covering|pressing|pushing|squeezing|hugging|clinging|leaning|stretching|picking|putting|taking|opening|closing|hanging|looking|staring|gazing|glancing|watching|retracting|withdrawing|examining|checking|inspecting|finding|discovering|stepping|backing|moving|turning|sitting|standing|kneeling|crouching|lying|crying|weeping|sobbing|sighing|breathing|gasping|shivering|flinching|recoiling|hesitating|toward|towards|into|onto|across|through|from|inside|outside|behind|under|over)\b/u;
 
 function isActionPhraseTag(key: string): boolean {
   return key.split(/\s+/u).length >= 3 && ACTION_PHRASE_PATTERN.test(key);
+}
+
+function stripAppearanceGarmentClauses(sentence: string, isFirstSentence: boolean): string {
+  const withoutWearingTail = sentence.replace(/,?\s*\b(?:wearing|dressed in)\s+[^.]+$/iu, "").trim();
+  const clauses = withoutWearingTail
+    .split(/,\s*/u)
+    .map((clause) => clause.trim())
+    .filter(Boolean);
+  const kept = clauses.filter((clause, index) => {
+    if (isFirstSentence && index === 0) {
+      return true;
+    }
+    const lower = clause.toLowerCase();
+    if (/^(?:wearing|dressed in)\b/u.test(lower)) {
+      return false;
+    }
+    if (
+      (GARMENT_PATTERN.test(lower) || isGarmentTag(lower)) &&
+      !/\b(?:hair|eyes?|face|skin|build|figure|woman|man|person|twenties|thirties|forties)\b/u.test(lower)
+    ) {
+      return false;
+    }
+    return true;
+  });
+  return kept.join(", ");
 }
 
 function readGarmentPhrase(key: string): string {
   if (/^no\s+/u.test(key)) {
     return `without ${key.slice(3)}`;
   }
-  return (
+  const renamed =
     NAI_GARMENT_RENAMES[key] ??
     key
       .replace(/\b(thighhighs|thigh highs|kneehighs)\b/u, (word) => NAI_GARMENT_RENAMES[word] ?? word)
-      .replace(/\bown\s+/u, "{pron} ")
-  );
+      .replace(/\bown\s+/u, "{pron} ");
+  return insertArticles(renamed);
 }
 
 /** Merges the hair words into one phrase and promotes the leading items of each group to core detail. */
@@ -1780,6 +1937,10 @@ function singularAdultNoun(gender: Gender, modifier?: string): string {
     case "middle-aged":
       return `a middle-aged ${noun}`;
     default:
+      if (modifier && /^[2-9]\d-year-old$/u.test(modifier)) {
+        const ageNum = Number(modifier.split("-")[0]);
+        return `${indefiniteArticle(modifier)} ${modifier} ${ageNum < 35 ? "young adult" : "adult"} ${noun}`;
+      }
       return `an adult ${noun}`;
   }
 }
@@ -2013,7 +2174,7 @@ const BODY_PART_WORDS =
 const DEFINITE_WORDS =
   /^(?:floor|ground|sky|sea|ocean|horizon|sun|moon|window|door|wall|bed|couch|sofa|table|desk|counter|stairs|street|beach|grass|water|rain|snow|mirror|camera|viewer)$/u;
 const ARTICLE_TRIGGER_PATTERN =
-  /\b(holding|carrying|drinking|eating|reading|writing|using|hugging|on|in|at|against|by|near|under|behind|beside|inside|onto|into|over|across|toward|towards|to)\s+([a-z][\w'-]*)/gu;
+  /\b(holding|carrying|drinking|eating|reading|writing|using|hugging|on|in|at|against|by|near|under|behind|beside|inside|onto|into|over|across|through|toward|towards|to)\s+([a-z][\w'-]*)/gu;
 const ARTICLE_SKIP_WORDS =
   /^(?:a|an|the|her|his|their|its|my|your|our|one|two|three|some|both|each|another|other|all|own|top|front|place|line|time|hand|hands|tiptoes|fours|air|public|focus|frame|view|profile|love|shock|surprise|tears|pain|thought|bed rest)$/u;
 
@@ -2124,25 +2285,30 @@ function splitLeadSentence(text: string): { lead: string; tail: string } {
  * A creator's free text (an appearance, a style) as a photo prompt may carry it, sentence by sentence. Each comma
  * segment is kept or dropped whole, and the dropped ones are reported in `dropped`:
  * - text in any script but Latin. Korean is the common case and is dropped by contract (the settings and builder
- *   screens say so); any other script has already locked the cut upstream (selectPhotoTextForScreening) and is
- *   dropped here regardless, so it can never reach an encoder that reads it;
- * - a body-identity trait or an eating-disorder build, as for tags;
- * - a minor- or student-coded segment ("lolita, flat-chested, childish body", "a high school student"), as for tags.
- *   Prose had no scrub of its own and rendered those verbatim from an appearance.
- * A sheer qualifier loses the word and the garment stays, opaque, as for tags. Pictographs go from every segment.
+ *   screens say so); any other script has been read upstream (selectPhotoTextForScreening) — in a sexual or suggestive
+ *   cut it locked the cut — and is dropped here regardless, so it can never reach an encoder that reads it;
+ * - an eating-disorder build, as for tags;
+ * - a minor- or student-coded segment ("lolita, flat-chested, childish body", "a high school student"), as for tags,
+ *   and both halves of a minor-coded phrase a comma split ("a little, shy girl"). Prose had no scrub of its own and
+ *   rendered those verbatim from an appearance;
+ * - outside an explicit scene, a body-identity trait, as for tags.
+ * Outside an explicit scene a sheer qualifier loses the word and the garment stays, opaque, as for tags. Pictographs go
+ * from every segment.
  */
-function sanitizePhotoSentences(text: string | undefined, dropped: string[]): string[] {
+function sanitizePhotoSentences(text: string | undefined, dropped: string[], explicitScene = false): string[] {
   const sentences: string[] = [];
   for (const segments of splitSceneSentences(stripEmphasisSyntax(text))) {
     const kept: string[] = [];
-    for (const written of segments) {
+    const splitMinor = findSplitMinorPhrases(segments.map(stripPictographs));
+    for (const [index, written] of segments.entries()) {
       const segment = stripPictographs(written);
       const lower = segment.toLowerCase();
-      const opaque = collapseWhitespace(stripSheerQualifiers(segment));
+      const opaque = collapseWhitespace(explicitScene ? segment : stripSheerQualifiers(segment));
       if (
+        splitMinor.has(index) ||
         hasUnverifiableScript(segment) ||
         isMinorOrStudentCodedSceneText(segment) ||
-        IDENTITY_ANATOMY_TRAIT_PATTERN.test(lower) ||
+        (!explicitScene && IDENTITY_ANATOMY_TRAIT_PATTERN.test(lower)) ||
         EATING_DISORDER_BODY_PATTERN.test(lower) ||
         // Nothing left once a bare "sheer" lost its word, or once the pictographs went.
         !/[\p{L}\p{N}]/u.test(opaque)
@@ -2178,8 +2344,8 @@ export function stripEmphasisSyntax(text: string | undefined): string {
 }
 
 /** sanitizePhotoSentences as one line, for the style's lead, tail and ambient defaults. */
-function sanitizePhotoText(text: string | undefined, dropped: string[] = []): string {
-  return sanitizePhotoSentences(text, dropped).join(". ");
+function sanitizePhotoText(text: string | undefined, dropped: string[] = [], explicitScene = false): string {
+  return sanitizePhotoSentences(text, dropped, explicitScene).join(". ");
 }
 
 function stripSheerQualifiers(text: string): string {
@@ -2201,113 +2367,22 @@ export function sanitizePhotorealNegativePrompt(text: string | undefined): strin
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Photo negatives: an allow-list
+// Photo negatives
 // ---------------------------------------------------------------------------------------------------------------
 //
-// A negative prompt is the one piece of photo text the safety floor does not read as a picture, and at any CFG above
-// 1 it steers the sampler away from what it names: "clothing", "denim", "turtleneck", "Kleidung" or "cl0thing" toward
-// an undressed figure, "adulthood", "in her twenties", "25yo" or "breasts" toward a younger one. (Below 1 a negative
-// would become the picture outright; comfyWorkflows never samples there.) A deny-list of such words leaked 70 of 75 a
-// red team tried — every garment, every language, every spelling — so the photo negative is an allow-list instead:
-// only image quality, artefacts, the wrong medium or look, and a few worn extras and skin marks whose absence leaves
-// the same clothed adult (the settings screen offers "glasses, heavy makeup" as its example). Anything else a creator
-// or a cut's negative weight puts there is dropped. Matching is on a normalised key (case, hyphens and underscores,
-// spacing and plurals ignored), so "Low-Res", "lowres" and "low res" are one entry.
-
-/** Standalone quality, artefact and medium terms. */
-const NEGATIVE_QUALITY_TERMS = [
-  // Resolution, focus, noise and compression.
-  "blurry", "blur", "blurred", "motion blur", "out of focus", "unfocused", "soft focus", "lowres", "low res", "low resolution",
-  "low quality", "worst quality", "bad quality", "poor quality", "normal quality", "average quality", "low detail",
-  "lack of detail", "jpeg", "jpeg artifacts", "compression artifacts", "artifacts", "noise", "noisy", "grain", "grainy",
-  "heavy grain", "film grain", "chromatic aberration", "banding", "color banding", "posterization", "moire", "halo",
-  "haloing", "ghosting", "double exposure", "lens flare", "glare", "error", "glitch", "glitched", "corrupted",
-  // Exposure, colour and processing.
-  "overexposed", "underexposed", "overexposure", "underexposure", "oversaturated", "undersaturated", "desaturated",
-  "washed out", "faded", "dull", "dull colors", "flat colors", "color cast", "harsh flash", "flash glare", "red eye",
-  "hdr", "heavy hdr", "oversharpened", "over sharpened", "digital sharpening", "overprocessed", "over processed",
-  "over edited", "over retouched", "retouched", "photoshopped", "beauty filter", "filter", "instagram filter",
-  "airbrushed", "airbrushed skin", "plastic skin", "waxy skin", "smooth skin", "overly smooth skin", "flat lighting",
-  "bad lighting", "harsh lighting", "harsh shadows", "monochrome", "black and white", "grayscale", "sepia",
-  // Framing and overlays.
-  "cropped", "crop", "out of frame", "cut off", "frame", "border", "letterbox", "letterboxed", "vignette", "tilted",
-  "crooked horizon", "fisheye", "perspective distortion", "bad composition", "cluttered background", "busy background",
-  "messy background", "distracting background", "simple background", "plain background", "watermark", "text", "logo",
-  "signature", "username", "artist name", "caption", "subtitles", "words", "letters", "timestamp", "date stamp", "ui",
-  // Wrong medium or look.
-  "anime", "anime style", "cartoon", "illustration", "illustrated", "painting", "oil painting", "watercolor", "drawing",
-  "sketch", "line art", "lineart", "comic", "manga", "cel shading", "2d", "3d", "3d render", "render", "cgi",
-  "digital art", "concept art", "video game", "unreal engine", "octane render", "semi realistic", "stylized", "painterly",
-  "doll", "doll like", "mannequin", "figurine", "toy", "plastic", "wax figure", "artificial", "fake", "unrealistic",
-  "uncanny", "uncanny valley", "amateur", "bad art", "poorly drawn", "ugly", "gross", "morbid", "mutilated",
-  "deformed", "disfigured", "distorted", "distortion", "malformed", "mutated", "mutation", "duplicate", "duplicated",
-  "cloned", "clone", "warped", "stretched", "squashed", "bad anatomy", "anatomical errors", "bad proportions",
-  "gross proportions", "long neck", "elongated", "too many fingers", "extra digit", "fewer digits",
-  // Worn extras and skin marks: leaving them out leaves the same clothed adult.
-  "glasses", "eyeglasses", "sunglasses", "spectacles", "hat", "cap", "beanie", "headwear", "tattoo", "piercing",
-  "freckles", "mole", "beauty mark", "scar", "blemish", "acne", "pimple", "heavy makeup", "thick makeup",
-  "excessive makeup", "too much makeup", "heavy eyeliner", "heavy contouring"
-];
-/** "extra fingers", "deformed hands", "bad face": a defect word with the body part it names. Never the part alone. */
-const NEGATIVE_DEFECT_QUALIFIERS = [
-  "bad", "poor", "poorly drawn", "ugly", "deformed", "malformed", "mutated", "mutation", "distorted", "disfigured",
-  "fused", "extra", "missing", "too many", "fewer", "duplicate", "duplicated", "cloned", "broken", "twisted",
-  "asymmetric", "asymmetrical", "uneven", "crossed", "misaligned", "floating", "disconnected", "wrong", "incorrect",
-  "unnatural", "weird", "strange", "gross", "blurry", "melted"
-];
-const NEGATIVE_DEFECT_PARTS = [
-  "anatomy", "proportion", "body", "body part", "hand", "finger", "thumb", "digit", "limb", "arm", "leg", "foot", "feet",
-  "toe", "face", "facial feature", "feature", "eye", "pupil", "iris", "teeth", "tooth", "mouth", "lip", "ear", "nose",
-  "neck", "head", "joint", "knuckle", "nail", "fingernail", "wrist", "elbow", "knee", "eyebrow", "eyelash"
-];
-
-/** A negative term in the form the vocabulary is keyed by: lowercase, no hyphens, underscores or spaces, singular. */
-function negativeVocabularyKey(term: string): string {
-  return term
-    .toLowerCase()
-    .replace(/artefact/gu, "artifact")
-    .replace(/colour/gu, "color")
-    .replace(/greyscale/gu, "grayscale")
-    .replace(/[_\p{Pd}]/gu, " ")
-    .replace(/[^\p{L}\p{N}\s]/gu, "")
-    .split(/\s+/u)
-    .filter(Boolean)
-    .map(singularWord)
-    .join("");
-}
-
-/** "fingers" → "finger", "artifacts" → "artifact", "lashes" → "lash"; short words ("ugly", "hdr", "lens") are kept. */
-function singularWord(word: string): string {
-  if (word.length <= 3) {
-    return word;
-  }
-  if (/ies$/u.test(word)) {
-    return `${word.slice(0, -3)}y`;
-  }
-  if (/(?:sh|ch|x|ss)es$/u.test(word)) {
-    return word.slice(0, -2);
-  }
-  return /[^s]s$/u.test(word) ? word.slice(0, -1) : word;
-}
-
-const PHOTO_NEGATIVE_VOCABULARY: ReadonlySet<string> = new Set([
-  ...NEGATIVE_QUALITY_TERMS.map(negativeVocabularyKey),
-  ...NEGATIVE_DEFECT_QUALIFIERS.flatMap((qualifier) => NEGATIVE_DEFECT_PARTS.map((part) => negativeVocabularyKey(`${qualifier} ${part}`)))
-]);
-
-/** True for a term a photo negative may carry (see the allow-list above). */
-export function isPhotoNegativeQualityTerm(term: string): boolean {
-  const key = negativeVocabularyKey(term);
-  return key.length > 0 && PHOTO_NEGATIVE_VOCABULARY.has(key);
-}
+// A negative prompt is the one piece of photo text the floor does not read as a picture, and at any CFG above 1 it
+// steers the sampler away from what it names. (Below 1 a negative would become the picture outright; comfyWorkflows
+// never samples there.) What a creator keeps out of a photo is theirs to say — clothing, censoring and modesty words
+// included: a negative of "clothing" steers toward an undressed adult, which is the routing's business. One direction
+// is not theirs: a negative that steers toward a YOUNGER subject ("adult", "mature", "in her twenties", "25yo",
+// "breasts", "pubic hair", in any language or disguise) is dropped wherever it comes from, so no negative can pull an
+// adult picture toward a child (isPhotoNegativeYouthSteeringTerm). Text in a script no lexicon here can read is
+// dropped for the same reason: nothing can say which way it steers.
 
 /**
- * Comma-list merge for negative prompts: canonical text, NAI and SD weights stripped, case-insensitive dedupe, order
- * kept, and only the allow-listed vocabulary (isPhotoNegativeQualityTerm) kept, whoever wrote it — a preset, the
- * settings, a character, the profile studio's box or a cut's negative weight. A negative of "clothing", "denim",
- * "adult", "breasts" or "in her twenties" steers the sampler toward the nude or younger figure at any CFG above 1,
- * whatever the positive prompt says. "nsfw" or "child" are dropped too: they would become the picture if the guidance
- * were ever inverted, and the picture's safety rests on the positive prompt, which the floor reads.
+ * Comma-list merge for negative prompts: canonical text, pictographs, NAI and SD weights stripped, case-insensitive
+ * dedupe, order kept — and every term that steers toward a younger subject, or that cannot be read, dropped, whoever
+ * wrote it: a preset, the settings, a character, the profile studio's box or a cut's negative weight.
  */
 function mergeNegativePrompts(...lists: Array<string | undefined>): string {
   const seen = new Set<string>();
@@ -2319,7 +2394,7 @@ function mergeNegativePrompts(...lists: Array<string | undefined>): string {
     for (const raw of canonicalizeSceneText(list).split(/[,\n]/u)) {
       const part = normalizeTagText(stripPictographs(raw.replace(/^\s*-?\d+(?:\.\d+)?\s*::/u, "").replace(/^\s*::/u, "").replace(/::\s*$/u, "")));
       const key = part.toLowerCase();
-      if (!part || hasUnverifiableScript(part) || isPhotoNegativeSafeguardTerm(part) || !isPhotoNegativeQualityTerm(part) || seen.has(key)) {
+      if (!part || !/[\p{L}\p{N}]/u.test(part) || hasUnverifiableScript(part) || isPhotoNegativeYouthSteeringTerm(part) || seen.has(key)) {
         continue;
       }
       seen.add(key);

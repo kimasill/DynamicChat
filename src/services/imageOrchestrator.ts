@@ -22,7 +22,9 @@ import {
   createFrameNegativeTags,
   stripConflictingCompositionTags,
   filterTagsForFrame,
+  isGarmentTag,
   normalizeImageCueFrame,
+  readTagBodyRegion,
   resolveImageCueFrame
 } from "./imageFrame";
 import { generateNovelAiImages } from "./novelAiClient";
@@ -30,7 +32,8 @@ import type { NovelAiCharacterReferenceInput } from "./novelAiClient";
 import { resolveNovelAiModelName } from "./novelAiModels";
 import { classifyImageScene } from "./imageSceneClassifier";
 import type { SceneClassification } from "./imageSceneClassifier";
-import { decideImageBackend, describeImageBackendSetupBlock } from "./imageBackendRouting";
+import { decideImageBackend, describeImageBackendSetupBlock, joinFloorReadings, readVerbatimFloorText } from "./imageBackendRouting";
+import type { PhotorealFloorReading } from "./imageBackendRouting";
 import {
   buildPhotorealPrompt,
   describePhotorealStyleForScreening,
@@ -163,13 +166,21 @@ interface PhotorealFigure {
 /** A safety-floor reading of free text: the router's decision on it, and the classification behind it. */
 export interface PhotorealTextScreen {
   decision: ImageBackendDecision;
+  /** The text's own reading. */
   classification: SceneClassification;
+  /**
+   * What the decision was made on: the text's reading joined to the cut it is rendered with (joinFloorReadings), or
+   * the text's own when it was read alone.
+   */
+  reading: SceneClassification;
+  /** The decision takes the text (or the cut it is rendered with) off the photo model. */
+  refused: boolean;
 }
 
 /**
  * Why a profile image may not be a photoreal face reference: it is not a picked profile image (`not_picked`), its
  * record says nothing (`no_record`: no prompt; `unreadable_record`: no word the floor can read), or its prompt tripped
- * the floor (`floor`, with the reading in `screen`).
+ * the floor (`floor`, with the reading in `screen`) — on its own, or read with the cut it would be attached to.
  */
 export interface PhotorealReferenceRefusal {
   kind: "not_picked" | "no_record" | "unreadable_record" | "floor";
@@ -178,16 +189,16 @@ export interface PhotorealReferenceRefusal {
 }
 
 /**
- * A custom workflow's own literal text that the safety floor refuses, and where in the template it sits — or no
- * `literal` when only the template's literals read together trip it (one phrase spread over several nodes).
+ * A custom workflow's own literal text that takes a cut off the photo model, and where in the template it sits — or no
+ * `literal` when only the template's literals read together do (one phrase spread over several nodes).
  */
 export interface CustomWorkflowRefusal extends PhotorealTextScreen {
   literal?: ComfyWorkflowLiteralText;
 }
 
 /**
- * A built graph the safety floor refuses: the reading, and the picture-side text that tripped it — or none, when only
- * the texts read together did (words split across nodes).
+ * A built graph that takes a cut off the photo model: the reading, and the picture-side text that did it — or none,
+ * when only the texts read together did (words split across nodes).
  */
 export interface PhotorealGraphRefusal extends PhotorealTextScreen {
   text?: ComfyWorkflowPictureText;
@@ -334,8 +345,8 @@ export function describeNovelAiSetupBlock(state: AppState): string | undefined {
  * there), routes the COMPOSED result to a backend, and — for a photoreal cut — re-renders that same plan as the
  * photo model's natural-language prompt.
  *
- * `options.backend` is a manual "regenerate with this backend" request; the safety floor in decideImageBackend
- * still beats it. `options.cueKind` is the annotation pass's beat kind (recorded, never decisive).
+ * `options.backend` is a manual "regenerate with this backend" request; the floor in decideImageBackend still beats
+ * it. `options.cueKind` is the annotation pass's beat kind (recorded, never decisive).
  */
 export function planImageJob(
   state: AppState,
@@ -357,31 +368,35 @@ export function planImageJob(
   //
   // And it reads everything a photo prompt can carry, not only the tags. A registered figure's photoreal
   // appearance becomes the subject of the photo prompt, and the style text opens and closes every one of them;
-  // both are free text a creator types, and unread they let "a 15-year-old girl" or "a nude boudoir photograph"
-  // render under an ordinary portrait's routing. They are read even for a cut headed to NovelAI: a forced
-  // regeneration or an availability fallback can still hand it to the photo model.
-  const decided = decideImageBackend(
-    state,
-    classifyImageScene({
-      cueKind,
-      characterTagSets: figures.map((figure) => [figure.characterPrompt.prompt, ...selectPhotoTextForScreening(figure.profile?.photorealPrompt)]),
-      contextTags: [...promptPlan.layers.context, ...promptPlan.layers.userRules],
-      safetyTexts: describePhotorealStyleForScreening(readPhotorealSettings(state)),
-      frame: cueFrame,
-      registeredCharacterCount: scopedCue.characters.length
-    }),
-    { forcedBackend: options.backend }
-  );
-  const draftedPhotoreal = decided.backend === "photoreal" ? createPhotorealJobPlan(state, promptPlan, cueFrame, figures) : undefined;
-  // The last word goes to what is actually sent. A refused photo prompt is re-planned as an ordinary NovelAI cut,
-  // so a locked cut never keeps a photoreal prompt. A custom workflow sends its own literal text with every cut, so
-  // a template the floor refuses sends the cut to NovelAI the same way. And the graph itself is built, as it would
-  // be sent, and read: what the pieces become once a template wraps them is only visible there — and a template that
-  // cannot build this cut at all is found now, rather than as a photoreal cut that fails when it runs.
+  // both are free text a creator types, and unread they would put "a 15-year-old girl" into a sex scene, or render
+  // "a nude boudoir photograph" under a routing that keeps explicit cuts on NovelAI. They are read even for a cut
+  // headed to NovelAI: a forced regeneration or an availability fallback can still hand it to the photo model.
+  const composedClassification = classifyImageScene({
+    cueKind,
+    characterTagSets: figures.map((figure) => [figure.characterPrompt.prompt, ...selectPhotoTextForScreening(figure.profile?.photorealPrompt)]),
+    contextTags: [...promptPlan.layers.context, ...promptPlan.layers.userRules],
+    safetyTexts: describePhotorealStyleForScreening(readPhotorealSettings(state)),
+    frame: cueFrame,
+    registeredCharacterCount: scopedCue.characters.length
+  });
+  // The tag composer drops CJK and Hangul before the plan is classified, so "completely nude, 女子中学生" or "여중생"
+  // in the authored cut would read as an adult nude. The words never reach an encoder, but the cut was written about a
+  // minor: authored text the lexicon cannot read marks the cut unverifiable, which the floor locks only when it is
+  // sexual or suggestive.
+  const classification = hasUnreadableAuthoredText(scopedCue) ? { ...composedClassification, unverifiable: true } : composedClassification;
+  const decided = decideImageBackend(state, classification, { forcedBackend: options.backend });
+  const draftedPhotoreal = decided.backend === "photoreal" ? createPhotorealJobPlan(state, promptPlan, cueFrame, figures, classification) : undefined;
+  // The last word goes to what is actually sent, read together with the cut it draws. A photo prompt that completes
+  // the floor with the cut is re-planned as an ordinary NovelAI cut, so a locked cut never keeps a photoreal prompt;
+  // one that turns the picture explicit re-routes the cut as explicit, which is NovelAI when the user did not tick
+  // that. A custom workflow sends its own literal text with every cut, so its template is read the same way. And the
+  // graph itself is built, as it would be sent, and read: what the pieces become once a template wraps them is only
+  // visible there — and a template that cannot build this cut at all is found now, rather than as a photoreal cut
+  // that fails when it runs.
   const refusal = draftedPhotoreal
-    ? screenFinishedPhotorealPrompt(state, draftedPhotoreal.prompt, decided, options.backend) ??
-      screenPlannedCustomWorkflow(state, draftedPhotoreal.presetId, decided, options.backend) ??
-      screenPlannedPhotorealGraph(state, draftedPhotoreal, decided, options.backend)
+    ? screenFinishedPhotorealPrompt(state, draftedPhotoreal.prompt, decided, options.backend, classification) ??
+      screenPlannedCustomWorkflow(state, draftedPhotoreal.presetId, decided, options.backend, classification) ??
+      screenPlannedPhotorealGraph(state, draftedPhotoreal, decided, options.backend, classification)
     : undefined;
   const routing = refusal ?? decided;
   const photorealPlan = refusal ? undefined : draftedPhotoreal;
@@ -504,19 +519,27 @@ function readCueKind(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+/** Whether the cut as authored (tags, base tags, per-character prompts) holds letters outside the Latin script. */
+function hasUnreadableAuthoredText(cue: ImageCue): boolean {
+  const authored = [...(cue.tags ?? []), ...(cue.baseTags ?? []), ...(cue.characterPrompts ?? []).map((entry) => entry?.prompt ?? "")];
+  return authored.some((text) => typeof text === "string" && /[^\P{L}\p{Script=Latin}]/u.test(text.normalize("NFKC")));
+}
+
 /**
  * The photoreal half of a plan: the preset for this cut, its face references, the natural-language prompt and
  * the payload fields the inspector and the executor read.
  *
  * The prompt is a translation of the SAME composed plan NovelAI would have received — identity, outfit,
  * continuity and frame filtering are already applied — so routing a cut to the photo model never changes what is
- * in it, only how it is drawn.
+ * in it, only how it is drawn. A cut classified explicit (`cut`) reached here because the user routes explicit cuts to
+ * the photo model, so its scene is described as written (buildPhotorealPrompt's explicitScene).
  */
 function createPhotorealJobPlan(
   state: AppState,
   promptPlan: ImagePromptPlan,
   frame: ImageCueFrame | undefined,
-  figures: PhotorealFigure[]
+  figures: PhotorealFigure[],
+  cut: SceneClassification
 ): PhotorealJobPlan {
   const settings = readPhotorealSettings(state);
 
@@ -535,10 +558,11 @@ function createPhotorealJobPlan(
       if (!characterId || !objectKey || candidates.some((candidate) => candidate.characterId === characterId)) {
         return;
       }
-      // A profile image is only as safe as the prompt that drew it. One made before the floor read prose (a
-      // "14-year-old girl in a bikini" studio prompt, rendered and then picked) must not become the face of every
-      // later photo cut, so its prompt is read again before the image is used as a reference.
-      const refused = screenPhotorealReferenceImage(state, image);
+      // A profile image is only as safe as the prompt that drew it. One drawn from a prompt the floor refuses (a
+      // "14-year-old girl in a bikini" studio prompt from before the floor read prose) is the face of no cut, and one
+      // drawn from a minor-coded prompt is never the face of a sexual or suggestive cut; so its prompt is read again,
+      // with this cut, before the image is used as a reference.
+      const refused = screenPhotorealReferenceImage(state, image, cut);
       if (refused) {
         refusedReferences.push({ characterId, reason: refused.reason });
         return;
@@ -596,7 +620,8 @@ function createPhotorealJobPlan(
     extraNegative: characterNegatives.join(", "),
     referenceSyntax: preset.referenceSyntax,
     // Read by the floor with the style (describePhotorealStyleForScreening) before this cut was routed here.
-    womanAppearance: settings.appearancePrompt
+    womanAppearance: settings.appearancePrompt,
+    explicitScene: cut.category === "explicit"
   });
   const files = resolvePhotorealModelFiles(settings, presetId);
   const { width, height } = resolvePhotorealOutputSize(state);
@@ -660,10 +685,20 @@ function resolvePhotorealFigures(state: AppState, promptPlan: ImagePromptPlan): 
 }
 
 /**
- * The safety floor's verdict on free text a photo prompt would carry — a creator's appearance, the prompt a profile
- * image was made from, a prompt typed into the profile studio — or undefined when the floor lets it through. Read
- * as the builder renders it (selectPhotoTextForScreening: prose or a tag list, Korean segments left out), and
- * decided by the router itself, so the floor keeps exactly one definition.
+ * The classifier's reading of free text a photo prompt would carry — a creator's appearance, the prompt a profile image
+ * was made from, a prompt typed into the profile studio — over exactly what the builder would render of it
+ * (selectPhotoTextForScreening: prose or a tag list, Korean segments left out), or undefined when it would render none.
+ */
+export function classifyPhotorealText(text: string | undefined): SceneClassification | undefined {
+  const segments = selectPhotoTextForScreening(text);
+  return segments.length > 0 ? classifyPhotoTexts(segments) : undefined;
+}
+
+/**
+ * The floor's verdict on free text a photo prompt would carry, read on its own, or undefined when the floor lets it
+ * through. Decided by the router itself, so the floor keeps exactly one definition: only text that puts a subject read
+ * as a minor (or one no lexicon can read) into a sexual or suggestive picture is refused. An adult nude passes; where
+ * its cuts render is the routing's call.
  */
 export function screenPhotorealText(state: AppState, text: string | undefined): PhotorealTextScreen | undefined {
   const segments = selectPhotoTextForScreening(text);
@@ -671,22 +706,47 @@ export function screenPhotorealText(state: AppState, text: string | undefined): 
     return undefined;
   }
   const screen = readPhotoPromptText(state, segments);
-  return screen.decision.locked ? screen : undefined;
+  return screen.refused ? screen : undefined;
+}
+
+/** How readPhotoPromptText reads a photo text. */
+interface PhotoTextReading {
+  /**
+   * The cut the text is rendered with. The text's reading is joined to it (joinFloorReadings): a floor whose halves sit
+   * in the text and in the cut trips, and a text that turns the picture explicit re-routes the cut as explicit.
+   */
+  cut?: SceneClassification;
+  /** The backend a manual regeneration named. "photoreal" leaves the floor as the only thing that can refuse. */
+  forcedBackend?: ImageBackendId;
+  /**
+   * The text reaches the encoder as written — a finished photo prompt, a custom workflow's literals, a built graph —
+   * rather than through the builder, which drops what it cannot read (readVerbatimFloorText).
+   */
+  verbatim?: boolean;
 }
 
 /**
- * The one reading behind every photo-text gate: the texts as safety texts of an otherwise empty cut, decided by the
- * router. Callers differ only in WHICH text they hand over — the builder's view of a creator field (Korean segments
- * out, since the builder drops them), or text that goes to the encoder verbatim (all of it).
+ * The one reading behind every photo-text gate: the texts as safety texts of an otherwise empty cut, joined to the cut
+ * they are rendered with when there is one, decided by the router. Read alone, a text is refused only by the floor —
+ * its own category means nothing (a style is not a portrait). Read with its cut, it is refused whenever the joined
+ * reading no longer routes to the photo model: the floor, or a text that makes the cut explicit under a routing that
+ * keeps explicit cuts on NovelAI.
  */
-function readPhotoPromptText(state: AppState, texts: string[], forcedBackend?: ImageBackendId): PhotorealTextScreen {
-  const classification = classifyImageScene({ characterTagSets: [], contextTags: [], safetyTexts: texts, registeredCharacterCount: 0 });
-  return { classification, decision: decideImageBackend(state, classification, { forcedBackend }) };
+function readPhotoPromptText(state: AppState, texts: string[], options: PhotoTextReading = {}): PhotorealTextScreen {
+  const own = classifyPhotoTexts(texts);
+  const classification = options.verbatim ? readVerbatimFloorText(own) : own;
+  const reading = options.cut ? joinFloorReadings(options.cut, classification) : classification;
+  const decision = decideImageBackend(state, reading, { forcedBackend: options.forcedBackend });
+  return { classification, reading, decision, refused: options.cut ? decision.backend !== "photoreal" : decision.locked === true };
+}
+
+function classifyPhotoTexts(texts: string[]): SceneClassification {
+  return classifyImageScene({ characterTagSets: [], contextTags: [], safetyTexts: texts, registeredCharacterCount: 0 });
 }
 
 /**
- * Whether a profile image may be the photoreal face reference — the face every later photo cut of that character is
- * drawn with — or why not. The image is vouched for only by what was recorded when it was picked, so:
+ * Whether a profile image may be the photoreal face reference of `cut` — without a cut, of a cut at all — or why not.
+ * The image is vouched for only by what was recorded when it was picked, so:
  * - its object key must be a picked profile image's (isPickedProfileObjectKey): a benign prompt next to a key that
  *   names a story cut, or any other file, vouches for an image it never described;
  * - a record whose prompt is missing or blank is refused: nothing says what the image shows (hydrate turns a missing
@@ -696,13 +756,17 @@ function readPhotoPromptText(state: AppState, texts: string[], forcedBackend?: I
  *   record only LOOKS like it says something;
  * - the prompt is read like the finished photo prompt, over exactly the text the builder would have carried into
  *   the photo prompt that drew the image (selectPhotoTextForScreening: every segment but Korean ones, which the
- *   builder drops). The planner, the profile studio's face check and the executor all ask here.
+ *   builder drops). A record the floor refuses on its own vouches for no cut. One whose subject reads as a minor — or
+ *   a pupil, or cannot be read — vouches for no sexual or suggestive cut: read with the cut it would be the face of, it
+ *   trips the floor there, and only there. A record that is merely explicit is an adult's and serves any cut. The
+ *   planner, the profile studio's face check and the executor all ask here.
  * The record's negative is not read: no graph samples below CFG 1 (PHOTOREAL_MIN_CFG), so a negative only ever
  * pushes away from what it names, and every negative is cleaned on its way into a graph.
  */
 export function screenPhotorealReferenceImage(
   state: AppState,
-  image: Pick<CharacterProfileImage, "prompt" | "photoPrompt" | "objectKey"> | undefined
+  image: Pick<CharacterProfileImage, "prompt" | "photoPrompt" | "objectKey"> | undefined,
+  cut?: SceneClassification
 ): PhotorealReferenceRefusal | undefined {
   const objectKey = typeof image?.objectKey === "string" ? image.objectKey.trim() : "";
   if (!isPickedProfileObjectKey(objectKey)) {
@@ -719,12 +783,25 @@ export function screenPhotorealReferenceImage(
   if (!segments.some(hasReadablePhotoWord)) {
     return { kind: "unreadable_record", reason: "프로필 이미지를 만든 프롬프트 기록에 읽을 수 있는 영어 단어가 없어 얼굴 참조로 쓰지 않습니다" };
   }
-  const screen = readPhotoPromptText(state, segments);
-  return screen.decision.locked
+  const alone = readPhotoPromptText(state, segments);
+  if (alone.refused) {
+    return {
+      kind: "floor",
+      reason: `프로필 이미지를 만든 프롬프트가 실사 안전 기준(${describeFloorTrip(alone.reading)})에 걸려 얼굴 참조로 쓰지 않습니다`,
+      screen: alone
+    };
+  }
+  if (!cut) {
+    return undefined;
+  }
+  // Forced to the photo model, so that only the floor can refuse: the face a cut is drawn with changes nothing about
+  // where the cut renders.
+  const withCut = readPhotoPromptText(state, segments, { cut, forcedBackend: "photoreal" });
+  return withCut.refused
     ? {
         kind: "floor",
-        reason: `프로필 이미지를 만든 프롬프트가 실사 안전 기준(${describeFloorTrip(screen.classification)})에 걸려 얼굴 참조로 쓰지 않습니다`,
-        screen
+        reason: `프로필 이미지를 만든 프롬프트를 이 컷과 함께 읽으면 실사 안전 기준(${describeFloorTrip(withCut.reading)})에 걸려 이 컷의 얼굴 참조로 쓰지 않습니다`,
+        screen: withCut
       }
     : undefined;
 }
@@ -737,49 +814,53 @@ export function screenPhotorealReferenceImage(
 function hasReadablePhotoWord(text: string): boolean {
   return text
     .normalize("NFKC")
-    .split(/[\s,;:.!?()"'\u2018\u2019\u201c\u201d\u2013\u2014/]+/u)
+    .split(/[\s,;:.!?()"'‘’“”–—/]+/u)
     .some((token) => /^\p{Script=Latin}{3,}$/u.test(token));
 }
 
 /**
- * The literal text of a custom ComfyUI workflow that the safety floor refuses, one entry per offending input. The
- * template sends that text with every cut — "A fully naked 14 year old girl. %prompt%" turns every clean cut into
+ * The literal text of a custom ComfyUI workflow that takes a cut off the photo model, one entry per offending input.
+ * The template sends that text with every cut — "A fully naked 14 year old girl. %prompt%" turns every clean cut into
  * that picture — and the text reaches the encoder as written, so it is read like a finished photo prompt (Korean
- * included: nothing strips it). Each literal is read whole, placeholders taken out (so a phrase split around
- * %prompt% still reads as one), and piece by piece; then, when no single literal trips it, all of them together,
- * since a template can spread one phrase over encoders whose conditionings the sampler combines ("She is a girl" in
- * one node, "of twelve" in another). The built graph is read the same way at plan time and dispatch
- * (screenBuiltPhotorealWorkflow); reading it here too lets the settings screen say so.
+ * included: nothing strips it). Each literal is read whole, placeholders taken out (so a phrase split around %prompt%
+ * still reads as one), and piece by piece; then, when no single literal trips it, all of them together, since a
+ * template can spread one phrase over encoders whose conditionings the sampler combines ("She is a girl" in one node,
+ * "of twelve" in another). Read alone (the settings screen) only the floor refuses; read with the `cut` it would draw,
+ * a literal that makes the cut explicit re-routes it too. The built graph is read the same way at plan time and
+ * dispatch (screenBuiltPhotorealWorkflow); reading it here too lets the settings screen say so.
  */
 export function screenCustomWorkflowTemplate(
   state: AppState,
   workflowJson: string | undefined,
-  forcedBackend?: ImageBackendId
+  forcedBackend?: ImageBackendId,
+  cut?: SceneClassification
 ): CustomWorkflowRefusal[] {
   if (typeof workflowJson !== "string" || !workflowJson.trim()) {
     return [];
   }
+  const read = (texts: string[]) => readPhotoPromptText(state, texts, { cut, forcedBackend, verbatim: true });
   const literals = listCustomWorkflowLiteralTexts(workflowJson);
   const refusals = literals.flatMap((literal): CustomWorkflowRefusal[] => {
-    const screen = readPhotoPromptText(state, [literal.text, ...literal.fragments], forcedBackend);
-    return screen.decision.locked ? [{ ...screen, literal }] : [];
+    const screen = read([literal.text, ...literal.fragments]);
+    return screen.refused ? [{ ...screen, literal }] : [];
   });
   if (refusals.length > 0 || literals.length < 2) {
     return refusals;
   }
-  const joined = readPhotoPromptText(state, [literals.map((literal) => literal.text).join(" ")], forcedBackend);
-  return joined.decision.locked ? [joined] : [];
+  const joined = read([literals.map((literal) => literal.text).join(" ")]);
+  return joined.refused ? [joined] : [];
 }
 
 /**
  * Everything wrong with a custom workflow template, in the settings screen's Korean: its structure
- * (validateCustomWorkflowTemplate) and its own words read by the safety floor. A template with either kind of error
- * is never used — the planner routes its cuts to NovelAI and the executor refuses to send it.
+ * (validateCustomWorkflowTemplate) and its own words read by the floor. A template with either kind of error is never
+ * used — the planner routes its cuts to NovelAI and the executor refuses to send it. Words a user may route (adult
+ * nudity in a template) are not an error here: each cut they would draw is routed as explicit when it is planned.
  */
 export function validatePhotorealCustomWorkflow(state: AppState, workflowJson: string): string[] {
   const floorErrors = screenCustomWorkflowTemplate(state, workflowJson).map(
     (refusal) =>
-      `${describeWorkflowLiteralLocation(refusal.literal)}: 실사 안전 기준(${describeFloorTrip(refusal.classification)})에 걸리는 고정 문구가 있어 이 워크플로는 쓰지 않습니다.`
+      `${describeWorkflowLiteralLocation(refusal.literal)}: 실사 안전 기준(${describeFloorTrip(refusal.reading)})에 걸리는 고정 문구가 있어 이 워크플로는 쓰지 않습니다.`
   );
   return [...validateCustomWorkflowTemplate(workflowJson), ...floorErrors];
 }
@@ -789,38 +870,46 @@ function describeWorkflowLiteralLocation(literal: ComfyWorkflowLiteralText | und
 }
 
 /** Which part of the floor tripped, in a few words, for messages that are not about a scene. */
-function describeFloorTrip(classification: SceneClassification): string {
-  if (classification.category === "explicit") {
-    return "노출·성적 표현";
-  }
-  if (classification.minorCoded) {
-    return "미성년";
-  }
-  if (classification.schoolCoded && classification.suggestive) {
-    return "학생·교복과 노출";
-  }
-  return classification.unverifiable ? "확인할 수 없는 영문 외 문자" : "안전 기준";
+function describeFloorTrip(reading: PhotorealFloorReading): string {
+  const subject = reading.minorCoded
+    ? "미성년으로 읽히는 인물"
+    : reading.schoolCoded
+      ? "학생·교복"
+      : reading.unverifiable
+        ? "확인할 수 없는 영문 외 문자"
+        : "미성년으로 읽히는 인물";
+  return `${subject} + 성적·노출 장면`;
 }
 
-/** The planner's half of the custom-workflow rule: a cut on a template the floor refuses becomes a locked NovelAI cut. */
+/**
+ * What a planning screen did to the cut, as the head of the routing reason: locked it to NovelAI on the floor, or
+ * re-routed it as the explicit cut the text made it. `what` names the text, with its subject particle.
+ */
+function describeScreenRefusal(screen: PhotorealTextScreen, what: string): string {
+  return screen.decision.locked
+    ? `${what} 실사 안전 기준에 걸려 NovelAI로 바꿨습니다`
+    : `${what} 이 컷을 성적·노출 장면으로 만들어 '성적 장면 · 노출' 설정에 따라 다시 라우팅했습니다`;
+}
+
+/** The planner's half of the custom-workflow rule: a cut its template takes off the photo model is re-planned on NovelAI. */
 function screenPlannedCustomWorkflow(
   state: AppState,
   presetId: PhotorealWorkflowPresetId,
   routing: ImageBackendDecision,
-  forcedBackend?: ImageBackendId
+  forcedBackend: ImageBackendId | undefined,
+  cut: SceneClassification
 ): ImageBackendDecision | undefined {
   if (presetId !== "custom") {
     return undefined;
   }
-  const [refusal] = screenCustomWorkflowTemplate(state, readPhotorealSettings(state).customWorkflow, forcedBackend);
+  const [refusal] = screenCustomWorkflowTemplate(state, readPhotorealSettings(state).customWorkflow, forcedBackend, cut);
   if (!refusal) {
     return undefined;
   }
   return {
     ...refusal.decision,
-    category: routing.category,
     mode: routing.mode,
-    reason: `사용자 워크플로의 고정 문구가 실사 안전 기준에 걸려 NovelAI로 바꿨습니다 (${describeWorkflowLiteralLocation(refusal.literal)}) · ${refusal.decision.reason}`,
+    reason: `${describeScreenRefusal(refusal, "사용자 워크플로의 고정 문구가")} (${describeWorkflowLiteralLocation(refusal.literal)}) · ${refusal.decision.reason}`,
     signals: uniqueStrings([...routing.signals, ...readFloorSignals(refusal.classification).map((signal) => `workflow:${signal}`)])
   };
 }
@@ -830,55 +919,60 @@ function readFloorSignals(classification: SceneClassification): string[] {
 }
 
 /**
- * The last check before a photo prompt leaves the planner: the FINISHED prompt is classified sentence by sentence,
- * and a prompt the floor refuses turns the cut into a locked NovelAI one. Everything in it was read upstream, so
- * this only fires when an upstream reading missed something — a phrase the builder assembled from parts that were
- * harmless apart, a lexicon gap at the tag layer, a new source of text added to the builder later. It exists so
- * that the floor holds on what is sent, whatever the layers before it did.
+ * The last check before a photo prompt leaves the planner: the FINISHED prompt is classified sentence by sentence and
+ * read with the cut it draws (`cut`). A prompt that completes the floor with the cut turns it into a locked NovelAI
+ * one; a prompt that reads explicit where the cut did not re-routes it as explicit. Everything in it was read upstream,
+ * so this only fires when an upstream reading missed something — a phrase the builder assembled from parts that were
+ * harmless apart, a lexicon gap at the tag layer, a new source of text added to the builder later. It exists so that
+ * routing holds on what is sent, whatever the layers before it did. Without a `cut` only the floor refuses.
  */
 export function screenFinishedPhotorealPrompt(
   state: AppState,
   prompt: string,
   routing: ImageBackendDecision,
-  forcedBackend?: ImageBackendId
+  forcedBackend?: ImageBackendId,
+  cut?: SceneClassification
 ): ImageBackendDecision | undefined {
-  const { classification: screen, decision } = readPhotoPromptText(state, [prompt], forcedBackend);
-  if (!decision.locked) {
+  const screen = readPhotoPromptText(state, [prompt], { cut, forcedBackend, verbatim: true });
+  if (!screen.refused) {
     return undefined;
   }
   return {
-    ...decision,
-    // The cut keeps its own category unless the photo prompt itself turned out explicit.
-    category: screen.category === "explicit" ? "explicit" : routing.category,
+    ...screen.decision,
+    // Read alone the prompt has no category of its own; the cut keeps its own unless the prompt is explicit.
+    category: cut ? screen.decision.category : screen.classification.category === "explicit" ? "explicit" : routing.category,
     mode: routing.mode,
-    reason: `완성된 실사 프롬프트가 안전 기준에 걸려 NovelAI로 바꿨습니다 · ${decision.reason}`,
-    signals: uniqueStrings([...routing.signals, ...readFloorSignals(screen).map((signal) => `photo-prompt:${signal}`)])
+    reason: `${describeScreenRefusal(screen, "완성된 실사 프롬프트가")} · ${screen.decision.reason}`,
+    signals: uniqueStrings([...routing.signals, ...readFloorSignals(screen.classification).map((signal) => `photo-prompt:${signal}`)])
   };
 }
 
 /**
- * The floor's reading of a BUILT graph — every picture-side string as it is sent (listPhotorealGraphPictureTexts),
- * Korean included since nothing strips it there — or undefined when the floor lets it through. Each string is read on
- * its own, so a refusal can say where it is, and then all of them together, because a template can spread one phrase
- * over several nodes whose conditionings the sampler combines. The planner and the dispatch both read the graph here.
+ * The reading of a BUILT graph — every picture-side string as it is sent (listPhotorealGraphPictureTexts), Korean
+ * included since nothing strips it there — that takes the cut off the photo model, or undefined when nothing does. Each
+ * string is read on its own, so a refusal can say where it is, and then all of them together, because a template can
+ * spread one phrase over several nodes whose conditionings the sampler combines. Read with the `cut` it draws, like
+ * the finished prompt; the planner and the dispatch both read the graph here.
  */
 export function screenBuiltPhotorealWorkflow(
   state: AppState,
   workflow: ComfyApiWorkflow,
-  forcedBackend?: ImageBackendId
+  forcedBackend?: ImageBackendId,
+  cut?: SceneClassification
 ): PhotorealGraphRefusal | undefined {
+  const read = (text: string) => readPhotoPromptText(state, [text], { cut, forcedBackend, verbatim: true });
   const texts = listPhotorealGraphPictureTexts(workflow);
   for (const text of texts) {
-    const screen = readPhotoPromptText(state, [text.text], forcedBackend);
-    if (screen.decision.locked) {
+    const screen = read(text.text);
+    if (screen.refused) {
       return { ...screen, text };
     }
   }
   if (texts.length < 2) {
     return undefined;
   }
-  const joined = readPhotoPromptText(state, [texts.map((text) => text.text).join(" ")], forcedBackend);
-  return joined.decision.locked ? joined : undefined;
+  const joined = read(texts.map((text) => text.text).join(" "));
+  return joined.refused ? joined : undefined;
 }
 
 function describeGraphTextLocation(refusal: PhotorealGraphRefusal): string {
@@ -889,16 +983,17 @@ function describeGraphTextLocation(refusal: PhotorealGraphRefusal): string {
 
 /**
  * The planner's half of the built-graph rule. The graph is built exactly as the executor will build it (same
- * preparation, no network) and read; a refusal makes the cut a locked NovelAI one, like every other photo refusal.
- * A graph that cannot be built at all — a custom template that breaks a structural rule (a %steps% inside a sentence,
- * a CFG below 1, a file LoadImage) or needs more face references than this cut has — is the same kind of refusal:
- * a photoreal cut that can only fail when it runs is better planned on NovelAI now, with the reason on it.
+ * preparation, no network) and read with the cut; a refusal re-plans the cut on NovelAI, like every other photo
+ * refusal. A graph that cannot be built at all — a custom template that breaks a structural rule (a %steps% inside a
+ * sentence, a CFG below 1, a file LoadImage) or needs more face references than this cut has — is the same kind of
+ * refusal: a photoreal cut that can only fail when it runs is better planned on NovelAI now, with the reason on it.
  */
 function screenPlannedPhotorealGraph(
   state: AppState,
   plan: PhotorealJobPlan,
   routing: ImageBackendDecision,
-  forcedBackend?: ImageBackendId
+  forcedBackend: ImageBackendId | undefined,
+  cut: SceneClassification
 ): ImageBackendDecision | undefined {
   let workflow: ComfyApiWorkflow;
   try {
@@ -924,15 +1019,14 @@ function screenPlannedPhotorealGraph(
       signals: uniqueStrings([...routing.signals, "photo-graph:unbuildable"])
     };
   }
-  const refusal = screenBuiltPhotorealWorkflow(state, workflow, forcedBackend);
+  const refusal = screenBuiltPhotorealWorkflow(state, workflow, forcedBackend, cut);
   if (!refusal) {
     return undefined;
   }
   return {
     ...refusal.decision,
-    category: refusal.classification.category === "explicit" ? "explicit" : routing.category,
     mode: routing.mode,
-    reason: `실사로 보낼 그래프의 글(${describeGraphTextLocation(refusal)})이 안전 기준에 걸려 NovelAI로 바꿨습니다 · ${refusal.decision.reason}`,
+    reason: `${describeScreenRefusal(refusal, `실사로 보낼 그래프의 글(${describeGraphTextLocation(refusal)})이`)} · ${refusal.decision.reason}`,
     signals: uniqueStrings([...routing.signals, ...readFloorSignals(refusal.classification).map((signal) => `photo-graph:${signal}`)])
   };
 }
@@ -1411,10 +1505,11 @@ function createJobImageRequester(
   if (backend === "photoreal") {
     const references = readPlannedPhotorealReferences(job);
     const presetId = readPlannedPhotorealPresetId(job, state, references.length > 0);
+    const cut = readRecordedCut(job);
     return {
       warnings,
       async request(input) {
-        assertPhotorealDispatchAllowed(state, input.prompt, presetId, references);
+        const sent = assertPhotorealDispatchAllowed(state, cut, input.prompt, presetId, references);
         const result = await generatePhotorealImages({
           state,
           prompt: input.prompt,
@@ -1426,7 +1521,7 @@ function createJobImageRequester(
           seed: requestedSeed === undefined ? undefined : requestedSeed + input.requestIndex,
           signal,
           // The very graph that is about to leave, after every substitution — not a rebuild of it.
-          inspectWorkflow: (built) => assertPhotorealGraphAllowed(state, built.workflow)
+          inspectWorkflow: (built) => assertPhotorealGraphAllowed(state, built.workflow, sent)
         });
         assertPhotorealResultHasImages(state, result.dataUrls, input.label);
         return result;
@@ -1459,37 +1554,41 @@ function createJobImageRequester(
 /**
  * The floor's last look at a photoreal request, as it leaves. A job keeps the prompt it was planned with, and a queued
  * one survives a reload — so a cut planned under an older rule set, or one whose face reference has since lost its
- * standing, would otherwise go out exactly as planned. Re-read here, against what is live:
+ * standing, would otherwise go out exactly as planned. Re-read here, against what is live, each with the cut the job
+ * was planned as (readRecordedCut):
  * - the prompt being sent, as the finished-prompt gate reads it;
  * - a custom workflow's own text (the template is read when the cut runs, not when it was planned);
- * - each face reference against the character's CURRENT profile image: still that image, still vouched for;
+ * - each face reference against the character's CURRENT profile image: still that image, still vouched for this cut;
  * - and then, as it leaves, the graph all of that was built into (assertPhotorealGraphAllowed, through
  *   generatePhotorealImages' inspectWorkflow).
- * A refusal fails the cut. It is never re-sent to NovelAI on its own: that spends Anlas the user did not ask to spend,
- * and a regeneration re-plans the cut under the current floor anyway.
+ * Only the floor stops a cut here (each reading is forced to the photo model): where the cut renders was decided when
+ * it was planned. A refusal fails the cut. It is never re-sent to NovelAI on its own: that spends Anlas the user did
+ * not ask to spend, and a regeneration re-plans the cut under the current floor anyway. Returns the prompt's reading
+ * with the cut, which the graph is read with.
  */
 function assertPhotorealDispatchAllowed(
   state: AppState,
+  cut: SceneClassification | undefined,
   prompt: string,
   presetId: PhotorealWorkflowPresetId,
   references: PhotorealReferenceInput[]
-): void {
-  const promptScreen = readPhotoPromptText(state, [prompt]);
-  if (promptScreen.decision.locked) {
+): SceneClassification {
+  const promptScreen = readPhotoPromptText(state, [prompt], { cut, forcedBackend: "photoreal", verbatim: true });
+  if (promptScreen.refused) {
     throw new PhotorealDispatchRefusal(
-      `실사 이미지 생성 실패: 이 컷의 실사 프롬프트가 지금의 실사 안전 기준(${describeFloorTrip(promptScreen.classification)})에 걸려 보내지 않았습니다. NovelAI로 저절로 바꾸어 생성하지는 않습니다 — 다시 생성하면 지금 기준으로 다시 계획됩니다.`
+      `실사 이미지 생성 실패: 이 컷의 실사 프롬프트가 지금의 실사 안전 기준(${describeFloorTrip(promptScreen.reading)})에 걸려 보내지 않았습니다. NovelAI로 저절로 바꾸어 생성하지는 않습니다 — 다시 생성하면 지금 기준으로 다시 계획됩니다.`
     );
   }
   if (presetId === "custom") {
-    const [templateRefusal] = screenCustomWorkflowTemplate(state, readPhotorealSettings(state).customWorkflow);
+    const [templateRefusal] = screenCustomWorkflowTemplate(state, readPhotorealSettings(state).customWorkflow, "photoreal", promptScreen.reading);
     if (templateRefusal) {
       throw new PhotorealDispatchRefusal(
-        `실사 이미지 생성 실패: 사용자 워크플로(JSON)의 고정 문구가 실사 안전 기준(${describeFloorTrip(templateRefusal.classification)})에 걸려 보내지 않았습니다 (${describeWorkflowLiteralLocation(templateRefusal.literal)}). 설정에서 워크플로를 고치세요.`
+        `실사 이미지 생성 실패: 사용자 워크플로(JSON)의 고정 문구가 실사 안전 기준(${describeFloorTrip(templateRefusal.reading)})에 걸려 보내지 않았습니다 (${describeWorkflowLiteralLocation(templateRefusal.literal)}). 설정에서 워크플로를 고치세요.`
       );
     }
   }
   for (const reference of references) {
-    const reason = describeStaleReference(state, reference);
+    const reason = describeStaleReference(state, reference, promptScreen.reading);
     if (reason) {
       const name = state.characters.find((character) => character.id === reference.characterId)?.name ?? reference.characterId ?? reference.name;
       throw new PhotorealDispatchRefusal(
@@ -1497,30 +1596,55 @@ function assertPhotorealDispatchAllowed(
       );
     }
   }
+  return promptScreen.reading;
 }
 
 /**
  * The dispatch half of the built-graph rule (screenBuiltPhotorealWorkflow), run on the graph generatePhotorealImages
- * is about to send. The pieces were read already; this reads what they became — template literals, the style and the
- * prompt in one string — and refuses the cut, never re-sending it to NovelAI (see assertPhotorealDispatchAllowed).
+ * is about to send, with the cut it draws. The pieces were read already; this reads what they became — template
+ * literals, the style and the prompt in one string — and refuses the cut on the floor, never re-sending it to NovelAI
+ * (see assertPhotorealDispatchAllowed).
  */
-function assertPhotorealGraphAllowed(state: AppState, workflow: ComfyApiWorkflow): void {
-  const refusal = screenBuiltPhotorealWorkflow(state, workflow);
+function assertPhotorealGraphAllowed(state: AppState, workflow: ComfyApiWorkflow, cut: SceneClassification): void {
+  const refusal = screenBuiltPhotorealWorkflow(state, workflow, "photoreal", cut);
   if (refusal) {
     throw new PhotorealDispatchRefusal(
-      `실사 이미지 생성 실패: 보내려던 실사 그래프의 글(${describeGraphTextLocation(refusal)})이 지금의 실사 안전 기준(${describeFloorTrip(refusal.classification)})에 걸려 보내지 않았습니다. NovelAI로 저절로 바꾸어 생성하지는 않습니다 — 설정의 스타일 문장이나 사용자 워크플로를 확인하세요.`
+      `실사 이미지 생성 실패: 보내려던 실사 그래프의 글(${describeGraphTextLocation(refusal)})이 지금의 실사 안전 기준(${describeFloorTrip(refusal.reading)})에 걸려 보내지 않았습니다. NovelAI로 저절로 바꾸어 생성하지는 않습니다 — 설정의 스타일 문장이나 사용자 워크플로를 확인하세요.`
     );
   }
 }
 
+/**
+ * The cut a queued photoreal job was planned as, rebuilt from its recorded routing (the classification itself is not
+ * stored): its category, and the floor's flags from the signals the classifier recorded beside it — it records one for
+ * every flag that is set. Undefined for a job planned before routing was recorded; its prompt is then read alone.
+ */
+function readRecordedCut(job: ImageGenerationJob): SceneClassification | undefined {
+  const routing = job.routing;
+  if (!routing) {
+    return undefined;
+  }
+  const signals = Array.isArray(routing.signals) ? routing.signals.filter((signal): signal is string => typeof signal === "string") : [];
+  const recorded = (kind: string) => signals.some((signal) => signal.startsWith(`${kind}:`));
+  return {
+    category: routing.category,
+    signals,
+    minorCoded: recorded("minor"),
+    schoolCoded: recorded("school"),
+    suggestive: routing.category === "explicit" || recorded("suggestive"),
+    unverifiable: recorded("unverifiable-script"),
+    humanCount: 0
+  };
+}
+
 /** Why a planned face reference may no longer be sent, or undefined while the character's live profile still vouches for it. */
-function describeStaleReference(state: AppState, reference: PhotorealReferenceInput): string | undefined {
+function describeStaleReference(state: AppState, reference: PhotorealReferenceInput, cut: SceneClassification): string | undefined {
   const image = reference.characterId ? findVisualProfile(state, reference.characterId)?.profileImages?.photoreal : undefined;
   const objectKey = typeof image?.objectKey === "string" ? image.objectKey.trim() : "";
   if (!objectKey || objectKey !== reference.objectKey) {
     return "계획한 뒤 캐릭터의 실사 프로필 이미지가 바뀌었거나 해제되었습니다";
   }
-  return screenPhotorealReferenceImage(state, image)?.reason;
+  return screenPhotorealReferenceImage(state, image, cut)?.reason;
 }
 
 const NOVELAI_REFERENCE_UNAVAILABLE_WARNING =
@@ -2529,7 +2653,7 @@ function composeCharacterPrompt(
   // Wearing state is untouched, so the next wider cut gets the full outfit back.
   const outfit =
     prompt.characterId && !assertsFullNudity(llmTags)
-      ? filterTagsForFrame(resolveCurrentCharacterOutfit(state, prompt.characterId), frame)
+      ? filterTagsForFrame(filterConflictingDefaultOutfitTags(resolveCurrentCharacterOutfit(state, prompt.characterId), llmTags), frame)
       : [];
   // Gender/subject tags lead the caption. Identity used to be appended last, so in a long caption (up to 45
   // authored tags plus continuity and outfit) the one tag that tells NovelAI this figure is a man or a woman
@@ -2567,6 +2691,51 @@ function splitSubjectIdentityTags(identity: string[]): { subject: string[]; rest
     }
   }
   return { subject, rest };
+}
+
+const FULL_BODY_GARMENT_TAG_PATTERN = /\b(?:dress|gown|suit|uniform|kimono|yukata|robe|bodysuit|jumpsuit|overalls?)\b/iu;
+
+function readGarmentCoveredRegions(tag: string): string[] {
+  const bare = stripNovelAiTagWeight(tag);
+  if (FULL_BODY_GARMENT_TAG_PATTERN.test(bare)) {
+    return ["torso", "hips"];
+  }
+  const region = readTagBodyRegion(tag);
+  return region ? [region] : [];
+}
+
+/**
+ * Drops fallback/persisted outfit tags that collide with garments the LLM explicitly authored for this cut on the
+ * same body region (e.g. a cut authoring "white blouse, grey trousers" or "ivory off-shoulder knit, denim mini skirt"
+ * should not also get the character's default "archivist coat" or "tactical bodysuit" injected on top of it).
+ */
+function filterConflictingDefaultOutfitTags(outfitTags: string[], authoredTags: string[]): string[] {
+  if (outfitTags.length === 0 || authoredTags.length === 0) {
+    return outfitTags;
+  }
+  const authoredRegions = new Set<string>();
+  for (const tag of authoredTags) {
+    if (!isGarmentTag(tag)) {
+      continue;
+    }
+    for (const region of readGarmentCoveredRegions(tag)) {
+      authoredRegions.add(region);
+    }
+  }
+  if (authoredRegions.size === 0) {
+    return outfitTags;
+  }
+  const authoredLower = new Set(authoredTags.map((tag) => stripNovelAiTagWeight(tag)));
+  return outfitTags.filter((tag) => {
+    if (authoredLower.has(stripNovelAiTagWeight(tag))) {
+      return true;
+    }
+    if (!isGarmentTag(tag)) {
+      return true;
+    }
+    const regions = readGarmentCoveredRegions(tag);
+    return regions.length === 0 || !regions.some((region) => authoredRegions.has(region));
+  });
 }
 
 function resolveCurrentCharacterOutfit(state: AppState, characterId: string): string[] {

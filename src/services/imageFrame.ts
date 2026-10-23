@@ -72,7 +72,7 @@ const REGION_TAG_PATTERNS: Array<{ region: ImageCueBodyRegion; pattern: RegExp }
   {
     region: "torso",
     pattern:
-      /\b(?:shirt|blouse|t-?shirt|sweater|hoodie|jacket|coat|blazer|vest|cardigan|uniform top|kimono|yukata|robe|dress|gown|apron|bra|bikini top|camisole|tank ?top|crop top|corset|breasts?|cleavage|chest|nipples?|areola|collarbone|shoulders?|back|spine|arms?|elbow|forearm|wrist|hands?|fingers?|nails|armpits?|tie|necktie|bowtie|suspenders|belt buckle|shoulder bag)\b/iu
+      /\b(?:shirt|blouse|t-?shirt|sweater|hoodie|jacket|coat|blazer|vest|cardigan|uniform top|kimono|yukata|robe|dress|gown|apron|bra|bikini top|camisole|tank ?top|crop top|corset|knit|turtleneck|pullover|polo|tunic|poncho|parka|windbreaker|bodysuit|jumpsuit|overalls?|breasts?|cleavage|chest|nipples?|areola|collarbone|shoulders?|back|spine|arms?|elbow|forearm|wrist|hands?|fingers?|nails|armpits?|tie|necktie|bowtie|suspenders|belt buckle|shoulder bag)\b/iu
   },
   {
     region: "hips",
@@ -102,7 +102,7 @@ const FACE_DEPENDENT_PATTERN =
  * deliberately (a close-up that deliberately includes a bloodied arm), so those are left alone.
  */
 const GARMENT_TAG_PATTERN =
-  /\b(?:hat|cap|beret|helmet|hood|headband|hairband|tiara|crown|veil|glasses|sunglasses|goggles|earrings?|necklace|choker|scarf|shirt|blouse|t-?shirt|sweater|hoodie|jacket|coat|blazer|vest|cardigan|uniform|kimono|yukata|robe|dress|gown|apron|bra|camisole|tank ?top|crop top|corset|necktie|bowtie|tie|suspenders|skirt|shorts|pants|trousers|jeans|skinnies|skinny jeans|jeggings|joggers|sweatpants|slacks|chinos|leggings|panties|underwear|thong|briefs|hakama|belt|garter ?belt|thighhighs?|thigh-?highs|stockings|pantyhose|tights|socks|kneehighs?|shoes?|boots?|sneakers|heels|sandals|loafers|slippers|footwear)\b/iu;
+  /\b(?:hat|cap|beret|helmet|hood|headband|hairband|tiara|crown|veil|glasses|sunglasses|goggles|earrings?|necklace|choker|scarf|shirt|blouse|t-?shirt|sweater|hoodie|jacket|coat|blazer|vest|cardigan|uniform|kimono|yukata|robe|dress|gown|apron|bra|camisole|tank ?top|crop top|corset|knit|turtleneck|pullover|polo|tunic|poncho|parka|windbreaker|bodysuit|jumpsuit|overalls?|necktie|bowtie|tie|suspenders|skirt|shorts|pants|trousers|jeans|skinnies|skinny jeans|jeggings|joggers|sweatpants|slacks|chinos|leggings|panties|underwear|thong|briefs|hakama|belt|garter ?belt|thighhighs?|thigh-?highs|stockings|pantyhose|tights|socks|kneehighs?|shoes?|boots?|sneakers|heels|sandals|loafers|slippers|footwear)\b/iu;
 
 export function isGarmentTag(tag: string): boolean {
   return GARMENT_TAG_PATTERN.test(toLowerBare(tag));

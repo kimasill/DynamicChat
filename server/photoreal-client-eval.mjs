@@ -39,7 +39,7 @@ const PHOTOREAL_DEFAULTS = {
   requestMode: "proxy",
   baseUrl: "http://127.0.0.1:8188",
   proxyUrl: "",
-  workflowPreset: "qwen_image_2_1_turbo",
+  workflowPreset: "z_image_turbo",
   referenceWorkflowPreset: "qwen_image_2_1_turbo",
   modelFiles: {},
   steps: 0,
@@ -331,13 +331,13 @@ async function evaluatePhotorealWorkflowSafety(modules) {
   assertCheck(scope, nodesOf(handed.workflow, "CFGGuider")[0]?.inputs?.cfg === 1, "The builder pins the Turbo CFG whatever its caller hands it (7.5 in, 1 out).");
 
   // D: the job's negative is cleaned as it enters the graph — a queued job keeps the negative it was planned with.
-  const steering = "anime, clothes, shirt, pleated skirt, watermark";
+  const steering = "anime, clothes, shirt, pleated skirt, adult, in her twenties, watermark";
   const cleaned = (await dryRun({ cfg: 4 }, "qwen_image_2_1", steering)).payload;
   const sentNegative = String(nodesOf(cleaned.workflow, "TextEncodeQwenImage21")[0]?.inputs?.negative_prompt ?? "");
   assertCheck(
     scope,
-    /\banime\b/u.test(sentNegative) && /\bwatermark\b/u.test(sentNegative) && !/\b(?:clothes|shirt|skirt)\b/iu.test(sentNegative),
-    `A negative that names body-covering clothing reaches the graph without it; the unwanted things stay (${JSON.stringify(sentNegative)}).`
+    sentNegative === "anime, clothes, shirt, pleated skirt, watermark",
+    `A negative that steers toward a younger subject reaches the graph without those words; the user's clothing words and the unwanted things stay (${JSON.stringify(sentNegative)}).`
   );
 
   const template = (overrides = {}) =>
@@ -357,12 +357,12 @@ async function evaluatePhotorealWorkflowSafety(modules) {
   const customSettings = (workflow) => ({ workflowPreset: "custom", customWorkflow: workflow, cfg: 5, modelFiles: { custom: { diffusionModel: "photo.safetensors" } } });
   assertCheck(scope, workflows.validateCustomWorkflowTemplate(template()).length === 0, "A template with %negative_prompt% on the negative side and %model% in its loader validates.");
 
-  const negativeLiteral = template({ "3": { class_type: "CLIPTextEncode", inputs: { clip: ["1", 1], text: "clothes, shirt, %negative_prompt%" } } });
+  const negativeLiteral = template({ "3": { class_type: "CLIPTextEncode", inputs: { clip: ["1", 1], text: "clothes, shirt, adult, %negative_prompt%" } } });
   const customRun = (await dryRun(customSettings(negativeLiteral), "custom", "anime")).payload;
   assertCheck(
     scope,
-    customRun.workflow?.["3"]?.inputs?.text === "anime" && String(customRun.workflow?.["2"]?.inputs?.text).includes("cream wardrobe mirror") && customRun.workflow?.["5"]?.inputs?.cfg === 5,
-    `A custom template's own negative words are cleaned like the job's ("clothes, shirt, %negative_prompt%" → ${JSON.stringify(customRun.workflow?.["3"]?.inputs?.text)}), its picture side is untouched, and it keeps the user's CFG.`
+    customRun.workflow?.["3"]?.inputs?.text === "clothes, shirt, anime" && String(customRun.workflow?.["2"]?.inputs?.text).includes("cream wardrobe mirror") && customRun.workflow?.["5"]?.inputs?.cfg === 5,
+    `A custom template's own negative words are cleaned like the job's ("clothes, shirt, adult, %negative_prompt%" → ${JSON.stringify(customRun.workflow?.["3"]?.inputs?.text)}), its picture side is untouched, and it keeps the user's CFG.`
   );
 
   const negativeIntoPicture = template({ "2": { class_type: "CLIPTextEncode", inputs: { clip: ["1", 1], text: "%prompt%, %negative_prompt%" } } });

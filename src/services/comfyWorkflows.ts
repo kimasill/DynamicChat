@@ -19,14 +19,14 @@ import { sanitizePhotorealNegativePrompt } from "./photorealPrompt";
 // which ComfyUI empties when it starts and when it shuts down, and the relay downloads from there just the same. The
 // image DynamicChat keeps is the copy in its own object store. A custom workflow may still end in SaveImage.
 //
-// What reaches a graph is held to the photoreal safety floor's terms here, whoever built it. Every negative prompt
-// is cleaned (sanitizePhotorealNegativePrompt) as it enters the graph: at a CFG above 1 a negative of "clothing" or
-// "adult" steers the sampler as surely as a positive does, and nothing upstream classifies negatives. No guidance
-// scale is ever below 1 (PHOTOREAL_MIN_CFG): below 1 the sampler moves TOWARD the negative, so the negative — text
-// the floor deliberately does not read — would become the picture. Every image a graph loads is a `%ref:` reference
-// the relay uploads, never a file already in ComfyUI's input folder. And a custom template may only put text the floor
-// never reads (the negative, the model file names, the numbers) where it cannot become the picture's prompt. Screening
-// text needs the floor itself, which lives in the orchestrator: it reads the template's own literals
+// What reaches a graph is held to the photoreal floor's terms here, whoever built it. Every negative prompt is cleaned
+// (sanitizePhotorealNegativePrompt) as it enters the graph: at a CFG above 1 a negative of "adult" or "breasts" steers
+// the sampler toward a younger subject as surely as a positive does, and nothing upstream classifies negatives. No
+// guidance scale is ever below 1 (PHOTOREAL_MIN_CFG): below 1 the sampler moves TOWARD the negative, so the negative —
+// text the floor deliberately does not read — would become the picture. Every image a graph loads is a `%ref:`
+// reference the relay uploads, never a file already in ComfyUI's input folder. And a custom template may only put text
+// the floor never reads (the negative, the model file names, the numbers) where it cannot become the picture's prompt.
+// Screening text needs the floor itself, which lives in the orchestrator: it reads the template's own literals
 // (listCustomWorkflowLiteralTexts) and, because pieces that pass apart can be harmful once joined, every picture-side
 // string of the graph as actually built (listPhotorealGraphPictureTexts).
 
@@ -321,7 +321,7 @@ export function computeReferenceHeadCrop(width: number | undefined, height: numb
   if (!Number.isFinite(width) || !Number.isFinite(height) || !width || !height || width < 256 || height < 256) {
     return undefined;
   }
-  const side = Math.floor(Math.min(width, height * 0.62));
+  const side = Math.floor(Math.min(width, height * 0.45));
   const x = Math.max(0, Math.floor((width - side) / 2));
   const y = Math.min(Math.max(0, Math.floor(height * 0.02)), Math.max(0, height - side));
   return { x, y, width: side, height: side };
@@ -617,16 +617,21 @@ function previewOutputNode(images: [string, number]): ComfyApiWorkflow[string] {
 }
 
 function buildQwenImage21Graph(params: NormalizedParams, turbo: boolean): GraphBuild {
+  const hasReferences = params.references.length > 0;
   const encoderInputs: Record<string, unknown> = {
     clip: link("3"),
     prompt: params.prompt,
     negative_prompt: params.negativePrompt,
-    // Connected even without references (it is only used per image). With it, references are spliced in as
-    // VAE latents — the identity-preserving path; without it the encoder only sees them through the vision tower.
-    vae: link("4"),
-    // Each reference is resized to about 1024x1024 before encoding. The node's 0 ("native size") would let one
-    // large photo blow the KV cache past a 16 GB card.
-    resolution: 1024
+    // Without references, vae stays connected and resolution stays 1024.
+    // With references, ComfyUI's TextEncodeQwenImage21 (comfy_extras/nodes_qwen.py) sets
+    // `keep_vision = len(ref_latents) == 0`: connecting `vae` drops Qwen3-VL's semantic vision tokens
+    // and splices pixel-level 2D-RoPE VAE latents into the DiT, which forces the model to copy-paste the
+    // exact head angle, expression, and pose of <image1> while spilling KV cache on 16 GB GPUs.
+    // Omitting `vae` when references are present keeps `keep_vision = True` through Qwen3-VL's vision tower
+    // at 512px, preserving facial identity and hairstyle while letting pose, expression, outfit, and scene
+    // follow the prompt naturally.
+    ...(hasReferences ? {} : { vae: link("4") }),
+    resolution: hasReferences ? 512 : 1024
   };
   params.references.forEach((_name, index) => {
     encoderInputs[QWEN21_REFERENCE_INPUT_KEY(index + 1)] = referenceImageLink(params, index);
@@ -1087,7 +1092,7 @@ function touchesWordCharacter(text: string, index: number, length: number): bool
 
 /**
  * Cleans the text on a built custom graph's negative side the way the job's own negative was cleaned: the literal
- * words a template wraps around %negative_prompt% ("clothes, %negative_prompt%") steer the sampler just the same.
+ * words a template wraps around %negative_prompt% ("adult, %negative_prompt%") steer the sampler just the same.
  */
 function sanitizeNegativeSideText(workflow: ComfyApiWorkflow): void {
   const pictureSide = readPictureSide(workflow);

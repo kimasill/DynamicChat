@@ -27,6 +27,10 @@
  * apply to NovelAI jobs only; photoreal jobs are held to their own contract (English prose, no NovelAI tokens, a
  * camera sentence when the cut has a frame, every planned face reference named in the prompt).
  *
+ *   E2E_PHOTOREAL_CATEGORIES=portrait,full_body,explicit
+ *                         the categories mixed mode sends photoreal (comma list; unknown names are dropped). Default:
+ *                         the app's default ticks (portrait, full_body, scenery, object). Ticking `explicit` renders
+ *                         the adult sexual cuts photoreal, as the settings screen's checkbox does.
  *   E2E_COMFYUI_URL       ComfyUI base URL (default http://127.0.0.1:8188)
  *   E2E_RELAY_URL         DynamicChat relay (default http://127.0.0.1:8788/photoreal/comfyui — run `npm run api`)
  *   E2E_PHOTOREAL_DISPATCH=all|first
@@ -54,6 +58,9 @@ const turnsPerCadence = Number(process.env.E2E_TURNS ?? 1);
 const cadences = (process.env.E2E_CADENCES ?? "balanced,rich,image_progression").split(",").map((c) => c.trim()).filter(Boolean);
 const skipDispatch = process.env.E2E_SKIP_DISPATCH === "1";
 const photorealMode = ["mixed", "photoreal"].includes(process.env.E2E_PHOTOREAL ?? "") ? process.env.E2E_PHOTOREAL : undefined;
+// Read as written here and resolved by the app's own routing reader (resolveImageBackendRouting) below, so an unknown
+// name is dropped exactly as a hand-edited saved state would have it dropped.
+const photorealCategoryList = (process.env.E2E_PHOTOREAL_CATEGORIES ?? "").split(",").map((category) => category.trim()).filter(Boolean);
 const comfyUiUrl = process.env.E2E_COMFYUI_URL ?? "http://127.0.0.1:8188";
 const relayUrl = process.env.E2E_RELAY_URL ?? "http://127.0.0.1:8788/photoreal/comfyui";
 const photorealDispatchMode = ["all", "first"].includes(process.env.E2E_PHOTOREAL_DISPATCH ?? "") ? process.env.E2E_PHOTOREAL_DISPATCH : undefined;
@@ -85,7 +92,11 @@ const { executeImageJob } = await vite.ssrLoadModule("/src/services/imageOrchest
 // hand-written "footwear" regex got this wrong first time: thighhighs, stockings and socks are LEG
 // garments, so a cowboy shot — which shows legs but not feet — keeps them correctly.
 const { readTagBodyRegion, isGarmentTag } = await vite.ssrLoadModule("/src/services/imageFrame.ts");
-const { DEFAULT_PHOTOREAL_CATEGORIES } = await vite.ssrLoadModule("/src/services/imageBackendRouting.ts");
+const { DEFAULT_PHOTOREAL_CATEGORIES, resolveImageBackendRouting } = await vite.ssrLoadModule("/src/services/imageBackendRouting.ts");
+const photorealCategories =
+  photorealCategoryList.length > 0
+    ? resolveImageBackendRouting({ backendRouting: { mode: "mixed", photorealCategories: photorealCategoryList } }).photorealCategories
+    : [...DEFAULT_PHOTOREAL_CATEGORIES];
 const { PHOTOREAL_WORKFLOW_PRESETS } = await vite.ssrLoadModule("/src/services/comfyWorkflows.ts");
 const { freeComfyUiMemory, probeComfyUi } = await vite.ssrLoadModule("/src/services/comfyUiClient.ts");
 const { createLocalGpuCoordinator } = await vite.ssrLoadModule("/src/services/localGpuCoordinator.ts");
@@ -142,7 +153,7 @@ function freshState(cadence) {
       triggerMode: "realtime_auto",
       generationCadence: cadence,
       cooldownTurns: 0,
-      ...(photorealMode ? { backendRouting: { mode: photorealMode, photorealCategories: [...DEFAULT_PHOTOREAL_CATEGORIES] } } : {})
+      ...(photorealMode ? { backendRouting: { mode: photorealMode, photorealCategories: [...photorealCategories] } } : {})
     }
   });
 }
@@ -353,7 +364,8 @@ console.log(`\n────────── 큐 → NovelAI 호출 ───�
 if (skipDispatch) {
   console.log("  E2E_SKIP_DISPATCH=1 — 네트워크 호출 건너뜀");
 } else if (!dispatched && photorealMode) {
-  // In photoreal routing only locked cuts stay on NovelAI, and a run without one has nothing to send there.
+  // In photoreal routing only the floor's cuts (a minor-coded subject in a sexual scene) stay on NovelAI, and a run
+  // without one has nothing to send there.
   console.log(`  SKIP: E2E_PHOTOREAL=${photorealMode} 에서 NovelAI로 라우팅된 컷이 없어 NovelAI 호출 구간을 건너뜀`);
 } else if (!dispatched) {
   check("dispatch", false, "디스패치할 작업이 없음");
@@ -380,7 +392,7 @@ if (skipDispatch) {
 }
 
 if (photorealMode) {
-  console.log(`\n────────── 실사 (${photorealMode}) ──────────`);
+  console.log(`\n────────── 실사 (${photorealMode}${photorealMode === "mixed" ? `: ${photorealCategories.join(", ")}` : ""}) ──────────`);
   console.log(
     `  계획된 실사 컷 ${photorealStats.planned}개` +
       (photorealDispatch

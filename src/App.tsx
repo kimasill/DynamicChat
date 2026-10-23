@@ -83,7 +83,7 @@ import {
 import { generateAssistantText, isLlmAbortedError, setActiveTurnAbortSignal } from "./services/llmClient";
 import { LLM_PROVIDER_GROUP_LABELS, LLM_PROVIDER_PRESETS, type LlmProviderPreset } from "./services/llmProviders";
 import { describeImageCueFrame, normalizeImageCueFrame } from "./services/imageFrame";
-import { IMAGE_SCENE_CATEGORY_OPTIONS, resolveImageBackendRouting } from "./services/imageBackendRouting";
+import { IMAGE_SCENE_CATEGORY_OPTIONS, PHOTOREAL_FLOOR_DESCRIPTION, resolveImageBackendRouting } from "./services/imageBackendRouting";
 import {
   COMFY_CUSTOM_PLACEHOLDERS,
   PHOTOREAL_MIN_CFG,
@@ -288,7 +288,7 @@ const imageBackendBadgeLabels: Record<ImageBackendId, string> = {
 const imageBackendRoutingModeOptions: Array<{ value: ImageBackendRoutingMode; label: string; detail: string }> = [
   { value: "novelai", label: "NAI만", detail: "모든 컷을 NovelAI로" },
   { value: "mixed", label: "장면별 혼합", detail: "고른 장면만 실사" },
-  { value: "photoreal", label: "전부 실사", detail: "성적 장면은 NovelAI" }
+  { value: "photoreal", label: "전부 실사", detail: "모든 컷을 실사로" }
 ];
 // Precise Reference exists only on these two; every other preset draws the cut without the face reference.
 const novelAiCharacterReferencePresets: ReadonlySet<NovelAiModelPreset> = new Set<NovelAiModelPreset>(["NAID4.5F", "NAID4.5C"]);
@@ -8915,17 +8915,19 @@ interface ImageBackendSetupNotice {
 /**
  * What the image routing promises that the connected backends cannot deliver, judged per ROUTED backend. Routing
  * names where cuts want to go; an off backend hands its cuts to the other one when that one is on (so the cut
- * still renders, just not as the screen implies), and with both off nothing renders at all. Safety-locked cuts
- * never move to photoreal, so NovelAI being off matters even in 전부 실사 — but that is only worth a standing
- * notice where such cuts are expected (19+); elsewhere the cut's own marker explains it.
+ * still renders, just not as the screen implies), and with both off nothing renders at all. The one kind of cut that
+ * never moves to photoreal is the floor's (a minor-coded figure in a sexual or exposing scene); no simulation is
+ * expected to produce those, so they get no standing notice — the cut's own marker says why it waits.
  */
 function describeImageBackendSetupNotices(state: AppState): ImageBackendSetupNotice[] {
   const routing = resolveImageBackendRouting(state.imageProfile);
   const novelAiOn = state.novelAi?.enabled === true;
   const photorealOn = state.photoreal?.enabled === true;
   const wantsPhotoreal = routing.mode === "photoreal" || (routing.mode === "mixed" && routing.photorealCategories.length > 0);
-  const wantsNovelAi = routing.mode !== "photoreal";
-  const lockedCutNote = "성적 장면처럼 NovelAI로 고정된 컷은 NovelAI를 켜야 생성되고, 그 전까지는 대기합니다.";
+  const wantsNovelAi =
+    routing.mode === "novelai" ||
+    (routing.mode === "mixed" && IMAGE_SCENE_CATEGORY_OPTIONS.some((option) => !routing.photorealCategories.includes(option.id)));
+  const floorCutNote = "미성년으로 읽히는 인물(학생·교복 포함)이 성적·노출 장면에 있는 컷만 실사로 생성하지 않으므로, 그런 컷은 NovelAI를 켤 때까지 대기합니다.";
 
   if (!novelAiOn && !photorealOn) {
     if (wantsPhotoreal && wantsNovelAi) {
@@ -8964,15 +8966,18 @@ function describeImageBackendSetupNotices(state: AppState): ImageBackendSetupNot
       backends: ["photoreal"]
     });
   }
-  if (!novelAiOn && routing.mode === "novelai") {
+  // Mixed mode counts too: the scenes left unticked — sexual scenes by default — were routed to NovelAI on purpose, and
+  // with NovelAI off they render photoreal by fallback, which the creator should hear before the first such cut.
+  if (!novelAiOn && wantsNovelAi) {
     notices.push({
       id: "novelai-fallback",
-      title: "NovelAI가 꺼져 있어 'NAI만' 모드의 컷을 실사로 대신 생성합니다.",
-      detail: lockedCutNote,
+      title:
+        routing.mode === "novelai"
+          ? "NovelAI가 꺼져 있어 'NAI만' 모드의 컷을 실사로 대신 생성합니다."
+          : "NovelAI가 꺼져 있어 실사로 고르지 않은 장면도 실사로 대신 생성합니다.",
+      detail: floorCutNote,
       backends: ["novelai"]
     });
-  } else if (!novelAiOn && state.simulation.contentRating === "adult_19") {
-    notices.push({ id: "novelai-locked", title: "성적 장면은 실사로 생성하지 않습니다.", detail: lockedCutNote, backends: ["novelai"] });
   }
   return notices;
 }
@@ -11986,6 +11991,31 @@ function CreateSimulationPage({
               </div>
               <div className="settings-section">
                 <SectionTitle icon={<Sparkles size={16} />} title="실사 스타일" />
+                <label className="checkline">
+                  <input
+                    type="checkbox"
+                    checked={
+                      draft.photoreal.enabled &&
+                      draft.photoreal.stylePreset === "daily_look" &&
+                      draft.photoreal.workflowPreset === "z_image_turbo"
+                    }
+                    onChange={(event) => {
+                      if (event.target.checked) {
+                        updatePhotoreal({
+                          enabled: true,
+                          stylePreset: "daily_look",
+                          workflowPreset: "z_image_turbo",
+                          referenceWorkflowPreset: "qwen_image_2_1_turbo",
+                          width: 960,
+                          height: 1280
+                        });
+                      } else {
+                        updatePhotoreal({ stylePreset: "cinematic" });
+                      }
+                    }}
+                  />
+                  핀터레스트 데일리룩 사진 톤 켜기 (DNC 감성 · Z-Image Turbo 960×1280)
+                </label>
                 <label>
                   스타일 프리셋
                   <select
@@ -13388,15 +13418,16 @@ function CharacterProfileImagePanel({
             : "실사 테스트는 이 PC의 ComfyUI에서 생성되어 비용이 들지 않습니다. 첫 생성은 모델을 불러오느라 더 걸립니다."}
         </p>
         {/* Same availability rule as decideImageBackend: 'NAI만' keeps story cuts off 실사 only while NovelAI is on. With
-            NovelAI off and 실사 on, every cut the safety floor does not lock falls back to 실사 — the seed's local-only
-            setup — so saying "실사가 쓰이지 않습니다" there was the opposite of what happens. */}
+            NovelAI off and 실사 on, every cut the floor does not lock falls back to 실사 — the seed's local-only setup —
+            so saying "실사가 쓰이지 않습니다" there was the opposite of what happens. */}
         {backend === "photoreal" && routingMode === "novelai" && draft.novelAi.enabled ? (
           <p className="runtime-hint">
             지금 이미지 라우팅이 'NAI만'이라 이야기 컷에는 실사가 쓰이지 않습니다. 이미지/연동 탭의 '실사 라우팅'에서 바꿀 수 있습니다.
           </p>
         ) : backend === "photoreal" && routingMode === "novelai" && draft.photoreal.enabled ? (
           <p className="runtime-hint">
-            이미지 라우팅은 'NAI만'이지만 NovelAI가 꺼져 있어, 안전 정책상 NovelAI로 고정된 컷을 뺀 이야기 컷은 실사로 생성됩니다.
+            이미지 라우팅은 'NAI만'이지만 NovelAI가 꺼져 있어 이야기 컷은 실사로 생성됩니다. 미성년으로 읽히는 인물(학생·교복 포함)이
+            성적·노출 장면에 있는 컷만 예외입니다.
           </p>
         ) : null}
         <div className="profile-studio-actions">
@@ -13518,8 +13549,9 @@ function ProfileImageSlot({
 }
 
 /**
- * A test the planner refused before anything ran — the photoreal safety floor, most often. Worded as "not started"
- * rather than as a failure: nothing was sent and nothing was spent, and what has to change is the request.
+ * A test the planner refused before anything ran — the photoreal floor (a figure read as a minor in a sexual or
+ * exposing scene), most often. Worded as "not started" rather than as a failure: nothing was sent and nothing was
+ * spent, and what has to change is the request.
  */
 function ProfileStudioRefusalNote({ refusal }: { refusal: ProfileStudioRefusal }) {
   const subject = refusal.variant === "reference_check" ? "얼굴 고정 테스트" : `${imageBackendLabels[refusal.backend]} 테스트`;
@@ -13532,31 +13564,32 @@ function ProfileStudioRefusalNote({ refusal }: { refusal: ProfileStudioRefusal }
 }
 
 /**
- * What the photoreal safety floor will do with free text a creator types for the photo side, worded for a note under
- * the field, or undefined when the text passes. The planner reads the same text on every cut — a character's 실사
- * 외형 with each cut that character is in, the style text with every cut — through the same screen, and a text the
- * floor refuses sends those cuts to NovelAI instead (or leaves them unrendered while NovelAI is off). Nothing is
- * blocked or rewritten here: the note only says, while the creator can still reword it, what routing will do anyway.
+ * What the photoreal floor will do with free text a creator types for the photo side, worded for a note under the
+ * field, or undefined when the text passes. The planner reads the same text on every cut — a character's 실사 외형
+ * with each cut that character is in, the style text with every cut — through the same screen, and a text the floor
+ * refuses sends those cuts to NovelAI instead (or leaves them unrendered while NovelAI is off). The floor is the one
+ * line routing does not leave to the creator: a figure read as a minor (students and school uniforms included) in a
+ * sexual or exposing scene. Adult nudity and sexual wording pass here — where those cuts go is the routing's call.
+ * Nothing is blocked or rewritten here: the note only says, while the creator can still reword it, what routing will
+ * do anyway.
  */
 function describePhotorealTextLock(state: AppState, text: string | undefined, scope: "appearance" | "style"): string | undefined {
   const screen = screenPhotorealText(state, text);
   if (!screen) {
     return undefined;
   }
-  const { classification } = screen;
-  // Letters no lexicon can read (kana, Chinese, Cyrillic look-alikes) lock a cut as surely as an explicit word, but
-  // the way out is different: the same description in English.
-  const unreadableOnly =
-    classification.unverifiable === true &&
-    classification.category !== "explicit" &&
-    !classification.minorCoded &&
-    !(classification.schoolCoded && classification.suggestive);
+  // The reading the router decided on (for a text read alone, the text's own).
+  const classification = screen.reading;
+  // A sexual scene written in letters no lexicon can read (kana, Chinese, Cyrillic look-alikes) is held back because
+  // the age in it cannot be checked, not because a minor was found, and the way out is different: the same
+  // description in English.
+  const unreadableOnly = classification.unverifiable === true && !classification.minorCoded && !classification.schoolCoded;
   const subject = scope === "appearance" ? "이 실사 외형" : "이 스타일 문장";
   const consequence = scope === "appearance" ? "이 캐릭터가 나오는 컷은 실사 대신 NovelAI로 생성됩니다." : "실사로 갈 컷이 모두 NovelAI로 넘어갑니다.";
   return [
     unreadableOnly
-      ? `${subject}에는 확인할 수 없는 문자(영문 외 문자)가 있어, ${consequence} 영어로 적어 주세요.`
-      : `${subject}은 실사 안전 기준(미성년·노출·성적 표현)에 걸려, ${consequence}`,
+      ? `${subject}에는 확인할 수 없는 문자(영문 외 문자)가 성적·노출 표현과 함께 있어 나이를 확인할 수 없으므로, ${consequence} 영어로 적어 주세요.`
+      : `${subject}은 미성년으로 읽히는 인물(학생·교복 포함)이 성적·노출 장면에 있는 것으로 읽혀, ${consequence} 이 경우만은 설정과 관계없이 실사로 생성하지 않습니다.`,
     state.novelAi.enabled ? undefined : "지금은 NovelAI가 꺼져 있어 그 컷은 생성되지 않습니다."
   ]
     .filter(Boolean)
@@ -13573,7 +13606,7 @@ function createDraftScreeningState(draft: Pick<SimulationDraft, "imageProfile" |
 }
 
 /**
- * The safety floor's verdict on a photo-side text field, shown under that field (describePhotorealTextLock). Read
+ * The photoreal floor's verdict on a photo-side text field, shown under that field (describePhotorealTextLock). Read
  * once typing pauses, so it does not flicker in and out mid-word. The region is always mounted and polite: a screen
  * reader hears the note when it appears or changes, and the field points at it, without an interruption per key.
  */
@@ -13826,35 +13859,38 @@ function describeImageBackendRoutingSummary(
   availability: { novelAiEnabled: boolean; photorealEnabled: boolean }
 ): string {
   const tickedLabels = routing.photorealCategories
-    .filter((category) => category !== "explicit")
     .map((category) => getImageSceneCategoryLabel(category))
     .filter((label): label is string => Boolean(label));
+  const routesToPhotoreal = routing.mode === "photoreal" || (routing.mode === "mixed" && tickedLabels.length > 0);
   const base =
     routing.mode === "novelai"
       ? "모든 컷을 NovelAI로 생성합니다."
       : routing.mode === "photoreal"
-        ? "모든 컷을 실사로 생성하고, 성적 장면과 미성년으로 보일 수 있는 장면만 NovelAI로 생성합니다."
+        ? "모든 컷을 실사로 생성합니다."
         : tickedLabels.length === 0
           ? "실사로 보낼 장면을 고르지 않아 모든 컷을 NovelAI로 생성합니다."
-          : `${tickedLabels.join(", ")} 장면은 실사로, 나머지는 NovelAI로 생성합니다. 성적 장면은 항상 NovelAI입니다.`;
-  const routesToPhotoreal = routing.mode === "photoreal" || (routing.mode === "mixed" && tickedLabels.length > 0);
+          : `${tickedLabels.join(", ")} 장면은 실사로, 나머지는 NovelAI로 생성합니다.`;
+  // The one rule no tick changes is said whenever routing sends anything to 실사, in the router's own words.
+  const routed = routesToPhotoreal ? `${base} ${PHOTOREAL_FLOOR_DESCRIPTION}.` : base;
   if (routesToPhotoreal && !availability.photorealEnabled) {
-    return `${base} ${availability.novelAiEnabled ? "지금은 실사(ComfyUI) 연동이 꺼져 있어 NovelAI로 대신 생성합니다." : "실사(ComfyUI) 연동을 켜야 생성됩니다."}`;
+    return `${routed} ${availability.novelAiEnabled ? "지금은 실사(ComfyUI) 연동이 꺼져 있어 NovelAI로 대신 생성합니다." : "실사(ComfyUI) 연동을 켜야 생성됩니다."}`;
   }
   if (!availability.novelAiEnabled && availability.photorealEnabled && routing.mode !== "photoreal") {
-    return `${base} 지금은 NovelAI가 꺼져 있어, 안전 정책상 NovelAI로 고정된 컷을 뺀 나머지를 실사로 대신 생성합니다.`;
+    // Everything now reaches 실사 but the floor's cuts, so the floor is said once, as the reason those wait.
+    return `${base} 지금은 NovelAI가 꺼져 있어 NovelAI로 갈 컷도 실사로 대신 생성합니다. 미성년으로 읽히는 인물(학생·교복 포함)이 성적·노출 장면에 있는 컷만 실사로 생성하지 않아 NovelAI를 켤 때까지 기다립니다.`;
   }
-  return base;
+  return routed;
 }
 
 /**
  * Per-cut renderer routing: [NAI만 | 장면별 혼합 | 전부 실사] and the scene categories that go photoreal in mixed
  * mode (multi-select). One component for all three places it appears — settings, the image panel, the builder —
- * so the summary and the explicit row's lock cannot drift apart between them.
+ * so the summary and the category list cannot drift apart between them.
  *
- * The explicit row is rendered disabled and always unchecked. It is in the list so the creator can SEE that
- * sexual cuts stay on NovelAI, not because it is a choice: resolveImageBackendRouting strips the category and
- * decideImageBackend locks such cuts whatever the routing says.
+ * Every category is the creator's choice, the sexual-scene one included: what the photo model draws is theirs to
+ * decide, and the defaults (people, scenery, objects) are only a starting point. The floor that no tick changes is
+ * stated in the summary, not as a row. An option the router marks `locked` still renders as a disabled, unticked row
+ * and is never written into the stored list.
  */
 function ImageBackendRoutingCard({
   routing,
@@ -13881,11 +13917,15 @@ function ImageBackendRoutingCard({
     } else {
       wanted.delete(category);
     }
-    wanted.delete("explicit");
     const label = getImageSceneCategoryLabel(category) ?? category;
     onChange(
       // Canonical order, so the stored list (and the summary that reads it) does not depend on click order.
-      { ...routing, photorealCategories: IMAGE_SCENE_CATEGORY_OPTIONS.map((option) => option.id).filter((id) => wanted.has(id)) },
+      {
+        ...routing,
+        photorealCategories: IMAGE_SCENE_CATEGORY_OPTIONS.filter((option) => option.locked !== true && wanted.has(option.id)).map(
+          (option) => option.id
+        )
+      },
       checked ? `'${label}' 장면을 실사로 보냅니다.` : `'${label}' 장면을 NovelAI로 보냅니다.`
     );
   };
@@ -13919,7 +13959,13 @@ function ImageBackendRoutingCard({
           {IMAGE_SCENE_CATEGORY_OPTIONS.map((option) => {
             const locked = option.locked === true;
             return (
-              <label className={`backend-routing-category${locked ? " locked" : ""}`} key={option.id}>
+              // The compact list drops descriptions for room; the tooltip keeps them one hover away (the action row's
+              // "실사 모델은 큰 동작에 약하다" is exactly what a creator ticking it there should still be able to read).
+              <label
+                className={`backend-routing-category${locked ? " locked" : ""}`}
+                key={option.id}
+                title={compact && !locked ? option.description : undefined}
+              >
                 <input
                   type="checkbox"
                   checked={!locked && ticked.has(option.id)}
@@ -14022,6 +14068,35 @@ function ImagePanel({
   const novelAiV4CaptionDebug = inspectedJob && !isPhotorealJob ? readNovelAiV4CaptionDebug(inspectedJob.providerPayload) : undefined;
   const inspectedRouting = inspectedJob?.routing;
   const inspectedCategoryLabel = getImageSceneCategoryLabel(inspectedRouting?.category);
+  // A stored lock is the verdict of the day the cut was planned, possibly under an older rule (sexual cuts were once
+  // NovelAI-only in every mode). So the "other backend" button asks today's router instead — the same forced re-plan
+  // the click itself runs — and is offered exactly when that click would draw the cut photoreal. Only a locked cut
+  // pays for the re-plan.
+  const currentPhotorealRouting = useMemo(() => {
+    if (!inspectedJob || inspectedJob.routing?.locked !== true) {
+      return undefined;
+    }
+    try {
+      const regenerationCue = createImageCueForRegeneration(state, inspectedJob);
+      return planImageJob(state, inspectedJob.turnId, regenerationCue, inspectedJob.contextNodeIds, true, {
+        backend: "photoreal",
+        cueKind: regenerationCue.kind
+      }).routing;
+    } catch {
+      return inspectedJob.routing;
+    }
+  }, [inspectedJob, state]);
+  const inspectedLockHolds = inspectedRouting?.locked === true && currentPhotorealRouting?.backend !== "photoreal";
+  const inspectedLockStale = inspectedRouting?.locked === true && !inspectedLockHolds;
+  // The stored reason is a record of the plan, so it stays — but marked as that day's wording whenever today's router
+  // says something else (a lock that no longer holds, or an older phrasing of one that does). Router reasons are
+  // "<verdict> · <note> · …", so the verdicts are compared and the notes (direct request, NovelAI off) are not.
+  const leadingReason = (reason: string | undefined) => reason?.split(" · ")[0]?.trim() ?? "";
+  const inspectedReasonOutdated =
+    inspectedRouting?.locked === true &&
+    currentPhotorealRouting !== undefined &&
+    leadingReason(currentPhotorealRouting.reason) !== leadingReason(inspectedRouting.reason);
+  const inspectedLockReason = currentPhotorealRouting?.reason || inspectedRouting?.reason || `${PHOTOREAL_FLOOR_DESCRIPTION}.`;
   const inspectedPresetId = inspectedJob ? readProviderPayloadText(inspectedJob.providerPayload, "presetId") : undefined;
   const inspectedPreset =
     inspectedPresetId && Object.prototype.hasOwnProperty.call(PHOTOREAL_WORKFLOW_PRESETS, inspectedPresetId)
@@ -14157,9 +14232,10 @@ function ImagePanel({
             <div className="image-job-routing">
               <span className="image-job-routing-backend">{imageBackendLabels[inspectedBackend]}</span>
               {inspectedCategoryLabel ? <span>{inspectedCategoryLabel}</span> : null}
-              {inspectedRouting?.locked ? <span>안전 정책 고정</span> : null}
+              {inspectedLockHolds ? <span>실사 제외</span> : null}
               {inspectedRouting?.fallback ? <span>대체 백엔드</span> : null}
-              {inspectedRouting?.reason ? <p>{inspectedRouting.reason}</p> : null}
+              {inspectedRouting?.reason ? <p>{inspectedReasonOutdated ? `계획 당시 기준: ${inspectedRouting.reason}` : inspectedRouting.reason}</p> : null}
+              {inspectedLockStale ? <p>지금 기준으로는 이 컷을 실사로 다시 생성할 수 있습니다.</p> : null}
             </div>
           ) : null}
           <div className="image-job-metrics">
@@ -14199,16 +14275,16 @@ function ImagePanel({
               <button
                 className="icon-text-button"
                 type="button"
-                disabled={inspectedRouting?.locked === true || otherBackendOff}
-                aria-describedby={inspectedRouting?.locked || otherBackendOff ? `image-job-switch-note-${inspectedJob.id}` : undefined}
+                disabled={inspectedLockHolds || otherBackendOff}
+                aria-describedby={inspectedLockHolds || otherBackendOff ? `image-job-switch-note-${inspectedJob.id}` : undefined}
                 onClick={() => onRegenerateJob(inspectedJob, otherBackend)}
-                title={inspectedRouting?.locked ? inspectedRouting.reason : undefined}
+                title={inspectedLockHolds ? inspectedLockReason : undefined}
               >
                 <RefreshCcw size={15} />
                 다른 백엔드로 재생성 ({imageBackendLabels[otherBackend]})
               </button>
-              {inspectedRouting?.locked ? (
-                <small id={`image-job-switch-note-${inspectedJob.id}`}>{inspectedRouting.reason || "안전 정책상 이 컷은 NovelAI로 고정되어 있습니다."}</small>
+              {inspectedLockHolds ? (
+                <small id={`image-job-switch-note-${inspectedJob.id}`}>{inspectedLockReason}</small>
               ) : otherBackendOff && otherBackend === "photoreal" ? (
                 <small id={`image-job-switch-note-${inspectedJob.id}`}>
                   실사 이미지(ComfyUI) 연동이 꺼져 있습니다. 설정 탭에서 켜면 이 컷을 실사로 다시 생성할 수 있습니다.
@@ -19452,6 +19528,34 @@ function PhotorealRuntimeSettings({
           <strong>스타일</strong>
           <span>{activeStyle?.label ?? "사용자 지정"}</span>
         </div>
+        <label className="checkline">
+          <input
+            type="checkbox"
+            checked={
+              photoreal.enabled &&
+              photoreal.stylePreset === "daily_look" &&
+              photoreal.workflowPreset === "z_image_turbo"
+            }
+            onChange={(event) => {
+              if (event.target.checked) {
+                onChange(
+                  {
+                    enabled: true,
+                    stylePreset: "daily_look",
+                    workflowPreset: "z_image_turbo",
+                    referenceWorkflowPreset: "qwen_image_2_1_turbo",
+                    width: 960,
+                    height: 1280
+                  },
+                  "핀터레스트 데일리룩 사진 톤(Z-Image Turbo · 960×1280)이 활성화되었습니다."
+                );
+              } else {
+                onChange({ stylePreset: "cinematic" }, "필름 시네마틱 톤으로 전환되었습니다.");
+              }
+            }}
+          />
+          핀터레스트 데일리룩 사진 톤 켜기 (DNC 감성 · Z-Image Turbo 960×1280)
+        </label>
         <label>
           스타일 프리셋
           <select

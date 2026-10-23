@@ -90,7 +90,7 @@ export const DEFAULT_PHOTOREAL_SETTINGS: Readonly<PhotorealApiSettings> = Object
   requestMode: "proxy",
   baseUrl: "http://127.0.0.1:8188",
   proxyUrl: "",
-  workflowPreset: "qwen_image_2_1_turbo",
+  workflowPreset: "z_image_turbo",
   referenceWorkflowPreset: "qwen_image_2_1_turbo",
   modelFiles: Object.freeze({}),
   steps: 0,

@@ -312,7 +312,10 @@ export interface ImageSceneTagPreset extends ImageSceneTagPresetNode {
  * plain face close-up.
  */
 export type ImageSceneCategory =
-  /** Sexual content or nudity. Locked to NovelAI: never rendered photoreal, in any routing mode. */
+  /**
+   * Sexual content or nudity. Routed like every other category (the user ticks it); only a cut whose subject reads as
+   * a minor is kept off the photo model, whatever the routing (imageBackendRouting.photorealFloorLock).
+   */
   | "explicit"
   /** Dynamic motion: fighting, running, jumping, falling, sports. */
   | "action"
@@ -334,13 +337,13 @@ export type ImageSceneCategory =
 /**
  * `novelai`: every cut is anime (the pre-photoreal behaviour, and the default for existing simulations).
  * `mixed`: cuts whose category is in `photorealCategories` render photoreal, the rest NovelAI.
- * `photoreal`: every cut renders photoreal except the safety-locked categories.
+ * `photoreal`: every cut renders photoreal except the floor's (a minor-coded subject in a sexual or suggestive cut).
  */
 export type ImageBackendRoutingMode = "novelai" | "mixed" | "photoreal";
 
 export interface ImageBackendRouting {
   mode: ImageBackendRoutingMode;
-  /** Categories rendered photoreal in `mixed` mode. `explicit` is ignored even if present. */
+  /** Categories rendered photoreal in `mixed` mode, `explicit` included when ticked. */
   photorealCategories: ImageSceneCategory[];
 }
 
@@ -351,7 +354,10 @@ export interface ImageBackendDecision {
   mode: ImageBackendRoutingMode;
   /** Short Korean explanation shown in the inspector. */
   reason: string;
-  /** The safety floor forced NovelAI (explicit content, or minor-coded subjects). Cannot be overridden. */
+  /**
+   * NovelAI is forced: the floor (a minor-coded, school-coded or unreadable subject in a sexual or suggestive cut), or a
+   * custom workflow that cannot build this cut. Cannot be overridden.
+   */
   locked?: boolean;
   /** The preferred backend was not available, so the other one was used. */
   fallback?: boolean;

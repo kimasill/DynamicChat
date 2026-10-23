@@ -13,7 +13,8 @@ import type {
   PhotorealWorkflowPresetId
 } from "../types";
 import { PHOTOREAL_WORKFLOW_PRESETS } from "./comfyWorkflows";
-import { executeImageJob, planImageJob, screenPhotorealReferenceImage, screenPhotorealText } from "./imageOrchestrator";
+import { PHOTOREAL_FLOOR_DESCRIPTION } from "./imageBackendRouting";
+import { classifyPhotorealText, executeImageJob, planImageJob, screenPhotorealReferenceImage, screenPhotorealText } from "./imageOrchestrator";
 import type { PhotorealReferenceRefusal, PhotorealTextScreen } from "./imageOrchestrator";
 import { sanitizePhotorealNegativePrompt } from "./photorealPrompt";
 import { DEFAULT_PHOTOREAL_SETTINGS } from "./runtimeApiSettings";
@@ -61,7 +62,8 @@ const REFERENCE_REFUSAL_MESSAGES: Record<PhotorealReferenceRefusal["kind"], stri
   not_picked: "이 실사 프로필 이미지는 DynamicChat이 생성한 후보 중에서 고른 이미지가 아니어서 얼굴 참조로 쓸 수 없습니다.",
   no_record: "이 실사 프로필 이미지에는 만든 프롬프트 기록이 없어 얼굴 참조로 쓸 수 없습니다.",
   unreadable_record: "이 실사 프로필 이미지의 프롬프트 기록에는 읽을 수 있는 영어 단어가 없어 얼굴 참조로 쓸 수 없습니다.",
-  floor: "이 실사 프로필 이미지는 실사 안전 기준(미성년·노출·성적 표현)에 걸리는 프롬프트로 만들어져 얼굴 참조로 쓸 수 없습니다."
+  floor:
+    "이 실사 프로필 이미지를 만든 프롬프트가 미성년으로 읽히는 인물(학생·교복 포함)을 그렸거나 확인할 수 없는 문자(영문 외 문자)를 담고 있어, 나이를 확인할 수 없는 얼굴이므로 성적·노출 장면이 있는 이 테스트의 얼굴 참조로 쓸 수 없습니다."
 };
 
 const NOVELAI_MODEL_PRESETS: ReadonlySet<string> = new Set<NovelAiModelPreset>([
@@ -83,11 +85,13 @@ const NOVELAI_MODEL_PRESETS: ReadonlySet<string> = new Set<NovelAiModelPreset>([
  * hair colour instead of fighting the saved tags. For photoreal a prose prompt is taken as the appearance text
  * (what CharacterVisualProfile.photorealPrompt holds); a tag list is taken as tags, as for NovelAI.
  *
- * A photoreal request the safety floor locks is refused with an Error, not planned on NovelAI. A test the panel
- * labels free (it runs on this PC) must never quietly spend Anlas on the NovelAI account, and a face check
- * rendered without the face proves nothing. The floor reads the typed prompt (prose or tags), the photoreal style
- * and the finished photo prompt, like any story cut; a face check also re-reads the prompt the profile image was
- * made from, since that image becomes the reference.
+ * A photoreal request the floor locks is refused with an Error, not planned on NovelAI. A test the panel labels free
+ * (it runs on this PC) must never quietly spend Anlas on the NovelAI account, and a face check rendered without the
+ * face proves nothing. The floor is the only thing that refuses: an adult nude ("A nude woman lying on a bed") is a
+ * test like any other, while a subject read as a minor in a sexual or exposing picture ("A 14-year-old girl in a
+ * bikini", "schoolgirl, lingerie") is not. It reads the typed prompt (prose or tags), the photoreal style and the
+ * finished photo prompt, like any story cut; a face check also re-reads the prompt the profile image was made from,
+ * alone and with the typed scene, since that image becomes the reference.
  */
 export function planCharacterProfileTestJobs(
   state: AppState,
@@ -131,6 +135,13 @@ export function planCharacterProfileTestJobs(
   const promptRefusal = backend === "photoreal" ? screenPhotorealText(state, prompt) : undefined;
   if (promptRefusal) {
     throw new Error(describePhotorealRefusal(promptRefusal));
+  }
+  // The face check draws the reference into the typed scene: a profile drawn from a minor-coded prompt passes alone
+  // (above) but is never the face of a sexual or exposing one.
+  const sceneReferenceRefusal =
+    input.variant === "reference_check" ? screenPhotorealReferenceImage(state, referenceImage, classifyPhotorealText(prompt)) : undefined;
+  if (sceneReferenceRefusal) {
+    throw new Error(`${REFERENCE_REFUSAL_MESSAGES[sceneReferenceRefusal.kind]} 성적·노출 표현을 빼고 테스트하거나 새 후보를 생성해 프로필을 다시 지정하세요.`);
   }
   const negativePrompt = input.negativePrompt?.trim() ?? "";
   const asAppearance = backend === "photoreal" && !looksLikeTagList(prompt);
@@ -202,6 +213,11 @@ export function planCharacterProfileTestJobs(
   // A reference check that ends up without a reference would be an ordinary portrait mislabelled as a pass.
   if (input.variant === "reference_check" && first?.backend === "photoreal") {
     const references = first.providerPayload.photorealReferences;
+    const refusals = first.providerPayload.photorealReferenceRefusals;
+    if ((!Array.isArray(references) || references.length === 0) && Array.isArray(refusals) && refusals.length > 0) {
+      // The planner read the reference with the whole cut (the style included) and left it out.
+      throw new Error(`${REFERENCE_REFUSAL_MESSAGES.floor} 성적·노출 표현을 빼고 테스트하거나 새 후보를 생성해 프로필을 다시 지정하세요.`);
+    }
     if (!Array.isArray(references) || references.length === 0) {
       throw new Error("얼굴 고정 테스트에는 얼굴 참조를 지원하는 워크플로(예: Qwen-Image 2.1)가 필요합니다. 설정의 '얼굴 고정용' 프리셋을 확인하세요.");
     }
@@ -370,22 +386,20 @@ function createStudioState(
 
 /**
  * Why a photoreal test cannot run, in the panel's words. `screen` is the typed prompt's own reading; without one the
- * prompt passed and the router's reason names what tripped instead (the style text, the finished photo prompt).
+ * prompt passed and the router's reason names what tripped instead (the style text, the finished photo prompt, the
+ * custom workflow's own words).
  */
 function describePhotorealRefusal(screen: PhotorealTextScreen | undefined, routingReason?: string): string {
   if (!screen) {
     const reason = routingReason?.trim();
-    return `실사 안전 기준(미성년·노출·성적 표현)에 걸려 실사로 생성할 수 없습니다${reason ? ` (${reason})` : ""}. 설정의 실사 스타일 문장이나 사용자 워크플로를 확인하거나 NovelAI로 바꾸어 테스트하세요.`;
+    return `${PHOTOREAL_FLOOR_DESCRIPTION}${reason ? ` — ${reason}` : ""}. 설정의 실사 스타일 문장이나 사용자 워크플로를 확인하거나 NovelAI로 바꾸어 테스트하세요.`;
   }
-  const { classification } = screen;
-  const unreadableOnly =
-    classification.unverifiable &&
-    classification.category !== "explicit" &&
-    !classification.minorCoded &&
-    !(classification.schoolCoded && classification.suggestive);
+  // The floor's subject half: a minor or pupil it read, or text it could not read at all next to sexual wording.
+  const { reading } = screen;
+  const unreadableOnly = reading.unverifiable === true && !reading.minorCoded && !reading.schoolCoded;
   return unreadableOnly
-    ? "이 프롬프트에는 확인할 수 없는 문자(영문 외 문자)가 있어 실사로 생성할 수 없습니다. 영어로 적거나 NovelAI로 바꾸어 테스트하세요."
-    : "이 프롬프트는 실사 안전 기준(미성년·노출·성적 표현)에 걸려 실사로 생성할 수 없습니다. NovelAI로 바꾸어 테스트하세요.";
+    ? "이 프롬프트에는 성적·노출 표현과 함께 확인할 수 없는 문자(영문 외 문자)가 있어 인물의 나이를 확인할 수 없으므로 실사로 생성하지 않습니다. 영어로 적거나 NovelAI로 바꾸어 테스트하세요."
+    : "이 프롬프트는 미성년으로 읽히는 인물(학생·교복 포함)을 성적·노출 장면에 두어 실사로 생성하지 않습니다. 성적·노출 표현을 빼거나 NovelAI로 바꾸어 테스트하세요.";
 }
 
 /**

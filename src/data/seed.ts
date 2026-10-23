@@ -1196,7 +1196,8 @@ export function hydrateState(candidate: AppState | undefined): AppState {
     ...candidate.imageProfile,
     model: resolveNovelAiModelName(novelAi.modelPreset, candidate.imageProfile?.model ?? seedState.imageProfile.model),
     // A simulation saved before photoreal existed has no routing and resolves to NovelAI-only — what it was drawn
-    // with. A malformed one is repaired the same way: unknown categories dropped, `explicit` never routable.
+    // with. A malformed one is repaired the same way: unknown categories dropped, every known one (explicit included)
+    // kept as the user ticked it.
     backendRouting: resolveImageBackendRouting(candidate.imageProfile ?? seedState.imageProfile)
   };
   const imageTagLlm = {
@@ -1619,8 +1620,8 @@ function isImageBackendRoutingMode(value: unknown): value is ImageBackendRouting
   return value === "novelai" || value === "mixed" || value === "photoreal";
 }
 
-// Its own exhaustive list rather than the routing UI's options: those describe what the user can pick, and if the
-// unpickable `explicit` row were ever dropped from them, hydration would strip the category off every locked cut.
+// Its own exhaustive list rather than the routing UI's options: those describe what the user can pick, and if a row
+// were ever dropped from them, hydration would strip that category off every stored cut that carries it.
 const IMAGE_SCENE_CATEGORIES: Record<ImageSceneCategory, true> = {
   explicit: true,
   action: true,

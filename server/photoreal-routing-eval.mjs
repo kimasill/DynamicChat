@@ -5,9 +5,11 @@ import { createServer } from "vite";
 
 // Scene classification and backend routing for the photoreal backend.
 //
-// The router is the safety floor (explicit, minor-coded and school-coded + suggestive cuts never render
-// photoreal), so most of this suite is about the floor holding: in every routing mode, with every availability
-// combination, and when a manual regeneration names the photoreal backend outright. The rest pins the category
+// Where a cut renders is the user's setting: every category — explicit included — goes where the routing mode and the
+// ticked categories send it. The one exception is the floor: a sexual or suggestive cut whose subject reads as a minor
+// (minor-coded, school-coded, or unreadable) never renders photoreal. Much of this suite is about both halves holding:
+// the floor in every routing mode, with every availability combination, and when a manual regeneration names the
+// photoreal backend outright — and an adult explicit cut never locked by any of them. The rest pins the category
 // matrix and its precedence, which decides what "mixed" mode actually sends where.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -110,6 +112,9 @@ function createClassifications(classifyImageScene) {
     ),
     minor: classifyImageScene(
       cut({ figures: [["1girl", "loli", "smile", "sundress"]], context: ["1girl", "solo", "park"], frame: "upper_body" })
+    ),
+    minorSexual: classifyImageScene(
+      cut({ figures: [["1girl", "loli", "smile", "bikini"]], context: ["1girl", "solo", "beach"], frame: "full_body" })
     ),
     school: classifyImageScene(
       cut({
@@ -278,8 +283,9 @@ function evaluateLexiconGaps({ isExplicitSceneTag, isMinorCodedSceneTag, classif
 
 /**
  * Review finding safety:no-unicode-normalization. Fullwidth letters, zero-width characters and soft hyphens fold to
- * the plain word; letters no lexicon can read (kana, Cyrillic look-alikes, CJK, Hangul) are unverifiable and lock the
- * cut in every mode, a forced photoreal regeneration included.
+ * the plain word; letters no lexicon can read (kana, Cyrillic look-alikes, CJK, Hangul) are unverifiable, and lock a
+ * suggestive cut in every mode, a forced photoreal regeneration included — nothing can say its subject is an adult.
+ * Alone they lock nothing: the photo builder drops them from every photo prompt.
  */
 function evaluateUnverifiableScript({ classifyImageScene }, { decideImageBackend }, seedState) {
   const solo = (tags) => classifyImageScene(cut({ figures: [["1girl", ...tags]], context: ["1girl", "solo", "beach"], frame: "full_body" }));
@@ -319,13 +325,21 @@ function evaluateUnverifiableScript({ classifyImageScene }, { decideImageBackend
       );
     }
   }
+  const kanaAlone = solo(["ロリ", "sundress"]);
+  const aloneDecision = decideImageBackend(createRoutingState(seedState, { mode: "photoreal", photoreal: true, novelAi: true }), kanaAlone);
+  assertCheck(
+    "unicode",
+    kanaAlone.unverifiable && aloneDecision.backend === "photoreal" && !aloneDecision.locked,
+    `An unverifiable cut that is not sexual or suggestive follows the routing (${aloneDecision.backend}${aloneDecision.locked ? "+locked" : ""}).`
+  );
   const accented = solo(["café latte", "Pokémon t-shirt"]);
   assertCheck("unicode", !accented.unverifiable, "Accented Latin letters fold to a–z and stay verifiable (café, Pokémon).");
 }
 
 /**
- * Free text read for the floor only (safetyTexts): the photoreal style and finished photo prompts. Prose is split
- * into sentences, comma segments and clauses, so the probe sentences lock; the category is never decided by it.
+ * Free text read for the floor flags and explicit content (safetyTexts): the photoreal style and finished photo
+ * prompts. Prose is split into sentences, comma segments and clauses, so every probe is DETECTED (explicit, or minor-
+ * or school-coded, or unreadable); no other category is ever decided by it.
  */
 async function evaluateSafetyTexts({ classifyImageScene }, { decideImageBackend }, seedState) {
   const prose = (text) => classifyImageScene({ characterTagSets: [["1girl"]], contextTags: ["cafe"], safetyTexts: [text], frame: FRAMES.upper_body, registeredCharacterCount: 1 });
@@ -364,6 +378,13 @@ async function evaluateSafetyTexts({ classifyImageScene }, { decideImageBackend 
   const styledCut = classifyImageScene({ ...cut({ figures: [["1girl", "smile", "sitting"]], context: ["1girl", "solo", "cafe"], frame: "upper_body" }), safetyTexts: describePhotorealStyleForScreening({ stylePreset: "custom", stylePrompt: "A nude boudoir photograph. Teenage model, 16 years old." }) });
   const decision = decideImageBackend(state, styledCut, { forcedBackend: "photoreal" });
   assertCheck("safety-texts", decision.backend === "novelai" && decision.locked, `A clean cafe cut under an explicit, minor-coded custom style is locked (${decision.reason}).`);
+  const adultStyledCut = classifyImageScene({ ...cut({ figures: [["1girl", "smile", "sitting"]], context: ["1girl", "solo", "cafe"], frame: "upper_body" }), safetyTexts: describePhotorealStyleForScreening({ stylePreset: "custom", stylePrompt: "A nude boudoir photograph of an adult woman." }) });
+  const adultDecision = decideImageBackend(state, adultStyledCut);
+  assertCheck(
+    "safety-texts",
+    adultStyledCut.category === "explicit" && adultDecision.backend === "photoreal" && !adultDecision.locked,
+    `An adult nude style makes the cut explicit, which all-photoreal mode renders photoreal (${adultStyledCut.category}, ${adultDecision.reason}).`
+  );
   const korean = describePhotorealStyleForScreening({ stylePreset: "daily_look", stylePrompt: "필름 느낌, soft film grain, ヌード" });
   assertCheck(
     "safety-texts",
@@ -394,7 +415,7 @@ function evaluateNegativeWeights({ classifyImageScene, isExplicitSceneTag }) {
  * by gender, and student identities in free text. Readings only ever add: the canonical term is still read, so
  * "1girl" and adult ages stay what they were. photoreal-safety-corpus-eval runs the full corpus end to end.
  */
-function evaluateFloorReadings({ classifyImageScene, isExplicitSceneTag, isMinorCodedSceneTag, isPhotoNegativeSafeguardTerm }) {
+function evaluateFloorReadings({ classifyImageScene, isExplicitSceneTag, isMinorCodedSceneTag, isPhotoNegativeYouthSteeringTerm }) {
   const disguised = ["n4ked", "nak3d", "$ex", "p0rn", "nu/de", "na·ked", "nak'd", "n*ked", "p*ssy", "n a k e d", "na ked", "nu de", "nuuuude", "blow-job", "blow job", "cream-pie", "deep-throating"];
   const missedDisguised = disguised.filter((tag) => !isExplicitSceneTag(tag));
   assertCheck("floor.readings", missedDisguised.length === 0, `Disguised spellings read as the word (missed: ${missedDisguised.join(", ") || "none"}).`);
@@ -423,12 +444,12 @@ function evaluateFloorReadings({ classifyImageScene, isExplicitSceneTag, isMinor
 
   assertCheck("floor.readings", isExplicitSceneTag("-1::sfw::") && isExplicitSceneTag("-2::apparel::") && isMinorCodedSceneTag("-1::adult::") && isMinorCodedSceneTag("-1::mature female::"), "Weighted down, a safeguard word uncensors, a covering garment undresses and an adulthood word ages down.");
   assertCheck("floor.readings", !isMinorCodedSceneTag("-1::large breasts::") && !isExplicitSceneTag("-1::hat::"), "An adult build or an accessory weighted down locks nothing.");
-  const safeguards = ["apparel", "fabric", "covered body", "sfw", "censored", "modest", "adult", "mature female", "woman", "wrinkles", "tall", "large breasts", "jacket", "towel"];
-  const notSafeguards = ["blurry", "lowres", "watermark", "hat", "glasses", "shoes", "nsfw", "nude", "child", "anime"];
+  const youthSteering = ["adult", "mature female", "woman", "wrinkles", "tall", "large breasts", "breasts", "pubic hair", "in her twenties", "25yo", "4dult", "erwachsen", "mujer adulta"];
+  const userChoices = ["apparel", "fabric", "covered body", "sfw", "censored", "modest", "jacket", "towel", "blurry", "lowres", "watermark", "hat", "glasses", "shoes", "nsfw", "nude", "child", "anime"];
   assertCheck(
     "floor.readings",
-    safeguards.every((term) => isPhotoNegativeSafeguardTerm(term)) && notSafeguards.every((term) => !isPhotoNegativeSafeguardTerm(term)),
-    `Safeguard terms never become a photo negative; quality terms and accessories do (${[...safeguards.filter((term) => !isPhotoNegativeSafeguardTerm(term)), ...notSafeguards.filter((term) => isPhotoNegativeSafeguardTerm(term))].join(", ") || "all as expected"}).`
+    youthSteering.every((term) => isPhotoNegativeYouthSteeringTerm(term)) && userChoices.every((term) => !isPhotoNegativeYouthSteeringTerm(term)),
+    `Only terms that steer toward a younger subject are kept out of a photo negative; clothing, modesty, quality and accessories are the user's (${[...youthSteering.filter((term) => !isPhotoNegativeYouthSteeringTerm(term)), ...userChoices.filter((term) => isPhotoNegativeYouthSteeringTerm(term))].join(", ") || "all as expected"}).`
   );
 }
 
@@ -966,8 +987,8 @@ function evaluateRoutingResolution({ DEFAULT_PHOTOREAL_CATEGORIES, IMAGE_SCENE_C
   });
   assertCheck(
     "routing.resolve",
-    sanitized.mode === "mixed" && JSON.stringify(sanitized.photorealCategories) === JSON.stringify(["portrait", "full_body", "object"]),
-    `Unknown categories are dropped, explicit is stripped, duplicates collapse, order is canonical (${sanitized.photorealCategories.join(", ")}).`
+    sanitized.mode === "mixed" && JSON.stringify(sanitized.photorealCategories) === JSON.stringify(["portrait", "full_body", "object", "explicit"]),
+    `Unknown categories are dropped, explicit is kept like any category, duplicates collapse, order is canonical (${sanitized.photorealCategories.join(", ")}).`
   );
 
   const badMode = resolveImageBackendRouting({ backendRouting: { mode: "turbo", photorealCategories: ["scenery"] } });
@@ -984,7 +1005,7 @@ function evaluateRoutingResolution({ DEFAULT_PHOTOREAL_CATEGORIES, IMAGE_SCENE_C
   assertCheck("routing.resolve", empty.photorealCategories.length === 0, "An explicitly empty category list stays empty (the user unticked everything).");
 
   const onlyExplicit = resolveImageBackendRouting({ backendRouting: { mode: "mixed", photorealCategories: ["explicit"] } });
-  assertCheck("routing.resolve", onlyExplicit.photorealCategories.length === 0, "A stored tick on explicit alone resolves to nothing photoreal.");
+  assertCheck("routing.resolve", onlyExplicit.photorealCategories.join() === "explicit", `A tick on explicit alone is kept: it is the user's choice (${onlyExplicit.photorealCategories.join(", ")}).`);
 
   const expectedOptions = [
     ["portrait", "인물 단독 · 얼굴/상반신"],
@@ -995,7 +1016,7 @@ function evaluateRoutingResolution({ DEFAULT_PHOTOREAL_CATEGORIES, IMAGE_SCENE_C
     ["romance", "스킨십 (비노출)"],
     ["action", "액션 · 역동적 동작"],
     ["fantasy", "판타지 · 비인간 요소"],
-    ["explicit", "성적 장면 — 항상 NovelAI"]
+    ["explicit", "성적 장면 · 노출"]
   ];
   assertCheck(
     "routing.resolve",
@@ -1003,7 +1024,19 @@ function evaluateRoutingResolution({ DEFAULT_PHOTOREAL_CATEGORIES, IMAGE_SCENE_C
     "Category options list all nine categories in the spec order with the spec's Korean labels."
   );
   const locked = IMAGE_SCENE_CATEGORY_OPTIONS.filter((option) => option.locked).map((option) => option.id);
-  assertCheck("routing.resolve", locked.join() === "explicit", `Only the explicit option is locked (${locked.join(", ")}).`);
+  assertCheck("routing.resolve", locked.length === 0, `No option is locked: every category is the user's to tick (${locked.join(", ") || "none"}).`);
+  const explicitOption = IMAGE_SCENE_CATEGORY_OPTIONS.find((option) => option.id === "explicit");
+  const actionOption = IMAGE_SCENE_CATEGORY_OPTIONS.find((option) => option.id === "action");
+  assertCheck(
+    "routing.resolve",
+    /성인/u.test(explicitOption?.description ?? "") && /미성년/u.test(explicitOption?.description ?? "") && !/항상 NovelAI|어떤 모드에서도/u.test(explicitOption?.description ?? ""),
+    `The explicit option says it is for adult characters and names the minor floor, not an always-NovelAI rule (${explicitOption?.description}).`
+  );
+  assertCheck(
+    "routing.resolve",
+    /실사 모델/u.test(actionOption?.description ?? "") && /약/u.test(actionOption?.description ?? ""),
+    `The action option says photo models are weaker at dynamic motion, so the user can decide (${actionOption?.description}).`
+  );
   assertCheck(
     "routing.resolve",
     IMAGE_SCENE_CATEGORY_OPTIONS.every((option) => /[가-힣]/u.test(option.description)),
@@ -1048,8 +1081,13 @@ function evaluateDecisionTable({ decideImageBackend }, { classifyImageScene }, s
     ["forced NovelAI overrides photoreal mode", "photoreal", true, true, "portrait", "novelai", "novelai", false, false],
     ["forced NovelAI never falls back when NovelAI is off", "photoreal", true, false, "portrait", "novelai", "novelai", false, false],
     ["school uniform without suggestive tags is not locked", "photoreal", true, true, "school", undefined, "photoreal", false, false],
-    ["explicit with NovelAI off is never promoted to photoreal", "photoreal", true, false, "explicit", undefined, "novelai", true, false],
-    ["minor-coded beats a forced photoreal regeneration", "photoreal", true, true, "minor", "photoreal", "novelai", true, false],
+    ["photoreal mode renders an adult explicit cut photoreal", "photoreal", true, true, "explicit", undefined, "photoreal", false, false],
+    ["mixed mode keeps an unticked explicit cut on NovelAI, unlocked", "mixed", true, true, "explicit", undefined, "novelai", false, false],
+    ["mixed mode explicit with NovelAI off falls back to photoreal", "mixed", true, false, "explicit", undefined, "photoreal", false, true],
+    ["forced photoreal renders an explicit cut photoreal", "novelai", true, true, "explicit", "photoreal", "photoreal", false, false],
+    ["a minor-coded cut that is not sexual follows the routing", "photoreal", true, true, "minor", undefined, "photoreal", false, false],
+    ["minor-coded + suggestive beats a forced photoreal regeneration", "photoreal", true, true, "minorSexual", "photoreal", "novelai", true, false],
+    ["minor-coded + suggestive with NovelAI off is never promoted to photoreal", "photoreal", true, false, "minorSexual", undefined, "novelai", true, false],
     ["school + suggestive is locked in mixed mode", "mixed", true, true, "schoolSuggestive", undefined, "novelai", true, false],
     ["school + suggestive beats a forced photoreal regeneration", "novelai", true, true, "schoolSuggestive", "photoreal", "novelai", true, false]
   ];
@@ -1070,14 +1108,18 @@ function evaluateDecisionTable({ decideImageBackend }, { classifyImageScene }, s
   );
   assertCheck("routing.decide", tickedAction.backend === "photoreal", `Mixed mode follows the ticks: action ticked → photoreal (${tickedAction.backend}).`);
 
-  const storedExplicitTick = decideImageBackend(
-    createRoutingState(seedState, { mode: "mixed", categories: ["explicit", "portrait"], photoreal: true, novelAi: true }),
-    classifications.explicit
-  );
+  const tickedExplicitState = createRoutingState(seedState, { mode: "mixed", categories: ["explicit", "portrait"], photoreal: true, novelAi: true });
+  const tickedExplicit = decideImageBackend(tickedExplicitState, classifications.explicit);
   assertCheck(
     "routing.decide",
-    storedExplicitTick.backend === "novelai" && storedExplicitTick.locked === true,
-    "A stored tick on explicit (hand-edited state) cannot route an explicit cut photoreal."
+    tickedExplicit.backend === "photoreal" && !tickedExplicit.locked,
+    `Mixed mode follows the ticks: explicit ticked → an adult explicit cut renders photoreal (${tickedExplicit.backend}).`
+  );
+  const tickedMinor = decideImageBackend(tickedExplicitState, classifications.minorSexual);
+  assertCheck(
+    "routing.decide",
+    tickedMinor.backend === "novelai" && tickedMinor.locked === true,
+    "…and a tick never moves the floor: a minor-coded subject in a suggestive cut stays NovelAI + locked."
   );
 
   const legacyState = createRoutingState(seedState, { mode: undefined, photoreal: true, novelAi: true });
@@ -1100,31 +1142,52 @@ function evaluateDecisionTable({ decideImageBackend }, { classifyImageScene }, s
 }
 
 function evaluateSafetyLockMatrix({ decideImageBackend, describeImageBackendSetupBlock }, { classifyImageScene }, seedState) {
-  const { explicit } = createClassifications(classifyImageScene);
+  const classifications = createClassifications(classifyImageScene);
+  const floorCuts = {
+    "minor + suggestive": classifications.minorSexual,
+    "minor + explicit": classifyImageScene(cut({ figures: [["1girl", "14 years old", "nude"]], context: ["1girl", "solo", "bedroom"], frame: "full_body" })),
+    "school + suggestive": classifications.schoolSuggestive,
+    "unreadable + suggestive": classifyImageScene(cut({ figures: [["1girl", "ロリ", "lingerie"]], context: ["1girl", "solo"], frame: "full_body" }))
+  };
+  const allTicked = ["portrait", "full_body", "scenery", "object", "group", "romance", "action", "fantasy", "explicit"];
   for (const mode of ["novelai", "mixed", "photoreal"]) {
     for (const availability of AVAILABILITY) {
-      const state = createRoutingState(seedState, {
-        mode,
-        categories: ["portrait", "full_body", "scenery", "object", "group", "romance", "action", "fantasy", "explicit"],
-        photoreal: availability.photoreal,
-        novelAi: availability.novelAi
-      });
-      const outcomes = [undefined, "photoreal", "novelai"].map((forcedBackend) =>
-        decideImageBackend(state, explicit, forcedBackend ? { forcedBackend } : undefined)
+      const state = createRoutingState(seedState, { mode, categories: allTicked, photoreal: availability.photoreal, novelAi: availability.novelAi });
+      for (const [label, classification] of Object.entries(floorCuts)) {
+        const outcomes = [undefined, "photoreal", "novelai"].map((forcedBackend) =>
+          decideImageBackend(state, classification, forcedBackend ? { forcedBackend } : undefined)
+        );
+        const held = outcomes.every((decision) => decision.backend === "novelai" && decision.locked === true && !decision.fallback);
+        assertCheck(
+          "routing.floor",
+          held,
+          `${label} stays NovelAI + locked in ${mode} mode, ${availability.label}, unforced / forced photoreal / forced NovelAI (${outcomes
+            .map((decision) => `${decision.backend}${decision.locked ? "+locked" : ""}`)
+            .join(", ")}).`
+        );
+      }
+      // The other half: an adult explicit cut is never locked, and goes where the routing sends it.
+      const adult = [undefined, "photoreal", "novelai"].map((forcedBackend) =>
+        decideImageBackend(state, classifications.explicit, forcedBackend ? { forcedBackend } : undefined)
       );
-      const held = outcomes.every((decision) => decision.backend === "novelai" && decision.locked === true && !decision.fallback);
+      const preferred = mode === "novelai" ? "novelai" : "photoreal";
+      const expected = [
+        preferred === "photoreal" && !availability.photoreal && availability.novelAi ? "novelai" : preferred === "novelai" && !availability.novelAi && availability.photoreal ? "photoreal" : preferred,
+        "photoreal",
+        "novelai"
+      ];
       assertCheck(
         "routing.floor",
-        held,
-        `Explicit stays NovelAI + locked in ${mode} mode, ${availability.label}, unforced / forced photoreal / forced NovelAI (${outcomes
+        adult.every((decision, index) => !decision.locked && decision.backend === expected[index]),
+        `An adult explicit cut is never locked in ${mode} mode with explicit ticked, ${availability.label}: unforced / forced photoreal / forced NovelAI (${adult
           .map((decision) => `${decision.backend}${decision.locked ? "+locked" : ""}`)
-          .join(", ")}).`
+          .join(", ")}; expected ${expected.join(", ")}).`
       );
     }
   }
 
   const blockedState = createRoutingState(seedState, { mode: "photoreal", photoreal: true, novelAi: false });
-  const blocked = decideImageBackend(blockedState, explicit, { forcedBackend: "photoreal" });
+  const blocked = decideImageBackend(blockedState, classifications.minorSexual, { forcedBackend: "photoreal" });
   assertCheck(
     "routing.floor",
     describeImageBackendSetupBlock(blockedState, blocked.backend) === NOVELAI_SETUP_TEXT,
@@ -1149,22 +1212,29 @@ function evaluateDecisionReasons({ decideImageBackend }, { classifyImageScene },
     `The reason names mode, category and backend: ${mixed.reason}`
   );
 
-  const explicit = decideImageBackend(
+  const floor = decideImageBackend(
     createRoutingState(seedState, { mode: "photoreal", photoreal: true, novelAi: true }),
-    classifications.explicit,
+    classifications.minorSexual,
     { forcedBackend: "photoreal" }
   );
   assertCheck(
     "routing.reason",
-    explicit.reason.startsWith("성적 장면은 실사로 생성하지 않습니다 (NovelAI 고정)") && explicit.reason.includes("직접 지정"),
-    `The explicit lock explains itself and that the manual pick was not applied: ${explicit.reason}`
+    floor.reason.startsWith("미성년으로 읽히는 인물이 성적·노출 장면에 있어 실사로 생성하지 않습니다 (NovelAI 고정)") && floor.reason.includes("직접 지정"),
+    `The floor explains itself and that the manual pick was not applied: ${floor.reason}`
   );
 
-  const minor = decideImageBackend(createRoutingState(seedState, { mode: "photoreal", photoreal: true, novelAi: false }), classifications.minor);
+  const minor = decideImageBackend(createRoutingState(seedState, { mode: "photoreal", photoreal: true, novelAi: false }), classifications.minorSexual);
   assertCheck(
     "routing.reason",
-    minor.reason.includes("미성년자") && minor.reason.includes("NovelAI 고정") && minor.reason.includes("NovelAI 연동을 켜야"),
+    minor.reason.includes("미성년") && minor.reason.includes("NovelAI 고정") && minor.reason.includes("NovelAI 연동을 켜야"),
     `The minor lock explains itself and why the cut waits on NovelAI: ${minor.reason}`
+  );
+
+  const unticked = decideImageBackend(createRoutingState(seedState, { mode: "mixed", photoreal: true, novelAi: true }), classifications.explicit);
+  assertCheck(
+    "routing.reason",
+    unticked.reason === "혼합 모드: '성적 장면 · 노출' 장면 → NovelAI" && !unticked.locked,
+    `An adult explicit cut the user did not tick is routed, not locked, and says so: ${unticked.reason}`
   );
 
   const fallback = decideImageBackend(createRoutingState(seedState, { mode: "mixed", photoreal: false, novelAi: true }), classifications.portrait);

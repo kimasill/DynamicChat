@@ -65,7 +65,10 @@ const FRAMES = {
 const NAI_TOKEN_PATTERN = /masterpiece|best quality|very aesthetic|absurdres|\bartist:|\byear \d{4}\b|\brating:|score_\d|::|[{}[\]]/iu;
 const HANGUL_PATTERN = /[가-힣]/u;
 
-/** The routing fixture: one cut per category plus the two safety-floor locks, in sidecar order. */
+/**
+ * The routing fixture: one cut per category, the adult explicit cut (routed like any category, never locked) and the
+ * floor's lock (a school-coded subject in a suggestive cut), in sidecar order.
+ */
 const MIXED_CUES = [
   {
     label: "portrait",
@@ -127,7 +130,6 @@ const MIXED_CUES = [
   {
     label: "explicit",
     expected: "explicit",
-    locked: true,
     characters: ["char_yuna", "char_minho"],
     base: ["1girl", "1boy", "bedroom"],
     prompts: [
@@ -162,7 +164,12 @@ const ROUTING_EXPECTATIONS = [
     routing: { mode: "mixed", photorealCategories: ["group", "action"] },
     backends: [N, N, N, N, P, P, N, N]
   },
-  { label: "mode photoreal", routing: { mode: "photoreal" }, backends: [P, P, P, P, P, P, N, N] }
+  {
+    label: "mode mixed (defaults + explicit ticked)",
+    routing: { mode: "mixed", photorealCategories: ["portrait", "full_body", "scenery", "object", "explicit"] },
+    backends: [P, P, P, P, N, N, P, N]
+  },
+  { label: "mode photoreal", routing: { mode: "photoreal" }, backends: [P, P, P, P, P, P, P, N] }
 ];
 
 const checks = [];
@@ -265,8 +272,15 @@ async function evaluateMixedSidecars({ seed, engine, workflows }) {
     assertCheck(
       scope,
       lockedJobs.length === lockedIndexes.length && lockedJobs.every((job) => job.backend === "novelai" && job.routing.locked === true && /NovelAI 고정/u.test(job.routing.reason)),
-      "explicit and school+suggestive cuts are locked to NovelAI with a reason",
+      "the floor's cut (school + suggestive) is locked to NovelAI with a reason",
       lockedJobs.map((job) => `${job.backend}/${job.routing?.locked}`).join(", ")
+    );
+    const unlocked = jobs.filter((_, index) => !MIXED_CUES[index].locked && jobs[index].routing?.locked);
+    assertCheck(
+      scope,
+      unlocked.length === 0,
+      "no other cut is locked — the adult explicit cut is routed by the user's setting like every category",
+      unlocked.map((job) => `${job.providerPayload.cueLabel}: ${job.routing?.reason}`).join(" | ")
     );
     assertCheck(
       scope,
@@ -335,8 +349,12 @@ async function evaluateMixedSidecars({ seed, engine, workflows }) {
 
 async function evaluateContinuityInjectedExplicit({ seed, engine }) {
   const scope = "continuity";
-  const state = createState(seed.seedState, { routing: { mode: "photoreal" } });
-  state.memoryEvents = [createStateMemoryEvent(state, "char_yuna", "InteractionTags", "sex from behind")];
+  const continuing = (routing) => {
+    const next = createState(seed.seedState, { routing });
+    next.memoryEvents = [createStateMemoryEvent(next, "char_yuna", "InteractionTags", "sex from behind")];
+    return next;
+  };
+  const state = continuing({ mode: "photoreal" });
   const closeUp = {
     label: "reaction close-up",
     characters: ["char_yuna"],
@@ -351,9 +369,18 @@ async function evaluateContinuityInjectedExplicit({ seed, engine }) {
   assertCheck(scope, /sex from behind/iu.test(composed), "premise: continuity injects the ongoing position into the authored face close-up", composed);
   assertCheck(
     scope,
-    job?.backend === "novelai" && job.routing?.category === "explicit" && job.routing.locked === true && job.routing.signals.includes("explicit:sex from behind"),
-    "the continuity-injected cut is classified explicit and locked to NovelAI even in photoreal mode",
+    job?.backend === "photoreal" && job.routing?.category === "explicit" && !job.routing.locked && job.routing.signals.includes("explicit:sex from behind"),
+    "the continuity-injected cut is classified explicit, and all-photoreal mode renders it photoreal (never locked)",
     `${job?.backend} ${job?.routing?.category} ${job?.routing?.signals?.join(" | ")}`
+  );
+  assertCheck(scope, /sex from behind/u.test(job?.prompt ?? ""), "an explicit cut's photo prompt describes the scene as written", job?.prompt?.slice(0, 240));
+  const mixedPlan = await planTurn(engine, continuing({ mode: "mixed" }), [toDraft(closeUp)]);
+  const mixedJob = mixedPlan.imageJobs?.[0];
+  assertCheck(
+    scope,
+    mixedJob?.backend === "novelai" && mixedJob.routing?.category === "explicit" && !mixedJob.routing.locked,
+    "with explicit unticked in mixed mode the same cut goes to NovelAI — routed, not locked: the face close-up the author wrote does not hide the continuity",
+    `${mixedJob?.backend} ${mixedJob?.routing?.reason}`
   );
 }
 
@@ -444,9 +471,11 @@ async function evaluateReferencePlanning({ seed, orchestrator }) {
 }
 
 /**
- * Everything a photo prompt can carry is read by the safety floor, not only the cut's tags (review findings
- * safety:appearance-text-unclassified, style-text-unclassified, lexicon gaps, Unicode). Each probe must end locked to
- * NovelAI, or — for text the builder drops — never reach a photo prompt.
+ * Everything a photo prompt can carry is read, not only the cut's tags (review findings
+ * safety:appearance-text-unclassified, style-text-unclassified, lexicon gaps, Unicode). A probe that puts a subject read
+ * as a minor (or one nobody can read) into a sexual or suggestive picture must end locked to NovelAI; an adult explicit
+ * one is routed like any explicit cut; and minor wording or unreadable text alone locks nothing but never reaches a
+ * photo prompt.
  */
 async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
   const scope = "floor";
@@ -461,33 +490,63 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
     job.backend === "novelai" && job.routing?.locked === true && /NovelAI 고정/u.test(job.routing.reason) && job.providerPayload.promptFormat === "novelai-tags";
 
   // The creator's 실사 외형 replaces the adult noun in every photo cut of the character, so it is read like a tag.
-  const appearances = [
-    "A 15-year-old Korean girl with long black hair",
-    "A petite teenage girl with twin tails",
-    "一个十四岁的韩国少女",
-    "A naked Korean woman with long black hair",
+  const floorAppearances = [
     "A 14-year-old Korean girl in a bikini",
-    "A naked woman lying on a bed",
     "A teenage girl in lingerie, lying on a bed",
-    "A little girl in a school uniform with a short skirt",
-    "A Korean woman in her late twenties, 一个十四岁的韩国少女"
+    "A schoolgirl in lingerie",
+    "A naked 15-year-old girl",
+    "一个十四岁的韩国少女, in a bikini"
   ];
-  for (const appearance of appearances) {
+  for (const appearance of floorAppearances) {
     for (const forced of [undefined, "photoreal"]) {
       const job = orchestrator.planImageJob(withYuna(() => ({ photorealPrompt: appearance })), "turn_floor", portraitCue, [], true, forced ? { backend: forced } : {});
       assertCheck(
         scope,
         isLockedNovelAi(job) && !job.prompt.includes(appearance) && !/一个|少女/u.test(job.prompt),
-        `an appearance the floor refuses locks the cut to NovelAI${forced ? " (even when photoreal is forced)" : ""}: ${JSON.stringify(appearance)}`,
+        `an appearance that puts a minor-coded or unreadable subject in a sexual picture locks the cut to NovelAI${forced ? " (even when photoreal is forced)" : ""}: ${JSON.stringify(appearance)}`,
         describe(job)
       );
     }
   }
-  const chinese = orchestrator.planImageJob(withYuna(() => ({ photorealPrompt: "一个十四岁的韩国少女" })), "turn_floor", portraitCue, [], true);
+  for (const appearance of ["A naked Korean woman with long black hair", "A naked woman lying on a bed"]) {
+    for (const forced of [undefined, "photoreal"]) {
+      const job = orchestrator.planImageJob(withYuna(() => ({ photorealPrompt: appearance })), "turn_floor", portraitCue, [], true, forced ? { backend: forced } : {});
+      assertCheck(
+        scope,
+        job.backend === "photoreal" && !job.routing.locked && job.routing.category === "explicit" && /naked/u.test(job.prompt),
+        `an adult nude appearance makes the cut explicit, which all-photoreal mode renders photoreal as written${forced ? " (forced)" : ""}: ${JSON.stringify(appearance)}`,
+        describe(job)
+      );
+    }
+    const mixedJob = orchestrator.planImageJob(withYuna(() => ({ photorealPrompt: appearance }), { routing: { mode: "mixed" } }), "turn_floor", portraitCue, [], true);
+    assertCheck(
+      scope,
+      mixedJob.backend === "novelai" && !mixedJob.routing.locked && mixedJob.routing.category === "explicit",
+      `…and in mixed mode without explicit ticked it goes to NovelAI, routed rather than locked: ${JSON.stringify(appearance)}`,
+      describe(mixedJob)
+    );
+  }
+  const nonSexualAppearances = [
+    ["A 15-year-old Korean girl with long black hair", /15-year-old|girl/u],
+    ["A petite teenage girl with twin tails", /teenage|girl/u],
+    ["A little girl in a school uniform with a short skirt", /little girl/u],
+    ["一个十四岁的韩国少女", /一个|少女/u],
+    ["A Korean woman in her late twenties, 一个十四岁的韩国少女", /一个|少女/u]
+  ];
+  for (const [appearance, wording] of nonSexualAppearances) {
+    const job = orchestrator.planImageJob(withYuna(() => ({ photorealPrompt: appearance })), "turn_floor", portraitCue, [], true);
+    assertCheck(
+      scope,
+      job.backend === "photoreal" && !job.routing.locked && !wording.test(job.prompt) && /\bwoman\b/u.test(job.prompt) && !/\bgirl\b/u.test(job.prompt),
+      `an appearance that is minor-coded or unreadable but not sexual follows the routing, and its wording never reaches the photo prompt: ${JSON.stringify(appearance)}`,
+      describe(job)
+    );
+  }
+  const chinese = orchestrator.planImageJob(withYuna(() => ({ photorealPrompt: "一个十四岁的韩国少女, in a bikini" })), "turn_floor", portraitCue, [], true);
   assertCheck(
     scope,
     chinese.routing.signals.some((signal) => signal.startsWith("unverifiable-script:")) && /확인할 수 없는 문자/u.test(chinese.routing.reason),
-    "text in another script is reported as unverifiable and says so in the lock reason",
+    "text in another script is reported as unverifiable and, in a suggestive cut, says so in the lock reason",
     chinese.routing.reason
   );
   const korean = orchestrator.planImageJob(withYuna(() => ({ photorealPrompt: "검은 긴 머리의 20대 한국 여성" })), "turn_floor", portraitCue, [], true);
@@ -519,22 +578,44 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
   );
   assertCheck(scope, scarred.backend === "photoreal" && !scarred.routing.locked, "\"a minor scar\" is not a minor (false-friend guard)", describe(scarred));
 
-  // The photoreal style opens and closes every photo prompt; it is read too, for the floor only.
+  // The photoreal style opens and closes every photo prompt; it is read too, for the floor and for explicit content.
   const cafeCue = { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: "smile, sitting" }] };
   const styles = [
     { stylePreset: "custom", stylePrompt: "A nude boudoir photograph. Teenage model, 16 years old." },
-    { stylePreset: "daily_look", stylePrompt: "fully naked subject, no clothes" },
-    { stylePreset: "cinematic", stylePrompt: "soft light, ヌード" }
+    { stylePreset: "custom", stylePrompt: "A boudoir photograph of a schoolgirl in lingerie." },
+    { stylePreset: "cinematic", stylePrompt: "lingerie, ヌード" }
   ];
   for (const style of styles) {
     const job = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "photoreal" }, photorealOverrides: style }), "turn_floor", cafeCue, [], true);
     assertCheck(
       scope,
-      isLockedNovelAi(job) && !/boudoir|naked|teenage|ヌード/iu.test(job.prompt),
-      `a style text the floor refuses locks every cut to NovelAI: ${JSON.stringify(style.stylePrompt)}`,
+      isLockedNovelAi(job) && !/boudoir|naked|teenage|schoolgirl|ヌード/iu.test(job.prompt),
+      `a style text that completes the floor locks every cut to NovelAI: ${JSON.stringify(style.stylePrompt)}`,
       describe(job)
     );
   }
+  const adultStyle = { stylePreset: "daily_look", stylePrompt: "fully naked subject, no clothes" };
+  const adultStyled = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "photoreal" }, photorealOverrides: adultStyle }), "turn_floor", cafeCue, [], true);
+  assertCheck(
+    scope,
+    adultStyled.backend === "photoreal" && !adultStyled.routing.locked && adultStyled.routing.category === "explicit" && /fully naked subject/u.test(adultStyled.prompt),
+    "an adult nude style makes every cut explicit; all-photoreal mode renders it with the style as written",
+    describe(adultStyled)
+  );
+  const adultStyledMixed = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "mixed" }, photorealOverrides: adultStyle }), "turn_floor", cafeCue, [], true);
+  assertCheck(
+    scope,
+    adultStyledMixed.backend === "novelai" && !adultStyledMixed.routing.locked && adultStyledMixed.routing.category === "explicit",
+    "…and mixed mode without explicit ticked sends those cuts to NovelAI, routed rather than locked",
+    describe(adultStyledMixed)
+  );
+  const unreadableStyle = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "photoreal" }, photorealOverrides: { stylePreset: "cinematic", stylePrompt: "soft light, ヌード" } }), "turn_floor", cafeCue, [], true);
+  assertCheck(
+    scope,
+    unreadableStyle.backend === "photoreal" && !unreadableStyle.routing.locked && !/ヌード/u.test(unreadableStyle.prompt),
+    "an unreadable style word over a clothed cut locks nothing and never reaches the photo prompt",
+    describe(unreadableStyle)
+  );
   const nsfwStyleOnNovelAi = createState(seed.seedState, { routing: { mode: "novelai" }, photorealOverrides: styles[0] });
   const plainOnNovelAi = createState(seed.seedState, { routing: { mode: "novelai" } });
   const lockedNai = orchestrator.planImageJob(nsfwStyleOnNovelAi, "turn_floor", cafeCue, [], true);
@@ -547,29 +628,45 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
   );
 
   // Tags the lexicons used to miss: inflections, synonyms, hyphenation, Unicode look-alikes, kana.
-  const tagProbes = [
+  const floorTagProbes = [
     "teenaged, bikini",
     "school-uniform, lingerie",
-    "17 years of age",
-    "aged fifteen",
-    "sixth grader",
-    "adolescent",
-    "ｎｕｄｅ",
+    "17 years of age, bikini",
+    "aged fifteen, nude",
+    "sixth grader, lingerie",
+    "adolescent, swimsuit",
     "n\u0430ked",
-    "nu\u200bde",
-    "nu\u00adde",
-    "ロリ, bikini",
-    "-2::clothing::, standing"
+    "ロリ, bikini"
   ];
-  for (const tags of tagProbes) {
+  for (const tags of floorTagProbes) {
     const cue = { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: `smile, ${tags}` }] };
     const job = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "photoreal" } }), "turn_floor", cue, [], true);
     assertCheck(scope, isLockedNovelAi(job), `a cut tagged ${JSON.stringify(tags)} is locked to NovelAI`, describe(job));
   }
+  for (const tags of ["ｎｕｄｅ", "nu\u200bde", "nu\u00adde", "-2::clothing::, standing"]) {
+    const cue = { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: `smile, ${tags}` }] };
+    const job = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "photoreal" } }), "turn_floor", cue, [], true);
+    assertCheck(
+      scope,
+      job.backend === "photoreal" && !job.routing.locked && job.routing.category === "explicit",
+      `a cut tagged ${JSON.stringify(tags)} is read as explicit (disguise and all) and routed like any explicit cut`,
+      describe(job)
+    );
+  }
+  for (const [tags, wording] of [["17 years of age", /17 years/u], ["aged fifteen", /fifteen/u], ["sixth grader", /grader/u], ["adolescent", /adolescent/u]]) {
+    const cue = { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: `smile, ${tags}` }] };
+    const job = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "photoreal" } }), "turn_floor", cue, [], true);
+    assertCheck(
+      scope,
+      job.backend === "photoreal" && !job.routing.locked && !wording.test(job.prompt) && /\badult woman\b|Korean woman/iu.test(job.prompt),
+      `a cut tagged ${JSON.stringify(tags)} in a clothed scene follows the routing; the photo prompt drops the wording and keeps an adult subject`,
+      describe(job)
+    );
+  }
   const kanaOnNovelAi = orchestrator.planImageJob(
     createState(seed.seedState, { routing: { mode: "novelai" } }),
     "turn_floor",
-    { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: "smile, ロリ" }] },
+    { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: "smile, ロリ, bikini" }] },
     [],
     true
   );
@@ -605,6 +702,29 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
       taintedReference.providerPayload.photorealReferenceRefusals?.[0]?.characterId === "char_yuna",
     "a profile image made from a prompt the floor refuses is never sent as a face reference, and the plan says why",
     JSON.stringify(taintedReference.providerPayload.photorealReferenceRefusals)
+  );
+  // A profile drawn from a minor-coded prompt is the face of a clothed cut, never of a sexual one; an adult nude
+  // profile is the face of any cut.
+  const withRecord = (prompt) => withYuna((profile) => ({ profileImages: { ...profile.profileImages, photoreal: { ...profile.profileImages.photoreal, prompt } } }));
+  const suggestiveCue = { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: "smile, sitting, lingerie" }] };
+  const minorRecord = "A 15-year-old Korean girl with long black hair";
+  const minorOnClothed = orchestrator.planImageJob(withRecord(minorRecord), "turn_floor", portraitCue, [], true);
+  const minorOnSuggestive = orchestrator.planImageJob(withRecord(minorRecord), "turn_floor", suggestiveCue, [], true);
+  assertCheck(
+    scope,
+    minorOnClothed.providerPayload.photorealReferences?.length === 1 && minorOnSuggestive.backend === "photoreal" && (minorOnSuggestive.providerPayload.photorealReferences ?? []).length === 0 &&
+      /이 컷과 함께 읽으면/u.test(minorOnSuggestive.providerPayload.photorealReferenceRefusals?.[0]?.reason ?? ""),
+    "a profile drawn from a minor-coded prompt is the face of a clothed cut, but never of a suggestive one — and the plan says why",
+    `${minorOnClothed.providerPayload.photorealReferences?.length} / ${JSON.stringify(minorOnSuggestive.providerPayload.photorealReferenceRefusals)}`
+  );
+  const adultNudeRecord = "A nude Korean woman in her late twenties with long black hair";
+  const adultOnClothed = orchestrator.planImageJob(withRecord(adultNudeRecord), "turn_floor", portraitCue, [], true);
+  const adultOnSuggestive = orchestrator.planImageJob(withRecord(adultNudeRecord), "turn_floor", suggestiveCue, [], true);
+  assertCheck(
+    scope,
+    adultOnClothed.providerPayload.photorealReferences?.length === 1 && adultOnSuggestive.providerPayload.photorealReferences?.length === 1,
+    "a profile drawn from an adult nude prompt is the face of any cut",
+    `${adultOnClothed.providerPayload.photorealReferences?.length} / ${adultOnSuggestive.providerPayload.photorealReferences?.length}`
   );
   const kanaReference = orchestrator.planImageJob(
     withYuna((profile) => ({ profileImages: { ...profile.profileImages, photoreal: { ...profile.profileImages.photoreal, prompt: "1girl, ロリ" } } })),
@@ -712,7 +832,8 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
     JSON.stringify(hydratedImage)
   );
 
-  // The final gate: the finished photo prompt is classified again, and a refused one becomes a locked NovelAI cut.
+  // The final gate: the finished photo prompt is classified again, and one the floor refuses becomes a locked NovelAI
+  // cut. Read alone (no cut) only the floor refuses: an adult explicit prompt passes.
   const clean = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "photoreal" } }), "turn_floor", portraitCue, [], true);
   assertCheck(
     scope,
@@ -722,11 +843,10 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
   );
   const gateState = createState(seed.seedState, { routing: { mode: "photoreal" } });
   const finished = [
-    ["A candid photograph. A nude woman sitting on a bed.", "explicit"],
     ["A candid photograph. An adult woman, ロリ, smiling.", "portrait"],
-    ["A candid photograph. A 16 years old model, smiling.", "portrait"],
-    ["A candid photograph. An adult woman wearing a school uniform and lingerie.", "portrait"],
-    ["A candid photograph. An adult woman lying on her back, wearing a bikini.", "explicit"]
+    ["A candid photograph. A 16 years old model, wearing a bikini.", "portrait"],
+    ["A candid photograph. A 16 years old model, nude.", "explicit"],
+    ["A candid photograph. An adult woman wearing a school uniform and lingerie.", "portrait"]
   ];
   for (const [prompt, category] of finished) {
     const decision = orchestrator.screenFinishedPhotorealPrompt(gateState, prompt, clean.routing, "photoreal");
@@ -735,16 +855,21 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
       decision?.backend === "novelai" &&
         decision.locked === true &&
         decision.category === category &&
-        decision.reason.startsWith("완성된 실사 프롬프트가 안전 기준에 걸려 NovelAI로 바꿨습니다") &&
+        decision.reason.startsWith("완성된 실사 프롬프트가 실사 안전 기준에 걸려 NovelAI로 바꿨습니다") &&
         decision.signals.some((signal) => signal.startsWith("photo-prompt:")),
       `the final gate refuses a photo prompt the floor would lock: ${JSON.stringify(prompt)}`,
       decision ? `${decision.backend} ${decision.category} ${decision.reason}` : "passed"
     );
   }
+  for (const prompt of ["A candid photograph. A nude woman sitting on a bed.", "A candid photograph. An adult woman lying on her back, wearing a bikini.", "A candid photograph. A 16 years old model, smiling."]) {
+    const decision = orchestrator.screenFinishedPhotorealPrompt(gateState, prompt, clean.routing, "photoreal");
+    assertCheck(scope, decision === undefined, `the final gate passes a photo prompt that is only adult-explicit or only minor-coded: ${JSON.stringify(prompt)}`, decision?.reason);
+  }
 
-  // NovelAI's undressing idiom is not turned into a photo negative; ordinary negative weights still are.
+  // A negative weight becomes a photo negative as the one negative rule keeps it: clothing is the user's, an adult word
+  // is never one.
   const hat = orchestrator.planImageJob(
-    withYuna(() => ({ photorealNegativePrompt: "clothing, glasses" })),
+    withYuna(() => ({ photorealNegativePrompt: "clothing, glasses, adult, 25yo" })),
     "turn_floor",
     { ...portraitCue, characterPrompts: [{ characterId: "char_yuna", prompt: "smile, -1::hat::" }] },
     [],
@@ -757,9 +882,11 @@ async function evaluatePhotoTextFloor({ seed, orchestrator, photoPrompt }) {
     scope,
     hat.backend === "photoreal" &&
       keptAccessories.every((term) => negatives.includes(term)) &&
-      !negatives.includes("clothing") &&
+      negatives.includes("clothing") &&
+      !negatives.includes("adult") &&
+      !negatives.includes("25yo") &&
       hat.negativePrompt === photoPrompt.sanitizePhotorealNegativePrompt(hat.negativePrompt),
-    `a negative weight on a hat becomes a photo negative as the one negative rule keeps it (${keptAccessories.join(", ") || "nothing"}); body-covering clothing never does, from any source; the planned negative is already in its sent form`,
+    `a negative weight on a hat becomes a photo negative as the one negative rule keeps it (${keptAccessories.join(", ") || "nothing"}); the user's clothing word stays and youth-steering words never do; the planned negative is already in its sent form`,
     hat.negativePrompt
   );
 }
@@ -840,6 +967,7 @@ async function evaluateRegeneration({ seed, orchestrator }) {
   const scope = "regenerate";
   const portraitCue = toCue(MIXED_CUES[0]);
   const explicitCue = toCue(MIXED_CUES[6]);
+  const floorCue = toCue(MIXED_CUES[7]);
   const novelAiMode = createState(seed.seedState, { routing: { mode: "novelai" } });
   const photorealMode = createState(seed.seedState, { routing: { mode: "photoreal" } });
 
@@ -849,12 +977,19 @@ async function evaluateRegeneration({ seed, orchestrator }) {
   assertCheck(scope, forcedNovelAi.backend === "novelai" && forcedNovelAi.providerPayload.promptFormat === "novelai-tags", "regenerating with the NovelAI backend in photoreal mode plans NovelAI");
   const kept = orchestrator.planImageJob(photorealMode, "turn_regen", portraitCue, [], true, { backend: forcedPhotoreal.backend });
   assertCheck(scope, kept.backend === "photoreal", "regenerating with the job's own backend keeps it");
-  const lockedForce = orchestrator.planImageJob(photorealMode, "turn_regen", explicitCue, [], true, { backend: "photoreal" });
+  const lockedForce = orchestrator.planImageJob(photorealMode, "turn_regen", floorCue, [], true, { backend: "photoreal" });
   assertCheck(
     scope,
     lockedForce.backend === "novelai" && lockedForce.routing.locked === true && /직접 지정해도 바뀌지 않습니다/u.test(lockedForce.routing.reason),
-    "the safety lock beats a forced photoreal backend",
+    "the floor beats a forced photoreal backend",
     lockedForce.routing.reason
+  );
+  const explicitForce = orchestrator.planImageJob(novelAiMode, "turn_regen", explicitCue, [], true, { backend: "photoreal" });
+  assertCheck(
+    scope,
+    explicitForce.backend === "photoreal" && !explicitForce.routing.locked && explicitForce.routing.category === "explicit" && /직접 지정/u.test(explicitForce.routing.reason),
+    "regenerating an adult explicit cut with the photoreal backend plans it photoreal, even in NovelAI mode",
+    explicitForce.routing.reason
   );
   const offForced = orchestrator.planImageJob(createState(seed.seedState, { routing: { mode: "novelai" }, photoreal: false }), "turn_regen", portraitCue, [], true, { backend: "photoreal" });
   assertCheck(
@@ -900,12 +1035,19 @@ async function evaluateSetupBlocks({ seed, orchestrator }) {
   assertCheck(scope, photorealJob.backend === "photoreal" && photorealJob.providerPayload.setupBlockedReason === undefined, "a photoreal cut with ComfyUI on is not blocked");
   const blockedPhotoreal = orchestrator.planImageJob(photorealOff, "turn_setup", portraitCue, [], false, { backend: "photoreal" });
   assertCheck(scope, blockedPhotoreal.providerPayload.setupBlockedReason === PHOTOREAL_SETUP_TEXT, "a photoreal cut with ComfyUI off waits with the photoreal setup text", blockedPhotoreal.providerPayload.setupBlockedReason);
-  const lockedWithNovelAiOff = orchestrator.planImageJob(novelAiOff, "turn_setup", toCue(MIXED_CUES[6]), [], false);
+  const lockedWithNovelAiOff = orchestrator.planImageJob(novelAiOff, "turn_setup", toCue(MIXED_CUES[7]), [], false);
   assertCheck(
     scope,
-    lockedWithNovelAiOff.backend === "novelai" && lockedWithNovelAiOff.providerPayload.setupBlockedReason === NOVELAI_SETUP_TEXT,
+    lockedWithNovelAiOff.backend === "novelai" && lockedWithNovelAiOff.routing?.locked === true && lockedWithNovelAiOff.providerPayload.setupBlockedReason === NOVELAI_SETUP_TEXT,
     "a locked cut with NovelAI off stays NovelAI and waits with the NovelAI text (never promoted to photoreal)",
     `${lockedWithNovelAiOff.backend} ${lockedWithNovelAiOff.providerPayload.setupBlockedReason}`
+  );
+  const explicitWithNovelAiOff = orchestrator.planImageJob(novelAiOff, "turn_setup", toCue(MIXED_CUES[6]), [], false);
+  assertCheck(
+    scope,
+    explicitWithNovelAiOff.backend === "photoreal" && explicitWithNovelAiOff.routing?.fallback === true && !explicitWithNovelAiOff.routing.locked,
+    "an adult explicit cut is not locked, so with NovelAI off it falls back to photoreal like any other cut",
+    `${explicitWithNovelAiOff.backend} ${explicitWithNovelAiOff.routing?.reason}`
   );
   assertCheck(scope, orchestrator.describeNovelAiSetupBlock(novelAiOff) === NOVELAI_SETUP_TEXT && orchestrator.describeNovelAiSetupBlock(both) === undefined, "describeNovelAiSetupBlock keeps its exact text");
 
@@ -1155,7 +1297,7 @@ async function evaluateRelayExecution({ seed, orchestrator, studio, photoPrompt 
     photorealOverrides: { baseUrl: mock.baseUrl, proxyUrl: `${server.baseUrl}/photoreal/comfyui`, timeoutSeconds: 60, cfg: 4, workflowPreset: "qwen_image_2_1", referenceWorkflowPreset: "qwen_image_2_1" }
   });
   const guidedJob = orchestrator.planImageJob(guided, "turn_relay", toCue(MIXED_CUES[0]), [], false);
-  const steered = { ...guidedJob, negativePrompt: `${guidedJob.negativePrompt}, clothes, shirt, pleated skirt` };
+  const steered = { ...guidedJob, negativePrompt: `${guidedJob.negativePrompt}, clothes, shirt, pleated skirt, adult, in her twenties` };
   const steeredResult = await orchestrator.executeImageJob(guided, steered);
   const steeredGraph = mock.requests("POST", "/prompt")[0]?.body?.prompt ?? {};
   const steeredEncoder = Object.values(steeredGraph).find((node) => node?.class_type === "TextEncodeQwenImage21")?.inputs ?? {};
@@ -1165,9 +1307,10 @@ async function evaluateRelayExecution({ seed, orchestrator, studio, photoPrompt 
     steeredResult.job.status === "completed" &&
       typeof steeredEncoder.negative_prompt === "string" &&
       steeredEncoder.negative_prompt === photoPrompt.sanitizePhotorealNegativePrompt(steered.negativePrompt) &&
-      !/\b(?:clothes|shirt|skirt)\b/iu.test(steeredEncoder.negative_prompt) &&
+      /\bpleated skirt\b/u.test(steeredEncoder.negative_prompt) &&
+      !/\b(?:adult|twenties)\b/iu.test(steeredEncoder.negative_prompt) &&
       steeredSampler.cfg === 4,
-    "a queued job's negative reaches ComfyUI exactly as the one negative rule leaves it (no body-covering clothing at CFG 4), and a non-Turbo preset keeps the user's CFG",
+    "a queued job's negative reaches ComfyUI exactly as the one negative rule leaves it (the user's clothing words kept, no youth-steering word at CFG 4), and a non-Turbo preset keeps the user's CFG",
     `${steeredResult.job.error ?? ""} ${JSON.stringify(steeredEncoder.negative_prompt)} cfg=${steeredSampler.cfg}`
   );
   mock.reset();
@@ -1509,24 +1652,25 @@ async function evaluateProfileStudio({ seed, studio, workflows }) {
   );
   assertThrowsKorean(scope, () => studio.planCharacterProfileTestJobs(state, { characterId: "char_nobody", backend: "photoreal", prompt: prose, variant: "portrait", count: 1 }), "an unknown character is refused");
 
-  // The safety floor still applies, but a 실사 request it locks is refused instead of being planned on NovelAI: the
-  // panel says a photoreal test is free, and quietly running it on NovelAI spent Anlas (review finding).
-  const SAFETY_REFUSAL = "이 프롬프트는 실사 안전 기준(미성년·노출·성적 표현)에 걸려 실사로 생성할 수 없습니다. NovelAI로 바꾸어 테스트하세요.";
-  const UNREADABLE_REFUSAL = "이 프롬프트에는 확인할 수 없는 문자(영문 외 문자)가 있어 실사로 생성할 수 없습니다. 영어로 적거나 NovelAI로 바꾸어 테스트하세요.";
+  // The floor still applies, but a 실사 request it locks is refused instead of being planned on NovelAI: the panel
+  // says a photoreal test is free, and quietly running it on NovelAI spent Anlas (review finding). Only the floor
+  // refuses: an adult nude test is a test like any other.
+  const SAFETY_REFUSAL = "이 프롬프트는 미성년으로 읽히는 인물(학생·교복 포함)을 성적·노출 장면에 두어 실사로 생성하지 않습니다. 성적·노출 표현을 빼거나 NovelAI로 바꾸어 테스트하세요.";
+  const UNREADABLE_REFUSAL = "이 프롬프트에는 성적·노출 표현과 함께 확인할 수 없는 문자(영문 외 문자)가 있어 인물의 나이를 확인할 수 없으므로 실사로 생성하지 않습니다. 영어로 적거나 NovelAI로 바꾸어 테스트하세요.";
   const refusedPrompts = [
     ["A 14-year-old Korean girl in a bikini", SAFETY_REFUSAL],
-    ["A naked woman lying on a bed", SAFETY_REFUSAL],
     ["A teenage girl in lingerie, lying on a bed", SAFETY_REFUSAL],
-    ["A little girl in a school uniform with a short skirt", SAFETY_REFUSAL],
+    ["A little girl in a school uniform, in her underwear", SAFETY_REFUSAL],
     ["1girl, long black hair, student, swimsuit, beach", SAFETY_REFUSAL],
     ["1girl, school uniform, cleavage", SAFETY_REFUSAL],
-    ["1girl, petite, teen, white dress", SAFETY_REFUSAL],
-    ["一个十四岁的韩国少女", UNREADABLE_REFUSAL]
+    ["schoolgirl, lingerie", SAFETY_REFUSAL],
+    ["1girl, petite, teen, nude", SAFETY_REFUSAL],
+    ["一个十四岁的韩国少女, in a bikini", UNREADABLE_REFUSAL]
   ];
   const refusedVariants = [
     ...refusedPrompts.map(([prompt, expected]) => ({ prompt, expected, variant: "portrait" })),
     // The face check runs the typed prompt too (with the profile as reference): same refusal, no NovelAI fallback.
-    { prompt: "A naked woman lying on a bed", expected: SAFETY_REFUSAL, variant: "reference_check" }
+    { prompt: "A 14-year-old Korean girl in a bikini", expected: SAFETY_REFUSAL, variant: "reference_check" }
   ];
   for (const { prompt, expected, variant } of refusedVariants) {
     let message;
@@ -1541,6 +1685,29 @@ async function evaluateProfileStudio({ seed, studio, workflows }) {
       planned === undefined && message === expected,
       `a 실사 ${variant} test the floor locks is refused, never planned on NovelAI: ${JSON.stringify(prompt)}`,
       message ?? planned?.map((job) => `${job.backend}/${job.routing?.locked}`).join(",")
+    );
+  }
+  // What the floor does not refuse runs as a 실사 test: adult nudity, and minor wording or unreadable text in a clothed
+  // portrait (the photo prompt drops that wording and keeps an adult subject).
+  for (const { prompt, variant } of [
+    { prompt: "A naked woman lying on a bed", variant: "portrait" },
+    { prompt: "A nude Korean woman in her late twenties", variant: "reference_check" },
+    { prompt: "1girl, petite, teen, white dress", variant: "portrait" },
+    { prompt: "A little girl in a school uniform with a short skirt", variant: "portrait" },
+    { prompt: "一个十四岁的韩国少女", variant: "portrait" }
+  ]) {
+    let message;
+    let planned;
+    try {
+      planned = studio.planCharacterProfileTestJobs(state, { characterId: "char_yuna", backend: "photoreal", prompt, variant, count: 2 });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    assertCheck(
+      scope,
+      Array.isArray(planned) && planned.every((job) => job.backend === "photoreal" && !job.routing?.locked) && !/teen|little girl|一个|少女/u.test(planned[0]?.prompt ?? ""),
+      `a 실사 ${variant} test the floor does not refuse runs photoreal: ${JSON.stringify(prompt)}`,
+      message ?? planned?.[0]?.prompt?.slice(0, 200)
     );
   }
   const lockedOnNovelAi = studio.planCharacterProfileTestJobs(state, { characterId: "char_yuna", backend: "novelai", prompt: "1girl, school uniform, cleavage", variant: "portrait", count: 2 });
@@ -1558,6 +1725,7 @@ async function evaluateProfileStudio({ seed, studio, workflows }) {
     koreanJob?.prompt.slice(0, 160)
   );
   const styled = { ...state, photoreal: { ...state.photoreal, stylePreset: "custom", stylePrompt: "A nude boudoir photograph. Teenage model, 16 years old." } };
+  // The message names the floor in the settings screen's words and points at the style text.
   let styleMessage;
   try {
     studio.planCharacterProfileTestJobs(styled, { characterId: "char_yuna", backend: "photoreal", prompt: "A Korean woman in her late twenties", variant: "portrait", count: 1 });
@@ -1566,7 +1734,7 @@ async function evaluateProfileStudio({ seed, studio, workflows }) {
   }
   assertCheck(
     scope,
-    typeof styleMessage === "string" && /실사 안전 기준/u.test(styleMessage) && /스타일 문장/u.test(styleMessage) && /NovelAI 고정/u.test(styleMessage),
+    typeof styleMessage === "string" && /미성년으로 읽히는 인물/u.test(styleMessage) && /스타일 문장/u.test(styleMessage) && /NovelAI 고정/u.test(styleMessage),
     "a clean prompt under a style the floor locks is refused too, and the message points at the style text",
     styleMessage
   );
@@ -1580,6 +1748,27 @@ async function evaluateProfileStudio({ seed, studio, workflows }) {
     scope,
     () => studio.planCharacterProfileTestJobs(tainted, { characterId: "char_yuna", backend: "photoreal", prompt: prose, variant: "reference_check", count: 2 }),
     "the face check refuses a profile image whose own prompt the floor locks (it is never used as a reference)"
+  );
+  // A profile drawn from a minor-coded prompt passes a clothed face check, and is refused for a suggestive one.
+  const minorProfile = structuredClone(state);
+  minorProfile.visualProfiles = minorProfile.visualProfiles.map((profile) =>
+    profile.characterId === "char_yuna"
+      ? { ...profile, profileImages: { ...profile.profileImages, photoreal: { ...profile.profileImages.photoreal, prompt: "A 15-year-old Korean girl with long black hair" } } }
+      : profile
+  );
+  const clothedCheck = studio.planCharacterProfileTestJobs(minorProfile, { characterId: "char_yuna", backend: "photoreal", prompt: prose, variant: "reference_check", count: 1 });
+  assertCheck(scope, clothedCheck[0]?.providerPayload.photorealReferences?.length === 1, "a profile drawn from a minor-coded prompt passes a clothed face check (it is that face's reference)");
+  let suggestiveCheckMessage;
+  try {
+    studio.planCharacterProfileTestJobs(minorProfile, { characterId: "char_yuna", backend: "photoreal", prompt: "A Korean woman in her late twenties in lingerie", variant: "reference_check", count: 1 });
+  } catch (error) {
+    suggestiveCheckMessage = error instanceof Error ? error.message : String(error);
+  }
+  assertCheck(
+    scope,
+    typeof suggestiveCheckMessage === "string" && /미성년으로 읽히는 인물/u.test(suggestiveCheckMessage) && /얼굴 참조로 쓸 수 없습니다/u.test(suggestiveCheckMessage),
+    "…and the same profile is refused as the face of a suggestive face check, saying why",
+    suggestiveCheckMessage
   );
   const unrecorded = structuredClone(state);
   unrecorded.visualProfiles = unrecorded.visualProfiles.map((profile) =>
@@ -1949,9 +2138,9 @@ async function evaluateCustomWorkflowFloor({ seed, orchestrator, studio }) {
   const explicit = template("A fully naked 14 year old girl. %prompt%");
   const shapes = [
     [explicit, "4", "explicit, minor-coded words before %prompt%"],
-    [template("%prompt% She is completely naked."), "4", "words after %prompt%"],
+    [template("%prompt% She is 14 and completely naked."), "4", "words after %prompt%"],
     [template("A nude teenage girl on a bed"), "4", "no %prompt% at all, only its own words"],
-    [template("a 14 %prompt% year old girl"), "4", "a phrase split around %prompt%"],
+    [template("a 14 %prompt% year old girl in lingerie"), "4", "a phrase split around %prompt%"],
     [template("%prompt%, 나체"), "4", "Korean words (sent to the encoder as written, so unreadable to the floor)"],
     [template(["10", 0], { "10": { class_type: "PrimitiveString", inputs: { value: "A fully naked 14 year old girl" } } }), "10", "the words parked in a PrimitiveString linked into the encoder"]
   ];
@@ -1975,6 +2164,19 @@ async function evaluateCustomWorkflowFloor({ seed, orchestrator, studio }) {
   }
   const cleanJob = orchestrator.planImageJob(stateFor(clean), "turn_custom", toCue(MIXED_CUES[0]), [], true);
   assertCheck(scope, cleanJob.backend === "photoreal" && cleanJob.providerPayload.presetId === "custom", "the same cut under a clean template stays photoreal on the custom preset", `${cleanJob.backend} ${cleanJob.providerPayload.presetId}`);
+  // A template whose own words are adult-explicit is not an error: it makes every cut it draws explicit, and each is
+  // routed as one — photoreal where the user routes explicit cuts there, NovelAI (unlocked, with the node named) where not.
+  const adultTemplate = template("%prompt% She is completely naked.");
+  assertCheck(scope, orchestrator.validatePhotorealCustomWorkflow(stateFor(adultTemplate), adultTemplate).length === 0, "settings: a template with adult nudity in its own words is valid", JSON.stringify(orchestrator.validatePhotorealCustomWorkflow(stateFor(adultTemplate), adultTemplate)));
+  const adultJob = orchestrator.planImageJob(stateFor(adultTemplate), "turn_custom", toCue(MIXED_CUES[0]), [], true);
+  assertCheck(scope, adultJob.backend === "photoreal" && !adultJob.routing?.locked, "planning: in all-photoreal mode a clean cut under it stays photoreal", `${adultJob.backend} ${adultJob.routing?.reason}`);
+  const adultMixedJob = orchestrator.planImageJob(stateFor(adultTemplate, "mixed"), "turn_custom", toCue(MIXED_CUES[0]), [], true);
+  assertCheck(
+    scope,
+    adultMixedJob.backend === "novelai" && !adultMixedJob.routing?.locked && adultMixedJob.routing?.category === "explicit" && adultMixedJob.routing.reason.includes('노드 "4"') && /성적 장면 · 노출/u.test(adultMixedJob.routing.reason),
+    "planning: in mixed mode without explicit ticked the template makes the cut explicit, and it is re-routed to NovelAI (not locked), naming the node",
+    `${adultMixedJob.backend} ${adultMixedJob.routing?.reason}`
+  );
   // File and list inputs are not text: a model file name does not invalidate a template (they never reach an encoder).
   const namedModel = template("%prompt%", { "1": { class_type: "UNETLoader", inputs: { unet_name: "nsfw_finetune_v2.safetensors", weight_dtype: "default" } } });
   assertCheck(scope, orchestrator.validatePhotorealCustomWorkflow(stateFor(namedModel), namedModel).length === 0, "a model file name is not screened as prompt text");
@@ -2032,6 +2234,42 @@ async function evaluateCustomWorkflowFloor({ seed, orchestrator, studio }) {
     "execution: a cut planned under a clean template is refused once the template carries refused words, and nothing is sent",
     `${sent.job.status} ${sent.job.error} calls=${calls.length}`
   );
+
+  // A template that names a minor without anything sexual is read with each cut it draws: the floor's halves can sit
+  // in the template and in the cut. A clothed cut stays photoreal; a sexual one is locked, at planning and as it leaves.
+  const minorTemplate = template("A photograph of a 14 year old girl. %prompt%");
+  assertCheck(scope, orchestrator.validatePhotorealCustomWorkflow(stateFor(minorTemplate), minorTemplate).length === 0, "settings: a template that names a minor in a clothed sentence is valid on its own");
+  const minorClothed = orchestrator.planImageJob(stateFor(minorTemplate), "turn_custom", toCue(MIXED_CUES[0]), [], true);
+  const minorExplicit = orchestrator.planImageJob(stateFor(minorTemplate), "turn_custom", toCue(MIXED_CUES[6]), [], true);
+  assertCheck(
+    scope,
+    minorClothed.backend === "photoreal" &&
+      minorExplicit.backend === "novelai" &&
+      minorExplicit.routing?.locked === true &&
+      minorExplicit.routing.reason.includes('노드 "4"') &&
+      /미성년/u.test(minorExplicit.routing.reason),
+    "planning: under it a clothed cut stays photoreal and an explicit cut is locked to NovelAI, the reason naming the node",
+    `${minorClothed.backend} / ${minorExplicit.backend} ${minorExplicit.routing?.reason}`
+  );
+  const explicitPlannedClean = orchestrator.planImageJob(stateFor(clean), "turn_custom", toCue(MIXED_CUES[6]), [], true);
+  const joinedCalls = [];
+  const joinedRun = await withFetchStub(
+    async (url) => {
+      joinedCalls.push(url);
+      return new Response(JSON.stringify({ error: "should not be called" }), { status: 500, headers: { "content-type": "application/json" } });
+    },
+    () => orchestrator.executeImageJob(stateFor(minorTemplate), explicitPlannedClean)
+  );
+  assertCheck(
+    scope,
+    explicitPlannedClean.backend === "photoreal" &&
+      joinedRun.job.status === "failed" &&
+      /^실사 이미지 생성 실패: /u.test(joinedRun.job.error ?? "") &&
+      /미성년/u.test(joinedRun.job.error ?? "") &&
+      joinedCalls.length === 0,
+    "execution: an explicit cut planned under a clean template is refused once the template names a minor, and nothing is sent",
+    `${explicitPlannedClean.backend} ${joinedRun.job.status} ${joinedRun.job.error} calls=${joinedCalls.length}`
+  );
 }
 
 /**
@@ -2078,7 +2316,7 @@ async function evaluateDispatchFloor({ seed, orchestrator }) {
   );
 
   // A job planned under an older rule set: its prompt says what today's floor refuses.
-  const appended = " She is 16 years old.";
+  const appended = " She is 16 years old and naked.";
   const stale = {
     ...planned,
     prompt: `${planned.prompt}${appended}`,
@@ -2107,6 +2345,37 @@ async function evaluateDispatchFloor({ seed, orchestrator }) {
     JSON.stringify(refused.result.job.providerPayload.photorealReferences)
   );
 
+  // The floor joins the prompt with the cut the job was planned as: an adult explicit cut whose prompt now also names a
+  // minor is refused, though either half alone passes.
+  const explicitPlanned = orchestrator.planImageJob(state, "turn_dispatch", toCue(MIXED_CUES[6]), [], true);
+  const minorAppended = " She is 16 years old.";
+  const explicitStale = {
+    ...explicitPlanned,
+    prompt: `${explicitPlanned.prompt}${minorAppended}`,
+    providerPayload: {
+      ...explicitPlanned.providerPayload,
+      promptVariants: (explicitPlanned.providerPayload.promptVariants ?? []).map((variant) => ({ ...variant, prompt: `${variant.prompt}${minorAppended}` }))
+    }
+  };
+  const explicitControl = await run(state, explicitPlanned);
+  const joinedRefusal = await run(state, explicitStale);
+  const clothedMinor = await run(state, {
+    ...planned,
+    prompt: `${planned.prompt}${minorAppended}`,
+    providerPayload: { ...planned.providerPayload, promptVariants: (planned.providerPayload.promptVariants ?? []).map((variant) => ({ ...variant, prompt: `${variant.prompt}${minorAppended}` })) }
+  });
+  assertCheck(
+    scope,
+    explicitPlanned.backend === "photoreal" &&
+      explicitControl.result.job.status === "completed" &&
+      joinedRefusal.result.job.status === "failed" &&
+      /안전 기준/u.test(joinedRefusal.result.job.error ?? "") &&
+      joinedRefusal.calls.length === 0 &&
+      clothedMinor.result.job.status === "completed",
+    "dispatch reads the prompt with the cut it was planned as: minor wording added to an adult explicit cut is refused, the same wording on a clothed cut is not, and the explicit cut itself is sent",
+    `${explicitPlanned.backend} control=${explicitControl.result.job.status} joined=${joinedRefusal.result.job.status} ${joinedRefusal.result.job.error ?? ""} clothed=${clothedMinor.result.job.status}`
+  );
+
   // The face reference is checked against the character's profile as it is NOW.
   const withLiveProfile = (patch) => {
     const next = structuredClone(state);
@@ -2121,6 +2390,21 @@ async function evaluateDispatchFloor({ seed, orchestrator }) {
     [withLiveProfile((image) => ({ ...image, objectKey: `${SIMULATION_ID}/profile_yuna_v2.png` })), "that is no longer the character's profile image"],
     [withLiveProfile(() => undefined), "whose character no longer has a photoreal profile"]
   ];
+  // An explicit cut planned with the adult profile as its face, whose profile record now reads minor-coded: the
+  // reference is checked against this cut, so it is refused here (the same record still serves a clothed cut).
+  const minorRecordState = withLiveProfile((image) => ({ ...image, prompt: "A 15-year-old Korean girl with long black hair" }));
+  const minorOnExplicit = await run(minorRecordState, explicitPlanned);
+  const minorOnClothed = await run(minorRecordState, planned);
+  assertCheck(
+    scope,
+    explicitPlanned.providerPayload.photorealReferences?.length >= 1 &&
+      minorOnExplicit.result.job.status === "failed" &&
+      /얼굴 참조 이미지를 쓸 수 없어/u.test(minorOnExplicit.result.job.error ?? "") &&
+      minorOnExplicit.calls.length === 0 &&
+      minorOnClothed.result.job.status === "completed",
+    "a face whose record now reads minor-coded is refused as an explicit cut leaves, and still sent with a clothed cut",
+    `${minorOnExplicit.result.job.status} ${minorOnExplicit.result.job.error ?? ""} clothed=${minorOnClothed.result.job.status} ${minorOnClothed.result.job.error ?? ""}`
+  );
   for (const [liveState, label] of referenceCases) {
     const outcome = await run(liveState, planned);
     assertCheck(
@@ -2196,11 +2480,13 @@ async function evaluateSentGraphFloor({ seed, orchestrator, studio, photoPrompt 
   // The built graph, read directly: a word split over the pieces, and a phrase split over two encoders.
   const gateState = createState(seed.seedState, { routing: { mode: "photoreal" } });
   const built = (workflowJson) => JSON.parse(workflowJson.replaceAll('"%width%"', "1024").replaceAll('"%height%"', "1024").replaceAll('"%seed%"', "1"));
-  const split = orchestrator.screenBuiltPhotorealWorkflow(gateState, built(template("A candid photograph of a woman, na ked, lying on a bed")));
+  const split = orchestrator.screenBuiltPhotorealWorkflow(gateState, built(template("A candid photograph of a 14 year old girl, na ked, lying on a bed")));
   assertCheck(scope, split?.decision.locked === true && split.text?.nodeId === "4" && split.text.input === "text", "screenBuiltPhotorealWorkflow locks a built string the pieces never contained, and names its node", JSON.stringify(split?.text));
+  const adultSplit = orchestrator.screenBuiltPhotorealWorkflow(gateState, built(template("A candid photograph of a woman, na ked, lying on a bed")));
+  assertCheck(scope, adultSplit === undefined, "the same assembled word about an adult is not the floor's to refuse (read alone, only the floor refuses)", JSON.stringify(adultSplit?.decision?.reason));
   const acrossNodes = built(
     template("A candid photograph. She is a girl", {
-      "10": { class_type: "CLIPTextEncode", inputs: { clip: ["2", 0], text: "of twelve" } },
+      "10": { class_type: "CLIPTextEncode", inputs: { clip: ["2", 0], text: "of twelve, in lingerie" } },
       "11": { class_type: "ConditioningCombine", inputs: { conditioning_1: ["4", 0], conditioning_2: ["10", 0] } },
       "7": {
         class_type: "KSampler",
@@ -2216,7 +2502,7 @@ async function evaluateSentGraphFloor({ seed, orchestrator, studio, photoPrompt 
 
   // Settings and planning for the phrase over two nodes: the template's literals are also read together.
   const twoNodeTemplate = template("%prompt% She is a girl", {
-    "10": { class_type: "CLIPTextEncode", inputs: { clip: ["2", 0], text: "of twelve" } },
+    "10": { class_type: "CLIPTextEncode", inputs: { clip: ["2", 0], text: "of twelve, in lingerie" } },
     "11": { class_type: "ConditioningCombine", inputs: { conditioning_1: ["4", 0], conditioning_2: ["10", 0] } },
     "7": {
       class_type: "KSampler",
@@ -2240,7 +2526,7 @@ async function evaluateSentGraphFloor({ seed, orchestrator, studio, photoPrompt 
   const junctionState = stateFor(junctionTemplate);
   const junctionPlanned = orchestrator.planImageJob(junctionState, "turn_sent", cue, [], true);
   assertCheck(scope, junctionPlanned.backend === "photoreal", "fixture: a clean cut under a template whose literal starts with a fragment is photoreal", `${junctionPlanned.backend} ${junctionPlanned.routing?.reason}`);
-  const fragmentPrompt = `${junctionPlanned.prompt.replace(/[.\s]+$/u, "")}, na`;
+  const fragmentPrompt = `${junctionPlanned.prompt.replace(/[.\s]+$/u, "")}, a 14 year old girl, na`;
   const fragmentJob = {
     ...junctionPlanned,
     prompt: fragmentPrompt,
@@ -2306,6 +2592,7 @@ async function evaluateSentGraphFloor({ seed, orchestrator, studio, photoPrompt 
     routing: { mode: "photoreal" },
     photorealOverrides: { workflowPreset: "qwen_image_2_1", referenceWorkflowPreset: "qwen_image_2_1", cfg: 4, faceReferenceEnabled: false, negativePrompt: "clothes, adult, watermark" }
   });
+  // Clothing in a negative is the user's to keep; a word that makes the subject an adult is never a photo negative.
   const steeringState = structuredClone(negativeState);
   steeringState.visualProfiles = steeringState.visualProfiles.map((profile) =>
     profile.characterId === "char_yuna" ? { ...profile, photorealNegativePrompt: "clothing, fully clothed, heavy makeup" } : profile
@@ -2338,10 +2625,11 @@ async function evaluateSentGraphFloor({ seed, orchestrator, studio, photoPrompt 
       scope,
       job.backend === "photoreal" &&
         job.negativePrompt === photoPrompt.sanitizePhotorealNegativePrompt(job.negativePrompt) &&
-        !/\b(?:cloth(?:es|ing)|clothed|sweater|adult)\b/iu.test(job.negativePrompt) &&
+        /\b(?:cloth(?:es|ing)|clothed)\b/iu.test(job.negativePrompt) &&
+        !/\badult\b/iu.test(job.negativePrompt) &&
         run.result.job.status === "completed" &&
         sentNegative === photoPrompt.sanitizePhotorealNegativePrompt(job.negativePrompt),
-      `${label}: the planned negative is already in its sent form, carries no safeguard word, and is sent exactly as the rule leaves it`,
+      `${label}: the planned negative is already in its sent form, keeps the user's clothing words, carries no youth-steering word, and is sent exactly as the rule leaves it`,
       `${job.negativePrompt} | sent ${JSON.stringify(sentNegative)} ${run.result.job.error ?? ""}`
     );
   }

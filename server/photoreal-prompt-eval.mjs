@@ -237,8 +237,8 @@ function evaluateScriptsAndCanonicalText(promptModule) {
   const negatives = splitList(undress.negativePrompt);
   assertCheck(
     scope,
-    negatives.includes("hat") && negatives.includes("glasses") && negatives.includes("blurry") && !negatives.some((term) => /cloth|shirt|skirt|pants|ヌード/u.test(term)),
-    `Body-covering clothing never becomes a photo negative, from a negative weight or a typed negative; accessories still do (${undress.negativePrompt}).`
+    ["hat", "glasses", "blurry", "clothing", "clothes", "shirt", "skirt", "pants"].every((term) => negatives.includes(term)) && !negatives.some((term) => /ヌード/u.test(term)),
+    `Clothing in a negative is the user's choice, from a negative weight or a typed negative, like an accessory; text in a script nothing can read is dropped (${undress.negativePrompt}).`
   );
   assertCheck(scope, !/clothing|shirt|skirt|\bhat\b/u.test(undress.prompt), "Negatively weighted tags are still kept out of the positive prompt.");
 
@@ -472,9 +472,9 @@ function evaluatePhotoSanitizing(promptModule) {
     style,
     referenceSyntax: "none"
   });
-  assertCheck("prompt.photo-sanitize", !/futa|intersex|dickgirl/iu.test(plan.prompt) && plan.droppedTags.includes("futanari"), "Body-identity traits never reach the photo prompt.");
+  assertCheck("prompt.photo-sanitize", !/futa|intersex|dickgirl/iu.test(plan.prompt) && plan.droppedTags.includes("futanari"), "Outside an explicit cut, body-identity traits never reach the photo prompt.");
   assertCheck("prompt.photo-sanitize", !/anorexi|emaciated|skeletal/iu.test(plan.prompt) && plan.droppedTags.includes("anorexic") && /slender/u.test(plan.prompt), "Eating-disorder body terms are dropped; ordinary build words stay.");
-  assertCheck("prompt.photo-sanitize", /tactical bodysuit/u.test(plan.prompt) && /white blouse/u.test(plan.prompt) && !/translucent|see-?through|sheer|transparent/iu.test(plan.prompt), `Sheer qualifiers are removed and the garment stays, opaque (${plan.subjectSentences[0]}).`);
+  assertCheck("prompt.photo-sanitize", /tactical bodysuit/u.test(plan.prompt) && /white blouse/u.test(plan.prompt) && !/translucent|see-?through|sheer|transparent/iu.test(plan.prompt), `Outside an explicit cut, sheer qualifiers are removed and the garment stays, opaque (${plan.subjectSentences[0]}).`);
   // The patterns are module-level regexes; a global flag would make .test() alternate between calls.
   const again = promptModule.buildPhotorealPrompt({
     characters: [{ tags: ["1girl", "translucent tactical bodysuit"], identityTags: [] }], contextTags: [], style, referenceSyntax: "none"
@@ -483,6 +483,50 @@ function evaluatePhotoSanitizing(promptModule) {
     characters: [{ tags: ["1girl", "translucent tactical bodysuit"], identityTags: [] }], contextTags: [], style, referenceSyntax: "none"
   });
   assertCheck("prompt.photo-sanitize", again.prompt === third.prompt && !/translucent/u.test(third.prompt), "Repeated builds sanitize identically (no regex state carried between calls).");
+
+  // A cut routed as explicit is one the user chose to render as a photograph: its scene is described as written.
+  const explicitTags = ["1girl", "futanari", "anorexic", "nude", "sex from behind", "spread legs", "translucent tactical bodysuit", "see-through", "sheer white blouse", "loli", "high school student"];
+  const explicit = promptModule.buildPhotorealPrompt({
+    characters: [{ tags: explicitTags, identityTags: [] }],
+    contextTags: ["bedroom"],
+    style,
+    referenceSyntax: "none",
+    explicitScene: true
+  });
+  assertCheck(
+    "prompt.photo-sanitize",
+    /futanari/u.test(explicit.prompt) && /nude/u.test(explicit.prompt) && /sex from behind/u.test(explicit.prompt) && /translucent tactical bodysuit/u.test(explicit.prompt) && /sheer white blouse/u.test(explicit.prompt) && /see-through/u.test(explicit.prompt),
+    `In an explicit cut the scene is kept as written: the anatomy trait, the act and the sheer qualifiers (${explicit.subjectSentences[0]}).`
+  );
+  assertCheck(
+    "prompt.photo-sanitize",
+    !/anorexi|\bloli|high school|student/iu.test(explicit.prompt) && /An adult woman/u.test(explicit.prompt),
+    `…while eating-disorder words and minor or student wording are still dropped and the subject is still an adult (${explicit.subjectSentences[0]}).`
+  );
+  const nonExplicit = promptModule.buildPhotorealPrompt({
+    characters: [{ tags: explicitTags, identityTags: [] }],
+    contextTags: ["bedroom"],
+    style,
+    referenceSyntax: "none",
+    explicitScene: false
+  });
+  assertCheck(
+    "prompt.photo-sanitize",
+    !/futanari|translucent|see-?through|sheer/iu.test(nonExplicit.prompt),
+    `explicitScene: false strips exactly as an unflagged build does (${nonExplicit.subjectSentences[0]}).`
+  );
+  const explicitAppearance = promptModule.buildPhotorealPrompt({
+    characters: [{ appearance: "A tall Korean woman, futanari, emaciated frame, in a sheer orange top", tags: ["1girl", "futanari", "nude"], identityTags: ["1girl", "futanari"] }],
+    contextTags: [],
+    style: promptModule.resolvePhotorealStyle({ stylePreset: "custom", stylePrompt: "A boudoir photograph. Sheer curtains, soft light.", negativePrompt: "" }),
+    referenceSyntax: "none",
+    explicitScene: true
+  });
+  assertCheck(
+    "prompt.photo-sanitize",
+    /futanari/u.test(explicitAppearance.prompt) && /a sheer orange top/u.test(explicitAppearance.prompt) && /Sheer curtains/u.test(explicitAppearance.prompt) && !/emaciated/u.test(explicitAppearance.prompt),
+    `In an explicit cut an appearance and a style keep their sheer and anatomy wording too, and the appearance does not replace an anatomy trait from the identity (${explicitAppearance.prompt}).`
+  );
 }
 
 function evaluateReferences(promptModule) {
@@ -587,8 +631,9 @@ function evaluateNegativeMerge(promptModule) {
   const empty = promptModule.buildPhotorealPrompt({ characters: [{ tags: ["1girl"], identityTags: [] }], contextTags: [], style: EMPTY_STYLE, referenceSyntax: "none" });
   assertCheck("prompt.negative", empty.negativePrompt === "", "No negatives in → empty negative out (no stray commas).");
 
-  // Red-team round 3: a negative that names what keeps the subject covered, safe or adult steers the sampler toward
-  // the opposite at any CFG above 1, from a typed negative or from a cut's negative weight alike.
+  // A negative that names what keeps the subject adult steers the sampler toward a younger one at any CFG above 1, from
+  // a typed negative or from a cut's negative weight alike, and is dropped. Clothing, modesty and safety words steer
+  // toward an undressed adult: what renders is the routing's call, and they are the user's to keep.
   const steering = promptModule.buildPhotorealPrompt({
     characters: [{ tags: ["1girl", "smile", "-2::apparel::", "-1::adult::", "-1::mature female::", "-1::glasses::"], identityTags: [] }],
     contextTags: [],
@@ -598,18 +643,17 @@ function evaluateNegativeMerge(promptModule) {
   });
   assertCheck(
     "prompt.negative",
-    steering.negativePrompt === "blurry, lowres, watermark, extra fingers, glasses",
-    `Covering, safety, adulthood and adult-build negatives are dropped; quality terms and accessories stay (got "${steering.negativePrompt}").`
+    steering.negativePrompt === "blurry, lowres, watermark, covered, censored, modest, fabric, apparel, wardrobe, sfw, safe for work, coat, tights, towel, extra fingers, glasses",
+    `Adulthood and adult-build negatives are dropped; clothing, safety, quality terms and accessories stay (got "${steering.negativePrompt}").`
   );
-  const sanitized = promptModule.sanitizePhotorealNegativePrompt("anime, 1.2::sfw::, Clothing, nsfw, child, (fully clothed:1.3), hat");
-  assertCheck("prompt.negative", sanitized === "anime, hat", `sanitizePhotorealNegativePrompt applies the same rule to a finished negative (got "${sanitized}").`);
+  const sanitized = promptModule.sanitizePhotorealNegativePrompt("anime, 1.2::sfw::, Clothing, nsfw, child, (fully clothed:1.3), adult, 25yo, hat");
+  assertCheck("prompt.negative", sanitized === "anime, sfw, Clothing, nsfw, child, fully clothed, hat", `sanitizePhotorealNegativePrompt applies the same rule to a finished negative (got "${sanitized}").`);
 
-  // Red-team round 4: the photo negative is an allow-list. A deny-list let 70 of 75 steering negatives through — every
-  // garment, every language, every spelling — so only quality, artefact, medium and look terms (and a few worn extras)
-  // are kept. Plurals, case, hyphens and underscores are one entry; anything not in the vocabulary is dropped.
+  // The negative is no longer an allow-list: only the youth-steering direction is dropped, read the way the floor reads
+  // a word (any spelling, language or disguise). Plurals, case, hyphens and underscores pass through as written.
   const presetNegatives = Object.values(promptModule.PHOTOREAL_STYLE_PRESETS).map((preset) => preset.negative);
   const presetLost = presetNegatives.filter((negative) => promptModule.sanitizePhotorealNegativePrompt(negative) !== negative);
-  assertCheck("prompt.negative", presetLost.length === 0, `Every preset's negative survives the allow-list intact (changed: ${presetLost.join(" | ") || "none"}).`);
+  assertCheck("prompt.negative", presetLost.length === 0, `Every preset's negative survives intact (changed: ${presetLost.join(" | ") || "none"}).`);
   const variants = promptModule.sanitizePhotorealNegativePrompt("Low-Res, JPEG_Artifacts, Extra Fingers, mutated-hands, poorly drawn faces, Out Of Frame, artefacts, (worst quality:1.4), {blurry}");
   assertCheck(
     "prompt.negative",
@@ -618,8 +662,13 @@ function evaluateNegativeMerge(promptModule) {
   );
   const steeringNegatives = "cl0thing, ropa, Kleidung, vêtements, adulthood, breasts, curves, knitwear, denim, turtleneck, long sleeves, in her twenties, 25yo, makeup, high heels, pubic hair, nude, naked child, loli, extra breasts, deformed clothing, censor bar, pixelation";
   const steeringKept = promptModule.sanitizePhotorealNegativePrompt(steeringNegatives);
-  assertCheck("prompt.negative", steeringKept === "", `Nothing outside the vocabulary survives: garments in any language or spelling, adulthood, body words, safety words (kept "${steeringKept}").`);
-  assertCheck("prompt.negative", ["blurry", "heavy makeup", "glasses", "tattoos"].every(promptModule.isPhotoNegativeQualityTerm) && !["makeup", "clothes", "hands", "skin"].some(promptModule.isPhotoNegativeQualityTerm), "A defect or look term is in the vocabulary; the bare thing it qualifies is not.");
+  assertCheck(
+    "prompt.negative",
+    steeringKept === "cl0thing, ropa, Kleidung, vetements, knitwear, denim, turtleneck, long sleeves, makeup, high heels, nude, naked child, loli, deformed clothing, censor bar, pixelation",
+    `Garments in any language or spelling and safety words stay; adulthood, ages and adult body words go (kept "${steeringKept}").`
+  );
+  const disguisedYouth = promptModule.sanitizePhotorealNegativePrompt("adulte, Frau, mulher adulta, 4dult, a-d-u-l-t, m@ture, treinta años, 30 Jahre, pechos, Brüste, in her 20s, over 18, 18+, glasses");
+  assertCheck("prompt.negative", disguisedYouth === "glasses", `Youth-steering words are read in other languages and in disguise (kept "${disguisedYouth}").`);
 }
 
 function evaluateNaturalPhrasing(promptModule) {
@@ -1060,11 +1109,11 @@ function evaluateQwenEdit2511Graphs(comfyModule) {
 function evaluateReferenceHeadCrops(comfyModule) {
   const crop = comfyModule.computeReferenceHeadCrop;
   const square = crop(1024, 1024);
-  assertCheck("comfy.head-crop", square && square.width === 634 && square.height === 634 && square.x === 195 && square.y === 20, `1024x1024 profile → top-centred 634px square (${JSON.stringify(square)}).`);
+  assertCheck("comfy.head-crop", square && square.width === 460 && square.height === 460 && square.x === 282 && square.y === 20, `1024x1024 profile → top-centred 460px square (${JSON.stringify(square)}).`);
   const portrait = crop(960, 1280);
-  assertCheck("comfy.head-crop", portrait && portrait.width === 793 && portrait.x === 83 && portrait.y === 25 && portrait.y + portrait.height <= 1280, `960x1280 profile → 793px square from the top (${JSON.stringify(portrait)}).`);
+  assertCheck("comfy.head-crop", portrait && portrait.width === 576 && portrait.x === 192 && portrait.y === 25 && portrait.y + portrait.height <= 1280, `960x1280 profile → 576px square from the top (${JSON.stringify(portrait)}).`);
   const wide = crop(1344, 768);
-  assertCheck("comfy.head-crop", wide && wide.width === 476 && wide.x === 434 && wide.y + wide.height <= 768, `A landscape profile still crops a centred square inside the image (${JSON.stringify(wide)}).`);
+  assertCheck("comfy.head-crop", wide && wide.width === 345 && wide.x === 499 && wide.y + wide.height <= 768, `A landscape profile still crops a centred square inside the image (${JSON.stringify(wide)}).`);
   assertCheck("comfy.head-crop", crop(undefined, 1024) === undefined && crop(200, 300) === undefined && crop(NaN, NaN) === undefined, "Unknown or tiny sizes give no crop (the reference is sent whole).");
 
   for (const presetId of ["qwen_image_2_1_turbo", "qwen_image_edit_2511"]) {
@@ -1081,7 +1130,7 @@ function evaluateReferenceHeadCrops(comfyModule) {
     const secondKey = presetId === "qwen_image_2_1_turbo" ? comfyModule.QWEN21_REFERENCE_INPUT_KEY(2) : "image2";
     assertCheck(
       "comfy.head-crop",
-      crops.length === 1 && sameLink(crops[0].node.inputs.image, loadOne) && crops[0].node.inputs.width === 793 && crops[0].node.inputs.x === 83 && crops[0].node.inputs.y === 25,
+      crops.length === 1 && sameLink(crops[0].node.inputs.image, loadOne) && crops[0].node.inputs.width === 576 && crops[0].node.inputs.x === 192 && crops[0].node.inputs.y === 25,
       `${presetId}: one ImageCrop on reference 1 with the planned box.`
     );
     assertCheck(

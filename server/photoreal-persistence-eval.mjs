@@ -23,7 +23,7 @@ const EXPECTED_PHOTOREAL_DEFAULTS = {
   requestMode: "proxy",
   baseUrl: "http://127.0.0.1:8188",
   proxyUrl: "",
-  workflowPreset: "qwen_image_2_1_turbo",
+  workflowPreset: "z_image_turbo",
   referenceWorkflowPreset: "qwen_image_2_1_turbo",
   modelFiles: {},
   steps: 0,
@@ -235,7 +235,7 @@ function evaluatePhotorealSettingsNormalization({ seed, runtimeApiSettings, work
     ["requestMode", "proxy"],
     ["baseUrl", "http://127.0.0.1:8188"],
     ["proxyUrl", ""],
-    ["workflowPreset", "qwen_image_2_1_turbo"],
+    ["workflowPreset", "z_image_turbo"],
     ["referenceWorkflowPreset", "z_image_turbo"],
     ["modelFiles", { z_image_turbo: { diffusionModel: "z_custom.safetensors", vae: "ae.safetensors" } }],
     ["steps", 100],
@@ -421,8 +421,8 @@ function evaluateBackendRoutingHydration({ seed, routing }) {
   );
   assertCheck(
     "routing.hydrate",
-    Array.isArray(mixed?.photorealCategories) && !mixed.photorealCategories.includes("explicit") && !mixed.photorealCategories.includes("selfie"),
-    "Hydration strips `explicit` and unknown categories from photorealCategories."
+    Array.isArray(mixed?.photorealCategories) && mixed.photorealCategories.includes("explicit") && !mixed.photorealCategories.includes("selfie"),
+    "Hydration keeps a tick on `explicit` (the user's choice) and strips unknown categories from photorealCategories."
   );
 
   const unknownMode = hydrateRouting({ mode: "everything", photorealCategories: ["portrait"] });
@@ -675,8 +675,9 @@ function evaluateCreateStateFromDraft({ seed }) {
   );
   assertCheck(
     "draft",
-    state.imageProfile.backendRouting?.mode === "mixed" && !state.imageProfile.backendRouting.photorealCategories.includes("explicit"),
-    "The draft's routing is kept and `explicit` cannot be routed photoreal."
+    state.imageProfile.backendRouting?.mode === "mixed" &&
+      ["portrait", "full_body", "explicit"].every((category) => state.imageProfile.backendRouting.photorealCategories.includes(category)),
+    "The draft's routing is kept, its tick on `explicit` included."
   );
 
   const { photoreal: _photoreal, ...legacyDraft } = draft;

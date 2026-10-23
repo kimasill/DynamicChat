@@ -10736,7 +10736,8 @@ textarea:focus {
   line-height: 1.45;
 }
 
-/* The explicit row is a statement, not a control: dashed, muted, and not clickable. */
+/* A locked row (an option the router never routes to 실사) is a statement, not a control: dashed, muted, and not
+   clickable. No built-in option is locked today; the sexual-scene row is an ordinary choice. */
 .backend-routing-category.locked {
   border-style: dashed;
   cursor: not-allowed;

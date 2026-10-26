@@ -54,6 +54,7 @@ const PHOTOREAL_WORKFLOW_PRESET_IDS: Record<PhotorealWorkflowPresetId, true> = {
 const PHOTOREAL_STYLE_PRESET_IDS: Record<PhotorealStylePresetId, true> = {
   instagram: true,
   daily_look: true,
+  raw_snap: true,
   film_portrait: true,
   cinematic: true,
   studio_editorial: true,

@@ -595,9 +595,13 @@ function createPhotorealJobPlan(
 
   const characters: PhotorealCharacterInput[] = figures.map((figure, figureIndex) => {
     const appearance = typeof figure.profile?.photorealPrompt === "string" ? figure.profile.photorealPrompt.trim() : "";
+    const ethnicity = appearance
+      ? undefined
+      : inferCharacterPhotorealEthnicity(state, figure.characterPrompt.characterId, figure.profile, figure.identity);
     return {
       characterId: figure.characterPrompt.characterId,
       ...(appearance ? { appearance } : {}),
+      ...(ethnicity ? { ethnicity } : {}),
       tags: figure.tags,
       identityTags: figure.identity,
       referenceIndex: referenceIndexByFigure.get(figureIndex),
@@ -2738,7 +2742,44 @@ function filterConflictingDefaultOutfitTags(outfitTags: string[], authoredTags: 
   });
 }
 
+function inferCharacterPhotorealEthnicity(
+  state: AppState,
+  characterId: string | undefined,
+  profile: CharacterVisualProfile | undefined,
+  identityTags: string[]
+): string | undefined {
+  if (!profile || identityTags.length === 0) {
+    return undefined;
+  }
+  const character =
+    characterId && Array.isArray(state.characters)
+      ? state.characters.find((candidate) => candidate.id === characterId)
+      : undefined;
+  const simulation = state.simulation;
+  const combinedText = [
+    character?.name ?? "",
+    character?.role ?? "",
+    character?.summary ?? "",
+    profile.positivePrompt ?? "",
+    profile.photorealPrompt ?? "",
+    simulation?.title ?? "",
+    simulation?.description ?? ""
+  ].join(" ");
+  if (
+    /\b(?:caucasian|european|western|american|british|french|german|russian|italian|spanish|latina|latino|african|black woman|black man|white woman|white man)\b|(?:외국인|서양인|백인|흑인|미국인|영국인|프랑스인|러시아인|독일인)/iu.test(
+      combinedText
+    )
+  ) {
+    return undefined;
+  }
+  if (/\p{Script=Hangul}/u.test(combinedText) || /\bkorean\b/iu.test(combinedText)) {
+    return "Korean";
+  }
+  return undefined;
+}
+
 function resolveCurrentCharacterOutfit(state: AppState, characterId: string): string[] {
+  const profile = state.visualProfiles.find((candidate) => candidate.characterId === characterId);
   // Latest in-scene Wearing state wins; fall back to the registered default outfit so a registered character
   // is never rendered in a random or missing outfit.
   for (let index = state.memoryEvents.length - 1; index >= 0; index -= 1) {
@@ -2751,11 +2792,22 @@ function resolveCurrentCharacterOutfit(state: AppState, characterId: string): st
     }
     const value = readStateMemoryValue(event);
     if (value) {
+      if (!/[a-z]/iu.test(value) && profile) {
+        const normalizedValue = value.replace(/\s+/gu, "").toLowerCase();
+        for (const [key, prompt] of Object.entries(profile.outfitPrompts ?? {})) {
+          const normalizedKey = key.replace(/\s+/gu, "").toLowerCase();
+          if (normalizedKey && (normalizedValue.includes(normalizedKey) || normalizedKey.includes(normalizedValue)) && prompt?.trim()) {
+            return promptToTags(prompt);
+          }
+        }
+        if (profile.defaultOutfitPrompt?.trim()) {
+          return promptToTags(profile.defaultOutfitPrompt);
+        }
+      }
       return promptToTags(value);
     }
     break;
   }
-  const profile = state.visualProfiles.find((candidate) => candidate.characterId === characterId);
   return profile?.defaultOutfitPrompt ? promptToTags(profile.defaultOutfitPrompt) : [];
 }
 
@@ -2984,7 +3036,7 @@ const POSTURE_CONTINUITY_STATE_TYPES = ["InteractionTags", "ActionTags", "PoseTa
 // Detail state types are additive, independent ongoing physical facts — an injury, blood, bodily fluids, sweat/wetness,
 // or a held prop. Each persists on its own across cuts/turns until the scene changes it, so each is carried per-type and
 // only when this cut authored no tag of that same type (an explicit change to one detail never drops the others).
-const DETAIL_CONTINUITY_STATE_TYPES = ["PhysicalStateTags", "BodyStateTags", "HeldItemTags"] as const;
+const DETAIL_CONTINUITY_STATE_TYPES = ["PhysicalStateTags", "BodyStateTags", "HeldItemTags", "StatusTags", "ExpressionTags"] as const;
 
 // Persisted ongoing posture + physical-detail tags for one character, used to fill a cut that omits them so the figure
 // keeps the scene's established position and visible body/clothing-damage details (the "floating body part on a neutral

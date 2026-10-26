@@ -377,7 +377,14 @@ export type PhotorealWorkflowPresetId =
   /** A user-supplied API-format ComfyUI workflow with %placeholders%. */
   | "custom";
 
-export type PhotorealStylePresetId = "instagram" | "daily_look" | "film_portrait" | "cinematic" | "studio_editorial" | "custom";
+export type PhotorealStylePresetId =
+  | "instagram"
+  | "daily_look"
+  | "raw_snap"
+  | "film_portrait"
+  | "cinematic"
+  | "studio_editorial"
+  | "custom";
 
 /** `proxy`: through the DynamicChat API server relay (ComfyUI refuses cross-origin browser calls). `mock`: dry run. */
 export type PhotorealRequestMode = "proxy" | "mock";

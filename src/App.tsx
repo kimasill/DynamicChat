@@ -306,6 +306,7 @@ const photorealWorkflowPresetOrder: PhotorealWorkflowPresetId[] = [
 const photorealStylePresetOrder: Array<Exclude<PhotorealStylePresetId, "custom">> = [
   "instagram",
   "daily_look",
+  "raw_snap",
   "film_portrait",
   "cinematic",
   "studio_editorial"
@@ -12214,6 +12215,31 @@ function CreateSimulationPage({
                       />
                       핀터레스트 데일리룩 사진 톤 켜기 (DNC 감성 · Z-Image Turbo 960×1280)
                     </label>
+                    <label className="checkline">
+                      <input
+                        type="checkbox"
+                        checked={
+                          draft.photoreal.enabled &&
+                          draft.photoreal.stylePreset === "raw_snap" &&
+                          draft.photoreal.workflowPreset === "z_image_turbo"
+                        }
+                        onChange={(event) => {
+                          if (event.target.checked) {
+                            updatePhotoreal({
+                              enabled: true,
+                              stylePreset: "raw_snap",
+                              workflowPreset: "z_image_turbo",
+                              referenceWorkflowPreset: "qwen_image_2_1_turbo",
+                              width: 768,
+                              height: 1024
+                            });
+                          } else {
+                            updatePhotoreal({ stylePreset: "cinematic", width: 832, height: 1248 });
+                          }
+                        }}
+                      />
+                      로우파이 리얼 폰카 모드 켜기 (저화질·생사진 · Z-Image Turbo 768×1024)
+                    </label>
                     <label>
                       스타일 프리셋
                       <select
@@ -19974,6 +20000,34 @@ function PhotorealRuntimeSettings({
             }}
           />
           핀터레스트 데일리룩 사진 톤 켜기 (DNC 감성 · Z-Image Turbo 960×1280)
+        </label>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={
+              photoreal.enabled &&
+              photoreal.stylePreset === "raw_snap" &&
+              photoreal.workflowPreset === "z_image_turbo"
+            }
+            onChange={(event) => {
+              if (event.target.checked) {
+                onChange(
+                  {
+                    enabled: true,
+                    stylePreset: "raw_snap",
+                    workflowPreset: "z_image_turbo",
+                    referenceWorkflowPreset: "qwen_image_2_1_turbo",
+                    width: 768,
+                    height: 1024
+                  },
+                  "로우파이 리얼 폰카 모드(Z-Image Turbo · 768×1024 저화질 생사진 톤)가 활성화되었습니다."
+                );
+              } else {
+                onChange({ stylePreset: "cinematic", width: 832, height: 1248 }, "필름 시네마틱 톤으로 전환되었습니다.");
+              }
+            }}
+          />
+          로우파이 리얼 폰카 모드 켜기 (저화질·생사진 · Z-Image Turbo 768×1024)
         </label>
         <label>
           스타일 프리셋

@@ -42,6 +42,8 @@ export interface PhotorealCharacterInput {
   characterId?: Id;
   /** CharacterVisualProfile.photorealPrompt (creator NL text) — wins over identity tags. */
   appearance?: string;
+  /** Optional subject ethnicity/nationality cue (e.g. "Korean") inferred from character settings or tags. */
+  ethnicity?: string;
   /** Composed tags for this figure in this cut. */
   tags: string[];
   /** The registered identity tags; removed from `tags` when `appearance` is given. */
@@ -168,27 +170,39 @@ export const PHOTOREAL_STYLE_PRESETS: Record<
     negative:
       "anime, cartoon, illustration, 3d render, cgi, painting, doll, plastic skin, airbrushed skin, oversaturated, heavy hdr, studio lighting, professional dslr, overly sterile, stiff posture, watermark, text, logo, extra fingers, deformed hands, distorted face"
   },
+  raw_snap: {
+    label: "로우파이 리얼 폰카 · 생사진/인스타 스토리",
+    description:
+      "화질을 의도적으로 낮춰 실제 폰카메라로 대충 찍은 듯한 초현실적 일상 스냅/인스타 스토리 모드. 저조도 노이즈, 미세한 손떨림과 소프트 포커스, 무보정 생얼 피부결, 은밀하고 리얼한 현장감.",
+    lead: "An unedited low-resolution mobile phone snapshot captured on a smartphone camera, Korean Instagram story and candid private camera roll aesthetic",
+    tail:
+      "Low-fi mobile phone camera optics, slight handheld motion softness and imperfect focus, visible high-ISO digital sensor noise and subtle JPEG compression artifacts, raw unretouched Korean skin texture with natural pores and subtle oil sheen, candid off-guard tension and intimate close-up presence, natural ambient mixed indoor lighting with slight highlight bloom, unposed real-life atmosphere, realistic proportions",
+    ambientLight: "Dim ambient indoor lighting and phone screen glow",
+    ambientSetting: "a lived-in Korean apartment room or late-night hallway",
+    negative:
+      "anime, cartoon, illustration, 3d render, cgi, painting, doll, plastic skin, airbrushed skin, studio lighting, professional dslr, ultra sharp, hyper detailed, studio backdrop, oversaturated, heavy hdr, glamour retouching, watermark, text, logo, extra fingers, deformed hands, distorted face"
+  },
   film_portrait: {
     label: "필름 인물 사진",
-    description: "35mm 필름 인물 사진. Kodak Portra 400 색감, 자연광, 얕은 심도와 부드러운 보케, 고운 필름 입자.",
+    description: "35mm 필름 인물 사진. 한국 인디 영화/화보 감성의 Kodak Portra 400 색감, 자연광, 얕은 심도와 부드러운 보케, 고운 필름 입자.",
     lead: "A 35mm film portrait photograph",
-    tail: "Kodak Portra 400 tones, shallow depth of field with soft bokeh, fine film grain, natural skin texture, realistic proportions",
+    tail: "Kodak Portra 400 tones, authentic Korean portrait photography aesthetic, shallow depth of field with soft bokeh, fine film grain, natural unretouched East Asian skin texture, realistic proportions",
     ambientLight: "Natural light",
     negative: `${PHOTO_NEGATIVE_BASE}, airbrushed skin, digital sharpening`
   },
   cinematic: {
     label: "시네마틱 스틸",
-    description: "영화의 한 장면 같은 스틸. 아나모픽 렌즈, 광원이 분명한 무드 조명, 공기 원근감, 필름 컬러 그레이딩.",
+    description: "현대 한국 영화·드라마의 한 장면 같은 스틸. 아나모픽 렌즈, 광원이 분명한 무드 조명, 자연스러운 한국인 이목구비와 피부톤, 공기 원근감, 필름 컬러 그레이딩.",
     lead: "A cinematic film still",
-    tail: "Anamorphic lens, atmospheric depth, filmic color grade, natural skin texture, realistic proportions",
+    tail: "Contemporary Korean cinema still aesthetic, anamorphic lens, atmospheric depth, filmic color grade, natural unretouched Korean skin texture with realistic pores, realistic proportions",
     ambientLight: "Motivated moody lighting",
     negative: `${PHOTO_NEGATIVE_BASE}, flat lighting, subtitles`
   },
   studio_editorial: {
     label: "스튜디오 화보",
-    description: "고급 패션 화보. 소프트박스 스튜디오 조명, 이음매 없는 배경지, 선명한 디테일.",
+    description: "고급 한국 패션 매거진 화보. 소프트박스 스튜디오 조명, 이음매 없는 배경지, 자연스럽고 선명한 피부 디테일.",
     lead: "A high-end fashion editorial photograph",
-    tail: "Crisp detail, natural skin texture, realistic proportions",
+    tail: "Seoul fashion editorial aesthetic, crisp detail, natural skin texture, realistic proportions",
     ambientLight: "Softbox studio lighting",
     ambientSetting: "a seamless studio backdrop",
     negative: `${PHOTO_NEGATIVE_BASE}, airbrushed skin, cluttered background`
@@ -433,6 +447,8 @@ interface CleanTag {
   key: string;
   /** What the plan carried, reported in droppedTags / trimmedTags. */
   source: string;
+  /** Optional ethnicity inferred when translating a language-specific gesture tag. */
+  inferredEthnicity?: string;
 }
 
 interface TagSink {
@@ -617,7 +633,7 @@ function cleanSingleTag(part: WeightedPart, sink: TagSink, explicitScene: boolea
     if (KOREAN_SCRIPT_PATTERN.test(text) && (part.weight === undefined || part.weight > 0)) {
       const gesture = KOREAN_GESTURE_TRANSLATIONS.find((entry) => entry.pattern.test(text));
       if (gesture) {
-        return { text: gesture.english, key: gesture.english.toLowerCase(), source: gesture.english };
+        return { text: gesture.english, key: gesture.english.toLowerCase(), source: gesture.english, inferredEthnicity: "Korean" };
       }
     }
     return undefined;
@@ -1155,6 +1171,7 @@ interface FigureModel {
   counts: SubjectCounts;
   gender?: Gender;
   modifier?: string;
+  ethnicity?: string;
   /** The creator's appearance as one clause (sentence breaks folded into commas), for multi-person sentences. */
   appearance?: string;
   /** The same text as the creator wrote it, sentence by sentence, for a single-person cut. */
@@ -1215,6 +1232,7 @@ function createItem(phrase: string, source: string, rank: number, order: { next:
 function createFigureModel(character: PhotorealCharacterInput | undefined): FigureModel {
   return {
     counts: { female: 0, male: 0, other: 0, several: [], crowd: [] },
+    ethnicity: character?.ethnicity,
     center: character?.center,
     hair: { words: [], styles: [], details: [], sources: [] },
     build: { words: [], sources: [] },
@@ -1246,7 +1264,18 @@ function buildFigureModel(
   // Gender and head count come from every source, identity included: the identity tags are often the only place
   // "1girl" is written, and the creator's appearance prose replaces how the person LOOKS, not who they are.
   for (const tag of tags) {
+    if (tag.inferredEthnicity && !figure.ethnicity) {
+      figure.ethnicity = tag.inferredEthnicity;
+    }
     readSubjectTag(figure, tag.key);
+  }
+  for (const tag of identity) {
+    if (tag.inferredEthnicity && !figure.ethnicity) {
+      figure.ethnicity = tag.inferredEthnicity;
+    }
+    if (Object.prototype.hasOwnProperty.call(ETHNICITY_TAG_MAP, tag.key) && !figure.ethnicity) {
+      figure.ethnicity = ETHNICITY_TAG_MAP[tag.key].ethnicity;
+    }
   }
   if (!figure.gender && countTotal(figure.counts) === 0) {
     for (const tag of identity) {
@@ -1307,12 +1336,42 @@ function buildFigureModel(
   return figure;
 }
 
+const ETHNICITY_TAG_MAP: Record<string, { ethnicity: string; gender?: Gender }> = {
+  korean: { ethnicity: "Korean" },
+  "korean woman": { ethnicity: "Korean", gender: "female" },
+  "korean girl": { ethnicity: "Korean", gender: "female" },
+  "korean man": { ethnicity: "Korean", gender: "male" },
+  "korean boy": { ethnicity: "Korean", gender: "male" },
+  "east asian": { ethnicity: "East Asian" },
+  "east asian woman": { ethnicity: "East Asian", gender: "female" },
+  "east asian man": { ethnicity: "East Asian", gender: "male" },
+  japanese: { ethnicity: "Japanese" },
+  "japanese woman": { ethnicity: "Japanese", gender: "female" },
+  "japanese man": { ethnicity: "Japanese", gender: "male" },
+  chinese: { ethnicity: "Chinese" },
+  "chinese woman": { ethnicity: "Chinese", gender: "female" },
+  "chinese man": { ethnicity: "Chinese", gender: "male" }
+};
+
 function isSubjectTagKey(key: string): boolean {
-  return COUNT_TAG_PATTERN.test(key) || MULTIPLE_TAG_PATTERN.test(key) || GENDER_WORD_PATTERN.test(key);
+  return (
+    COUNT_TAG_PATTERN.test(key) ||
+    MULTIPLE_TAG_PATTERN.test(key) ||
+    GENDER_WORD_PATTERN.test(key) ||
+    Object.prototype.hasOwnProperty.call(ETHNICITY_TAG_MAP, key)
+  );
 }
 
 /** Subject-count and gender tags decide the noun; they are never rendered as text themselves. */
 function readSubjectTag(figure: FigureModel, key: string): boolean {
+  if (Object.prototype.hasOwnProperty.call(ETHNICITY_TAG_MAP, key)) {
+    const entry = ETHNICITY_TAG_MAP[key];
+    figure.ethnicity = figure.ethnicity ?? entry.ethnicity;
+    if (entry.gender) {
+      figure.gender = figure.gender ?? entry.gender;
+    }
+    return true;
+  }
   const count = key.match(COUNT_TAG_PATTERN);
   if (count) {
     const gender = readGenderWord(count[3]);
@@ -1724,6 +1783,16 @@ function finalizeFigure(figure: FigureModel, order: { next: number }): void {
     // features, because hair is what identifies a person at a glance and NovelAI tags spread it over three tags.
     figure.features.unshift(createItem(renderHair(figure.hair), figure.hair.sources.join(", "), RANK_FIGURE_CORE, order));
   }
+  if (
+    figure.ethnicity &&
+    !figure.appearance &&
+    !(figure.modifier && /^[2-9]\d-year-old$/u.test(figure.modifier)) &&
+    !figure.features.some((item) => item.phrase.toLowerCase().includes(figure.ethnicity!.toLowerCase()))
+  ) {
+    figure.features.unshift(
+      createItem(`${figure.ethnicity} facial features`, figure.ethnicity.toLowerCase(), RANK_FIGURE_CORE, order)
+    );
+  }
   for (const group of [figure.features, figure.expression, figure.pose, figure.clothing]) {
     group.forEach((item, index) => {
       if (index < CORE_ITEMS_PER_GROUP) {
@@ -1899,7 +1968,8 @@ function renderSubjectPhrase(figure: FigureModel): string {
     return withSharedAppearance(figure.appearance, figure);
   }
   return withSharedAppearance(
-    describeSubjectCounts(figure.counts, figure.modifier) ?? singularAdultNoun(figure.gender ?? "other", figure.modifier),
+    describeSubjectCounts(figure.counts, figure.modifier, figure.ethnicity) ??
+      singularAdultNoun(figure.gender ?? "other", figure.modifier, figure.ethnicity),
     figure
   );
 }
@@ -1908,12 +1978,12 @@ function withSharedAppearance(subject: string, figure: FigureModel): string {
   return figure.sharedAppearance ? `${subject}, ${lowercaseLeadingArticle(figure.sharedAppearance)}` : subject;
 }
 
-function describeSubjectCounts(counts: SubjectCounts, modifier?: string): string | undefined {
+function describeSubjectCounts(counts: SubjectCounts, modifier?: string, ethnicity?: string): string | undefined {
   const parts: string[] = [];
   for (const gender of ["female", "male", "other"] as const) {
     const total = counts[gender];
     if (total === 1) {
-      parts.push(singularAdultNoun(gender, modifier));
+      parts.push(singularAdultNoun(gender, modifier, ethnicity));
     } else if (total > 1) {
       parts.push(`${counts.crowd.includes(gender) ? "a group of" : numberWord(total)} adult ${pluralNoun(gender)}`);
     } else if (counts.several.includes(gender)) {
@@ -1924,7 +1994,7 @@ function describeSubjectCounts(counts: SubjectCounts, modifier?: string): string
 }
 
 /** Adults by default (safety floor §2.4): "1girl" is "an adult woman", never "a girl". */
-function singularAdultNoun(gender: Gender, modifier?: string): string {
+function singularAdultNoun(gender: Gender, modifier?: string, ethnicity?: string): string {
   const noun = gender === "female" ? "woman" : gender === "male" ? "man" : "person";
   switch (modifier) {
     case "mature":
@@ -1939,7 +2009,7 @@ function singularAdultNoun(gender: Gender, modifier?: string): string {
     default:
       if (modifier && /^[2-9]\d-year-old$/u.test(modifier)) {
         const ageNum = Number(modifier.split("-")[0]);
-        return `${indefiniteArticle(modifier)} ${modifier} ${ageNum < 35 ? "young adult" : "adult"} ${noun}`;
+        return `${indefiniteArticle(modifier)} ${modifier} ${ethnicity ? `${ethnicity} ` : ""}${ageNum < 35 ? "young adult" : "adult"} ${noun}`;
       }
       return `an adult ${noun}`;
   }
